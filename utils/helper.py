@@ -1,4 +1,5 @@
 import base64
+import decimal
 import hashlib
 import ipaddress
 import json
@@ -30,7 +31,7 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
 MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_JSON_EDIT_IMAGES = 10
-MAX_IMAGE_COUNT = 10
+MAX_IMAGE_COUNT = 50
 DATA_URL_IMAGE_RE = re.compile(r"^data:(?P<mime>[-+./\w]+);base64,(?P<data>.*)$", re.DOTALL)
 REMOTE_IMAGE_TIMEOUT_SECONDS = 20
 REMOTE_IMAGE_MAX_REDIRECTS = 5
@@ -595,9 +596,27 @@ def extract_chat_prompt(body: dict[str, object]) -> str:
 
 
 def parse_image_count(raw_value: object) -> int:
+    if raw_value is None or raw_value == "":
+        return 1
+    if isinstance(raw_value, bool):
+        raise HTTPException(status_code=400, detail={"error": "n must be an integer"})
     try:
-        value = int(raw_value or 1)
-    except (TypeError, ValueError) as exc:
+        if isinstance(raw_value, int):
+            value = raw_value
+        elif isinstance(raw_value, float):
+            if not raw_value.is_integer():
+                raise ValueError
+            value = int(raw_value)
+        elif isinstance(raw_value, decimal.Decimal):
+            if raw_value != raw_value.to_integral_value():
+                raise ValueError
+            value = int(raw_value)
+        else:
+            text = str(raw_value).strip()
+            if not re.fullmatch(r"[+-]?\d+", text):
+                raise ValueError
+            value = int(text)
+    except (TypeError, ValueError, decimal.InvalidOperation) as exc:
         raise HTTPException(status_code=400, detail={"error": "n must be an integer"}) from exc
     if value < 1 or value > MAX_IMAGE_COUNT:
         raise HTTPException(status_code=400, detail={"error": f"n must be between 1 and {MAX_IMAGE_COUNT}"})

@@ -5,7 +5,7 @@ import json
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
@@ -113,6 +113,10 @@ def image_stream_error_message(message: str) -> str:
     if is_connection_timeout_error(text):
         return "upstream connection timed out, please retry later"
     return text or "image generation failed"
+
+
+def is_image_account_exhausted_error(exc: Exception) -> bool:
+    return isinstance(exc, ImageGenerationError) and exc.code == "insufficient_image_accounts"
 
 
 REFERENCED_IMAGE_IDS_RE = re.compile(r'"referenced_image_ids"\s*:\s*\[([^\]]+)\]')
@@ -370,6 +374,7 @@ class ImageTokenLeasePool:
     request: ConversationRequest
     excluded_tokens: set[str] = field(default_factory=set)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    wait_interval_seconds: float = 0.25
 
     def _filters(self) -> dict[str, Any]:
         plan_type, _ = split_image_model(self.request.model)
@@ -380,14 +385,50 @@ class ImageTokenLeasePool:
             "plan_types": ("plus", "team", "pro") if codex_model and not plan_type else None,
         }
 
-    def acquire(self) -> str:
+    def acquire(self, excluded_tokens: set[str] | None = None) -> str:
+        while True:
+            with self._lock:
+                combined_excluded_tokens = {*self.excluded_tokens, *(excluded_tokens or set())}
+            try:
+                token = account_service.get_available_access_token(
+                    **self._filters(),
+                    excluded_tokens=combined_excluded_tokens,
+                )
+            except RuntimeError as exc:
+                with self._lock:
+                    active_leases = set(self.excluded_tokens) - set(excluded_tokens or set())
+                    should_wait = bool(active_leases)
+                if not should_wait:
+                    raise exc
+                time.sleep(self.wait_interval_seconds)
+                continue
+            with self._lock:
+                if token not in self.excluded_tokens:
+                    self.excluded_tokens.add(token)
+                    return token
+            account_service.release_image_slot(token)
+            time.sleep(self.wait_interval_seconds)
+
+    def acquire_once(self) -> str:
         with self._lock:
-            token = account_service.get_available_access_token(
-                **self._filters(),
-                excluded_tokens=set(self.excluded_tokens),
-            )
+            excluded_tokens = set(self.excluded_tokens)
+        token = account_service.get_available_access_token(
+            **self._filters(),
+            excluded_tokens=excluded_tokens,
+        )
+        with self._lock:
+            if token in self.excluded_tokens:
+                account_service.release_image_slot(token)
+                raise RuntimeError("image account is already leased")
             self.excluded_tokens.add(token)
             return token
+
+    def release(self, token: str) -> None:
+        token = str(token or "").strip()
+        if not token:
+            return
+        with self._lock:
+            self.excluded_tokens.discard(token)
 
 
 def assistant_message_text(message: dict[str, Any]) -> str:
@@ -1266,7 +1307,7 @@ def _generate_single_image(
         if current_token:
             return current_token
         if token_pool is not None:
-            return token_pool.acquire()
+            return token_pool.acquire(attempted_tokens)
         plan_type, _ = split_image_model(request.model)
         codex_model = is_codex_image_model(request.model)
         return account_service.get_available_access_token(
@@ -1279,8 +1320,13 @@ def _generate_single_image(
     def release_current_token(success: bool) -> None:
         nonlocal current_token
         if current_token:
-            account_service.mark_image_result(current_token, success)
+            released_token = current_token
             current_token = ""
+            try:
+                account_service.mark_image_result(released_token, success)
+            finally:
+                if token_pool is not None:
+                    token_pool.release(released_token)
 
     def switch_token(success: bool = False) -> bool:
         nonlocal current_token
@@ -1288,7 +1334,7 @@ def _generate_single_image(
         if token_pool is None:
             return True
         try:
-            current_token = token_pool.acquire()
+            current_token = token_pool.acquire(attempted_tokens)
             return True
         except Exception:
             return False
@@ -1301,7 +1347,14 @@ def _generate_single_image(
             current_token = token
             attempted_tokens.add(token)
         except RuntimeError as exc:
-            raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
+            raise ImageGenerationError(
+                str(exc) or "no available image quota",
+                status_code=429,
+                error_type="rate_limit_error",
+                code="insufficient_image_accounts",
+                param="n",
+                account_email=account_email,
+            ) from exc
 
         emitted_for_token = False
         returned_message = False
@@ -1503,7 +1556,7 @@ def _acquire_unique_image_tokens(request: ConversationRequest, count: int) -> tu
     tokens: list[str] = []
     try:
         for _ in range(count):
-            token = token_pool.acquire()
+            token = token_pool.acquire_once()
             tokens.append(token)
     except Exception as exc:
         for token in tokens:
@@ -1531,7 +1584,7 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
             yield output
         return
 
-    tokens, token_pool = _acquire_unique_image_tokens(request, request.n)
+    token_pool = ImageTokenLeasePool(request)
 
     # 多张图片：根据配置选择并行或串行执行
     if not config.image_parallel_generation:
@@ -1540,45 +1593,55 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
             "n": request.n,
             "model": request.model,
         })
-        pending_tokens = dict(enumerate(tokens, start=1))
-        try:
-            for index in range(1, request.n + 1):
-                token = pending_tokens.pop(index)
-                outputs = _generate_single_image(request, index, request.n, token, token_pool)
-                for output in outputs:
-                    yield output
-        finally:
-            for token in pending_tokens.values():
-                account_service.release_image_slot(token)
+        for index in range(1, request.n + 1):
+            outputs = _generate_single_image(request, index, request.n, token_pool=token_pool)
+            for output in outputs:
+                yield output
         return
 
+    max_workers = min(20, request.n)
     logger.info({
         "event": "image_parallel_generation_start",
         "n": request.n,
         "model": request.model,
+        "max_workers": max_workers,
     })
     # 每张图片一个线程，同时启动
     futures = {}
     results: dict[int, list[ImageOutput]] = {}
     errors: dict[int, Exception] = {}
-    with ThreadPoolExecutor(max_workers=request.n) as executor:
-        for index, token in enumerate(tokens, start=1):
-            future = executor.submit(_generate_single_image, request, index, request.n, token, token_pool)
-            futures[future] = index
+    next_index = 1
+    stop_submitting = False
+
+    def submit_next(executor: ThreadPoolExecutor) -> None:
+        nonlocal next_index
+        future = executor.submit(_generate_single_image, request, next_index, request.n, "", token_pool)
+        futures[future] = next_index
+        next_index += 1
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        while next_index <= request.n and len(futures) < max_workers:
+            submit_next(executor)
 
         # 按完成顺序收集结果
-        for future in as_completed(futures):
-            index = futures[future]
-            try:
-                results[index] = future.result()
-            except Exception as exc:
-                errors[index] = exc
-                logger.warning({
-                    "event": "image_parallel_generation_error",
-                    "index": index,
-                    "error": str(exc)[:300],
-                })
-
+        while futures:
+            done, _pending = wait(set(futures), return_when=FIRST_COMPLETED)
+            for future in done:
+                index = futures.pop(future)
+                try:
+                    results[index] = future.result()
+                except Exception as exc:
+                    errors[index] = exc
+                    if is_image_account_exhausted_error(exc):
+                        stop_submitting = True
+                    logger.warning({
+                        "event": "image_parallel_generation_error",
+                        "index": index,
+                        "error": str(exc)[:300],
+                        "stop_submitting": stop_submitting,
+                    })
+                if not stop_submitting and next_index <= request.n:
+                    submit_next(executor)
     # yield 结果：跳过索引顺序限制，不再让低索引失败阻塞高索引成功结果
     emitted = False
     last_error = ""
@@ -1610,6 +1673,10 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     if not emitted:
         if not last_error:
             last_error = "no account in the pool could generate images — check account quota and rate-limit status"
+        for index in range(1, request.n + 1):
+            error = errors.get(index)
+            if isinstance(error, ImageGenerationError):
+                raise error
         raise ImageGenerationError(image_stream_error_message(last_error), conversation_id="")
 
 

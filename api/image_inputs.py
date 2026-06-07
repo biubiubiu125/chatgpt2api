@@ -48,7 +48,7 @@ def _parse_bool(value: object) -> bool | None:
 
 
 def _parse_count(value: object) -> int:
-    """解析生成数量：保持图片接口的 1 到 10 限制。"""
+    """解析生成数量：保持图片接口的 1 到 50 限制。"""
     return parse_image_count(value)
 
 

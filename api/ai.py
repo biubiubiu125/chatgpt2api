@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
@@ -25,7 +27,7 @@ from utils.helper import parse_image_count
 class ImageGenerationRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     model: str = "gpt-image-2"
-    n: int = 1
+    n: Any = 1
     size: str | None = None
     quality: str = "auto"
     response_format: str = "b64_json"
@@ -37,7 +39,7 @@ class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     model: str | None = None
     prompt: str | None = None
-    n: int | None = None
+    n: Any | None = None
     stream: bool | None = None
     modalities: list[str] | None = None
     messages: list[dict[str, object]] | None = None

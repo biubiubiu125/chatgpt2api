@@ -118,6 +118,7 @@ def run_account_refresh_cycle() -> dict[str, Any]:
     tokens = account_service.list_tokens()
     interval_minute = _refresh_account_interval_minute()
     start_detail = {
+        "event_type": "account_auto_refresh_start",
         "total": len(tokens),
         "interval_minute": interval_minute,
         "full_refresh": True,
@@ -137,6 +138,7 @@ def run_account_refresh_cycle() -> dict[str, Any]:
             "自动刷新账号完成",
             {
                 **start_detail,
+                "event_type": "account_auto_refresh_finished",
                 "refreshed": int(refresh_result.get("refreshed") or 0),
                 "error_count": _count_refresh_errors(refresh_result),
                 "relogined": int(refresh_result.get("relogined") or 0),
@@ -146,7 +148,7 @@ def run_account_refresh_cycle() -> dict[str, Any]:
     except Exception as exc:
         _add_account_log(
             "自动刷新账号失败",
-            {**start_detail, "error": str(exc)},
+            {**start_detail, "event_type": "account_auto_refresh_failed", "error": str(exc)},
         )
         raise
 
@@ -159,6 +161,7 @@ def run_account_refresh_cycle() -> dict[str, Any]:
             _add_account_log(
                 "refresh_token 保活完成",
                 {
+                    "event_type": "refresh_token_keepalive_finished",
                     "total": len(keepalive_tokens),
                     "refreshed": int(keepalive_result.get("refreshed") or 0),
                     "error_count": _count_refresh_errors(keepalive_result),
@@ -169,7 +172,7 @@ def run_account_refresh_cycle() -> dict[str, Any]:
         except Exception as exc:
             _add_account_log(
                 "refresh_token 保活失败",
-                {"total": len(keepalive_tokens), "error": str(exc)},
+                {"event_type": "refresh_token_keepalive_failed", "total": len(keepalive_tokens), "error": str(exc)},
             )
             raise
 

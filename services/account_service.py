@@ -19,6 +19,7 @@ from services.log_service import (
 )
 from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
+from utils.log import logger
 
 
 class AccountService:
@@ -303,6 +304,94 @@ class AccountService:
             account = self._accounts.get(resolved)
             return resolved, dict(account) if account else None
 
+    @staticmethod
+    def _log_int(value: object) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _account_log_snapshot(cls, account: dict | None) -> dict[str, Any]:
+        if not isinstance(account, dict):
+            return {}
+        return {
+            "status": account.get("status"),
+            "quota": max(0, cls._log_int(account.get("quota"))),
+            "image_quota_unknown": bool(account.get("image_quota_unknown")),
+            "success": cls._log_int(account.get("success")),
+            "fail": cls._log_int(account.get("fail")),
+        }
+
+    @classmethod
+    def _account_log_detail(
+        cls,
+        event_type: str,
+        access_token: str,
+        *,
+        before: dict | None = None,
+        after: dict | None = None,
+        account: dict | None = None,
+        source: str = "",
+        error: str = "",
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        subject = after if isinstance(after, dict) else account if isinstance(account, dict) else before or {}
+        before_state = cls._account_log_snapshot(before)
+        after_state = cls._account_log_snapshot(after or account)
+        detail: dict[str, Any] = {
+            "event_type": str(event_type or "").strip() or "account_event",
+            "token": anonymize_token(access_token),
+        }
+        email = str(subject.get("email") or "").strip()
+        if email:
+            detail["account_email"] = email
+        account_id = str(subject.get("account_id") or subject.get("user_id") or "").strip()
+        if account_id:
+            detail["account_id"] = account_id
+        account_type = str(subject.get("type") or "").strip()
+        if account_type:
+            detail["account_type"] = account_type
+        source_type = str(subject.get("source_type") or "").strip()
+        if source_type:
+            detail["source_type"] = source_type
+        if source:
+            detail["source"] = source
+        if before_state:
+            detail["before"] = before_state
+            detail["status_before"] = before_state.get("status")
+            detail["quota_before"] = before_state.get("quota")
+        if after_state:
+            detail["after"] = after_state
+            detail["status"] = after_state.get("status")
+            detail["quota"] = after_state.get("quota")
+            detail["status_after"] = after_state.get("status")
+            detail["quota_after"] = after_state.get("quota")
+        if before_state and after_state:
+            changes = {
+                key: {"from": before_state.get(key), "to": after_state.get(key)}
+                for key in ("status", "quota", "image_quota_unknown", "success", "fail")
+                if before_state.get(key) != after_state.get(key)
+            }
+            if changes:
+                detail["changes"] = changes
+        if error:
+            detail["error"] = str(error)
+        if extra:
+            detail.update(extra)
+        return detail
+
+    @staticmethod
+    def _add_account_log(summary: str, detail: dict[str, Any] | None = None) -> None:
+        try:
+            log_service.add(LOG_TYPE_ACCOUNT, summary, detail or {})
+        except Exception as exc:
+            logger.warning({
+                "event": "account_log_write_failed",
+                "summary": str(summary or "")[:120],
+                "error": str(exc)[:200],
+            })
+
     def _record_token_refresh_error(self, access_token: str, event: str, error: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
@@ -317,10 +406,16 @@ class AccountService:
             if account is not None:
                 self._accounts[resolved] = account
                 self._save_accounts()
-        log_service.add(
-            LOG_TYPE_ACCOUNT,
+        self._add_account_log(
             "refresh_token 刷新 access_token 失败",
-            {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
+            self._account_log_detail(
+                "access_token_refresh_failed",
+                resolved,
+                before=current,
+                after=account,
+                source=event,
+                error=str(error or ""),
+            ),
         )
 
     def _recent_token_refresh_error(self, account: dict) -> bool:
@@ -430,10 +525,16 @@ class AccountService:
             self._save_accounts()
             self._image_slot_condition.notify_all()
 
-        log_service.add(
-            LOG_TYPE_ACCOUNT,
+        self._add_account_log(
             "refresh_token 已刷新 access_token",
-            {"source": event, "token": anonymize_token(new_token), "rotated": rotated},
+            self._account_log_detail(
+                "access_token_refreshed",
+                new_token,
+                before=current,
+                after=account,
+                source=event,
+                extra={"old_token": anonymize_token(old_token), "rotated": rotated},
+            ),
         )
         return new_token
 
@@ -500,10 +601,10 @@ class AccountService:
                     "status": "正常",
                 }, quiet=True)
 
-                log_service.add(
-                    LOG_TYPE_ACCOUNT,
+                self._add_account_log(
                     "更新账号",
                     {
+                        "event_type": "password_relogin_succeeded",
                         "source": event,
                         "old_token": anonymize_token(access_token),
                         "new_token": anonymize_token(new_access_token),
@@ -517,10 +618,10 @@ class AccountService:
                 # 登录失败
                 error_type = result.get("error", "")
                 if error_type == "password_verify_failed_403" and isinstance(result.get("detail"), dict):
-                    log_service.add(
-                        LOG_TYPE_ACCOUNT,
+                    self._add_account_log(
                         "更新账号",
                         {
+                            "event_type": "password_relogin_failed",
                             "source": event,
                             "token": anonymize_token(access_token),
                             "email": email,
@@ -534,10 +635,10 @@ class AccountService:
                         # 账号已删除/停用 → 标记为禁用
                         self.update_account(access_token, {"status": "禁用", "quota": 0}, quiet=True)
                         account = self.get_account(access_token) or {}
-                        log_service.add(
-                            LOG_TYPE_ACCOUNT,
+                        self._add_account_log(
                             "账号已停用-标记禁用",
                             {
+                                "event_type": "password_relogin_account_deactivated",
                                 "source": event,
                                 "token": anonymize_token(access_token),
                                 "email": email,
@@ -552,10 +653,10 @@ class AccountService:
                         if progress_id:
                             self.update_relogin_progress(progress_id, access_token, "异常", error_type)
                 else:
-                    log_service.add(
-                        LOG_TYPE_ACCOUNT,
+                    self._add_account_log(
                         "更新账号",
                         {
+                            "event_type": "password_relogin_failed",
                             "source": event,
                             "token": anonymize_token(access_token),
                             "email": email,
@@ -569,10 +670,10 @@ class AccountService:
                     if progress_id:
                         self.update_relogin_progress(progress_id, access_token, "异常", error_type)
         except Exception as exc:
-            log_service.add(
-                LOG_TYPE_ACCOUNT,
+            self._add_account_log(
                 "更新账号",
                 {
+                    "event_type": "password_relogin_exception",
                     "source": event,
                     "token": anonymize_token(access_token),
                     "email": email,
@@ -984,15 +1085,22 @@ class AccountService:
         基于本地缓存做初筛，然后通过 fetch_remote_info 做远程验证（token 有效性、配额等）。
         限制最大尝试次数防止 token rotation 导致无限循环。
         """
-        max_attempts = 20  # 防止无限循环
         attempted_tokens: set[str] = self._normalize_excluded_tokens(excluded_tokens)
-        for _attempt in range(max_attempts):
-            access_token = self._acquire_next_candidate_token(
-                excluded_tokens=attempted_tokens,
-                plan_type=plan_type,
-                source_type=source_type,
-                plan_types=plan_types,
+        with self._lock:
+            max_attempts = max(
+                1,
+                len(self._list_ready_candidate_tokens(attempted_tokens, plan_type, source_type, plan_types)),
             )
+        for _attempt in range(max_attempts):
+            try:
+                access_token = self._acquire_next_candidate_token(
+                    excluded_tokens=attempted_tokens,
+                    plan_type=plan_type,
+                    source_type=source_type,
+                    plan_types=plan_types,
+                )
+            except RuntimeError:
+                break
             attempted_tokens.add(access_token)
             try:
                 account = self.fetch_remote_info(access_token, "get_available_access_token")
@@ -1055,8 +1163,14 @@ class AccountService:
             return False
         removed = bool(self.delete_accounts([access_token])["removed"])
         if removed:
-            log_service.add(LOG_TYPE_ACCOUNT, "自动移除异常账号",
-                            {"source": event, "token": anonymize_token(access_token)})
+            self._add_account_log(
+                "自动移除异常账号",
+                {
+                    "event_type": "account_auto_removed_invalid",
+                    "source": event,
+                    "token": anonymize_token(access_token),
+                },
+            )
         elif access_token:
             self.update_account(access_token, {"status": "异常", "quota": 0}, quiet=quiet)
         return removed
@@ -1165,8 +1279,10 @@ class AccountService:
                     self._accounts[access_token] = account
             self._save_accounts()
             items = [dict(item) for item in self._accounts.values()]
-            log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
-                            {"added": added, "skipped": skipped})
+            self._add_account_log(
+                f"新增 {added} 个账号，跳过 {skipped} 个",
+                {"event_type": "accounts_added", "added": added, "skipped": skipped},
+            )
         return {"added": added, "skipped": skipped, "items": items}
 
     def delete_accounts(self, tokens: list[str]) -> dict:
@@ -1189,7 +1305,10 @@ class AccountService:
                 else:
                     self._index = 0
                 self._save_accounts()
-                log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
+                self._add_account_log(
+                    f"删除 {removed} 个账号",
+                    {"event_type": "accounts_deleted", "removed": removed},
+                )
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
 
@@ -1207,13 +1326,29 @@ class AccountService:
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
                 self._save_accounts()
-                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
+                self._add_account_log(
+                    "自动移除限流账号",
+                    self._account_log_detail(
+                        "account_auto_removed_rate_limited",
+                        access_token,
+                        before=current,
+                        after=account,
+                    ),
+                )
                 return None
             self._accounts[access_token] = account
             self._save_accounts()
             if not quiet:
-                log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
-                                {"token": anonymize_token(access_token), "status": account.get("status")})
+                self._add_account_log(
+                    "更新账号",
+                    self._account_log_detail(
+                        "account_updated",
+                        access_token,
+                        before=current,
+                        after=account,
+                        extra={"updated_fields": sorted(str(key) for key in dict(updates or {}))},
+                    ),
+                )
             return dict(account)
         return None
 
@@ -1270,10 +1405,16 @@ class AccountService:
                 self._accounts[access_token] = account
                 self._save_accounts()
             if should_defer:
-                log_service.add(
-                    LOG_TYPE_ACCOUNT,
+                self._add_account_log(
                     "暂缓标记异常账号",
-                    {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
+                    self._account_log_detail(
+                        "invalid_token_deferred",
+                        access_token,
+                        before=current,
+                        after=account,
+                        source=event,
+                        error=str(error or ""),
+                    ),
                 )
                 return False
         return True
@@ -1307,10 +1448,27 @@ class AccountService:
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
                 self._save_accounts()
-                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
+                self._add_account_log(
+                    "自动移除限流账号",
+                    self._account_log_detail(
+                        "account_auto_removed_rate_limited",
+                        access_token,
+                        before=current,
+                        after=account,
+                    ),
+                )
                 return None
             self._accounts[access_token] = account
             self._save_accounts()
+            self._add_account_log(
+                "图片账号使用成功" if success else "图片账号使用失败",
+                self._account_log_detail(
+                    "image_generation_success" if success else "image_generation_failed",
+                    access_token,
+                    before=current,
+                    after=account,
+                ),
+            )
             return dict(account)
         return None
 
@@ -1493,7 +1651,25 @@ class AccountService:
                     # TLS/代理连接错误是网络问题，不计入账号失败
                     from services.protocol.conversation import is_tls_connection_error
                     if not is_tls_connection_error(error_str):
-                        errors.append({"token": anonymize_token(token), "error": error_str})
+                        account = self.get_account(token) or {}
+                        error_item = {
+                            "token": anonymize_token(token),
+                            "error": error_str,
+                        }
+                        email = str(account.get("email") or "").strip()
+                        if email:
+                            error_item["account_email"] = email
+                        errors.append(error_item)
+                        self._add_account_log(
+                            "刷新账号失败",
+                            self._account_log_detail(
+                                "account_refresh_failed",
+                                token,
+                                account=account,
+                                source="refresh_accounts",
+                                error=error_str,
+                            ),
+                        )
                 else:
                     if account is not None:
                         refreshed += 1
