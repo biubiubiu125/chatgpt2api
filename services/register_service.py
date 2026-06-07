@@ -20,8 +20,37 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _default_auto_refill_config() -> dict:
+    return {
+        "enabled": False,
+        "min_available": 30,
+        "batch_total": 100,
+        "check_interval": 300,
+    }
+
+
 def _default_config() -> dict:
-    return {**openai_register.config, "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
+    return {
+        **openai_register.config,
+        "mode": "total",
+        "target_quota": 100,
+        "target_available": 10,
+        "check_interval": 5,
+        "auto_refill": _default_auto_refill_config(),
+        "enabled": False,
+        "stats": {
+            "success": 0,
+            "fail": 0,
+            "done": 0,
+            "running": 0,
+            "threads": openai_register.config["threads"],
+            "elapsed_seconds": 0,
+            "avg_seconds": 0,
+            "success_rate": 0,
+            "current_quota": 0,
+            "current_available": 0,
+        },
+    }
 
 
 def _normalize(raw: dict) -> dict:
@@ -34,6 +63,13 @@ def _normalize(raw: dict) -> dict:
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
+    auto_refill_raw = cfg.get("auto_refill") if isinstance(cfg.get("auto_refill"), dict) else {}
+    auto_refill = {**_default_auto_refill_config(), **auto_refill_raw}
+    auto_refill["enabled"] = bool(auto_refill.get("enabled"))
+    auto_refill["min_available"] = max(1, int(auto_refill.get("min_available") or 1))
+    auto_refill["batch_total"] = max(1, int(auto_refill.get("batch_total") or 1))
+    auto_refill["check_interval"] = max(10, int(auto_refill.get("check_interval") or 300))
+    cfg["auto_refill"] = auto_refill
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
@@ -71,6 +107,14 @@ class RegisterService:
         if proxy and isinstance(self._config.get("mail"), dict):
             self._config["mail"]["proxy"] = proxy
 
+    @staticmethod
+    def _inject_proxy_to_run_config(run_config: dict) -> dict:
+        next_config = dict(run_config)
+        proxy = str(next_config.get("proxy") or "").strip()
+        if proxy and isinstance(next_config.get("mail"), dict):
+            next_config["mail"] = {**next_config["mail"], "proxy": proxy}
+        return next_config
+
     def update(self, updates: dict) -> dict:
         with self._lock:
             self._config = _normalize({**self._config, **updates})
@@ -80,24 +124,57 @@ class RegisterService:
             return self.get()
 
     def start(self) -> dict:
+        return self._start(trigger="manual")
+
+    def _start(
+        self,
+        trigger: str = "manual",
+        run_overrides: dict | None = None,
+        trigger_log: str | None = None,
+    ) -> dict:
         with self._lock:
             if self._runner and self._runner.is_alive():
                 self._config["enabled"] = True
                 self._save()
                 return self.get()
+            run_config = self._inject_proxy_to_run_config(_normalize({**self._config, **(run_overrides or {})}))
             self._config["enabled"] = True
             self._inject_proxy_to_mail()
             self._logs = []
             metrics = self._pool_metrics()
-            self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+            self._config["stats"] = {
+                "job_id": uuid.uuid4().hex,
+                "success": 0,
+                "fail": 0,
+                "done": 0,
+                "running": 0,
+                "threads": run_config["threads"],
+                **metrics,
+                "started_at": _now(),
+                "updated_at": _now(),
+                "trigger": trigger,
+                "run_mode": run_config["mode"],
+                "run_total": run_config["total"],
+            }
+            openai_register.config.update({k: run_config[k] for k in ("mail", "proxy", "total", "threads")})
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
             self._save()
-            self._runner = threading.Thread(target=self._run, daemon=True, name="openai-register")
+            self._runner = threading.Thread(target=self._run, args=(run_config, trigger), daemon=True, name="openai-register")
             self._runner.start()
-            self._append_log(f"注册任务启动，模式={self._config['mode']}，线程数={self._config['threads']}", "yellow")
+            if trigger_log:
+                self._append_log(trigger_log, "yellow")
+            self._append_log(f"注册任务启动，模式={run_config['mode']}，线程数={run_config['threads']}，触发={trigger}", "yellow")
             return self.get()
+
+    def start_auto_refill(self, batch_total: int, trigger_log: str | None = None) -> dict:
+        if not trigger_log:
+            trigger_log = f"自动补号触发：本轮注册={max(1, int(batch_total or 1))}"
+        return self._start(
+            trigger="auto_refill",
+            run_overrides={"mode": "total", "total": batch_total},
+            trigger_log=trigger_log,
+        )
 
     def stop(self) -> dict:
         with self._lock:
@@ -115,6 +192,10 @@ class RegisterService:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
             self._save()
             return self.get()
+
+    def is_running(self) -> bool:
+        with self._lock:
+            return bool(self._runner and self._runner.is_alive())
 
     def _append_log(self, text: str, color: str = "") -> None:
         with self._lock:
@@ -162,13 +243,14 @@ class RegisterService:
             self._config["stats"]["updated_at"] = _now()
             self._save()
 
-    def _run(self) -> None:
-        threads = int(self.get()["threads"])
+    def _run(self, run_config: dict | None = None, trigger: str = "manual") -> None:
+        base_config = dict(run_config or self.get())
+        threads = int(base_config["threads"])
         submitted, done, success, fail = 0, 0, 0, 0
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
             while True:
-                cfg = self.get()
+                cfg = dict(base_config if trigger == "auto_refill" else self.get())
                 while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
                     submitted += 1
                     futures.add(executor.submit(openai_register.worker, submitted))
@@ -192,6 +274,35 @@ class RegisterService:
             self._config["enabled"] = False
             self._save()
         self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow")
+
+    def start_auto_refill_watcher(self, stop_event: threading.Event) -> threading.Thread:
+        thread = threading.Thread(
+            target=self._auto_refill_loop,
+            args=(stop_event,),
+            daemon=True,
+            name="register-auto-refill",
+        )
+        thread.start()
+        return thread
+
+    def _auto_refill_loop(self, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
+            cfg = self.get()
+            auto_refill = cfg.get("auto_refill") if isinstance(cfg.get("auto_refill"), dict) else {}
+            interval = max(10, int(auto_refill.get("check_interval") or 300))
+            if auto_refill.get("enabled"):
+                metrics = self._pool_metrics()
+                min_available = max(1, int(auto_refill.get("min_available") or 1))
+                batch_total = max(1, int(auto_refill.get("batch_total") or 1))
+                running = bool(cfg.get("enabled")) or self.is_running()
+                if metrics["current_available"] < min_available and not running:
+                    trigger_log = (
+                        f"自动补号触发：当前正常账号={metrics['current_available']}，"
+                        f"阈值={min_available}，本轮注册={batch_total}"
+                    )
+                    self.start_auto_refill(batch_total, trigger_log=trigger_log)
+            if stop_event.wait(interval):
+                break
 
 
 register_service = RegisterService(REGISTER_FILE)

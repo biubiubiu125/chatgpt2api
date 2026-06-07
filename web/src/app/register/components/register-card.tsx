@@ -22,6 +22,7 @@ export function RegisterCard() {
   const setTargetQuota = useSettingsStore((state) => state.setRegisterTargetQuota);
   const setTargetAvailable = useSettingsStore((state) => state.setRegisterTargetAvailable);
   const setCheckInterval = useSettingsStore((state) => state.setRegisterCheckInterval);
+  const setAutoRefillField = useSettingsStore((state) => state.setRegisterAutoRefillField);
   const setMailField = useSettingsStore((state) => state.setRegisterMailField);
   const addProvider = useSettingsStore((state) => state.addRegisterProvider);
   const updateProvider = useSettingsStore((state) => state.updateRegisterProvider);
@@ -114,6 +115,46 @@ export function RegisterCard() {
             <div className="space-y-2">
               <label className="text-sm text-stone-700">检查间隔（秒）</label>
               <Input value={String(config.check_interval || "")} onChange={(event) => setCheckInterval(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled || config.mode === "total"} />
+            </div>
+          </div>
+
+          <div className="space-y-3 border-t border-stone-200 pt-3">
+            <div className="flex items-center gap-2">
+              <Checkbox
+                checked={Boolean(config.auto_refill?.enabled)}
+                onCheckedChange={(checked) => setAutoRefillField("enabled", Boolean(checked))}
+                disabled={config.enabled}
+              />
+              <label className="text-sm font-medium text-stone-800">自动补号</label>
+            </div>
+            <div className="grid gap-4 md:grid-cols-3">
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">低于正常账号</label>
+                <Input
+                  value={String(config.auto_refill?.min_available || "")}
+                  onChange={(event) => setAutoRefillField("min_available", event.target.value)}
+                  className="h-10 rounded-xl border-stone-200 bg-white"
+                  disabled={config.enabled}
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">每轮注册数</label>
+                <Input
+                  value={String(config.auto_refill?.batch_total || "")}
+                  onChange={(event) => setAutoRefillField("batch_total", event.target.value)}
+                  className="h-10 rounded-xl border-stone-200 bg-white"
+                  disabled={config.enabled}
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">补号检查间隔（秒）</label>
+                <Input
+                  value={String(config.auto_refill?.check_interval || "")}
+                  onChange={(event) => setAutoRefillField("check_interval", event.target.value)}
+                  className="h-10 rounded-xl border-stone-200 bg-white"
+                  disabled={config.enabled}
+                />
+              </div>
             </div>
           </div>
 

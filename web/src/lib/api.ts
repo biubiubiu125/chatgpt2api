@@ -277,6 +277,12 @@ export type RegisterConfig = {
   target_quota: number;
   target_available: number;
   check_interval: number;
+  auto_refill: {
+    enabled: boolean;
+    min_available: number;
+    batch_total: number;
+    check_interval: number;
+  };
   stats: {
     job_id?: string;
     success: number;
@@ -292,6 +298,9 @@ export type RegisterConfig = {
     started_at?: string;
     updated_at?: string;
     finished_at?: string;
+    trigger?: string;
+    run_mode?: string;
+    run_total?: number;
   };
   logs?: Array<{
     time: string;

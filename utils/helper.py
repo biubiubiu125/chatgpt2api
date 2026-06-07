@@ -452,8 +452,8 @@ def parse_image_count(raw_value: object) -> int:
         value = int(raw_value or 1)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail={"error": "n must be an integer"}) from exc
-    if value < 1 or value > 4:
-        raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 4"})
+    if value < 1 or value > 10:
+        raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 10"})
     return value
 
 

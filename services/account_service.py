@@ -889,6 +889,22 @@ class AccountService:
         with self._lock:
             return list(self._accounts)
 
+    def _normalize_excluded_tokens_locked(self, excluded_tokens: set[str] | None = None) -> set[str]:
+        normalized: set[str] = set()
+        for token in excluded_tokens or set():
+            raw_token = str(token or "").strip()
+            if not raw_token:
+                continue
+            normalized.add(raw_token)
+            resolved_token = self._resolve_access_token_locked(raw_token)
+            if resolved_token:
+                normalized.add(resolved_token)
+        return normalized
+
+    def _normalize_excluded_tokens(self, excluded_tokens: set[str] | None = None) -> set[str]:
+        with self._lock:
+            return self._normalize_excluded_tokens_locked(excluded_tokens)
+
     def _list_ready_candidate_tokens(
             self,
             excluded_tokens: set[str] | None = None,
@@ -896,7 +912,7 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> list[str]:
-        excluded = set(excluded_tokens or set())
+        excluded = self._normalize_excluded_tokens_locked(excluded_tokens)
         return [
             token
             for item in self._accounts.values()
@@ -961,6 +977,7 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            excluded_tokens: set[str] | None = None,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -968,7 +985,7 @@ class AccountService:
         限制最大尝试次数防止 token rotation 导致无限循环。
         """
         max_attempts = 20  # 防止无限循环
-        attempted_tokens: set[str] = set()
+        attempted_tokens: set[str] = self._normalize_excluded_tokens(excluded_tokens)
         for _attempt in range(max_attempts):
             access_token = self._acquire_next_candidate_token(
                 excluded_tokens=attempted_tokens,

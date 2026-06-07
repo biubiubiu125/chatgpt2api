@@ -20,6 +20,7 @@ class RegisterConfigRequest(BaseModel):
     target_quota: int | None = None
     target_available: int | None = None
     check_interval: int | None = None
+    auto_refill: dict | None = None
 
 
 def create_router() -> APIRouter:
