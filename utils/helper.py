@@ -1,13 +1,15 @@
 import base64
 import hashlib
+import ipaddress
 import json
 import mimetypes
 import re
+import socket
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from curl_cffi import requests
 from fastapi import HTTPException
@@ -28,8 +30,11 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
 MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_JSON_EDIT_IMAGES = 10
+MAX_IMAGE_COUNT = 10
 DATA_URL_IMAGE_RE = re.compile(r"^data:(?P<mime>[-+./\w]+);base64,(?P<data>.*)$", re.DOTALL)
 REMOTE_IMAGE_TIMEOUT_SECONDS = 20
+REMOTE_IMAGE_MAX_REDIRECTS = 5
+REMOTE_IMAGE_CHUNK_SIZE = 64 * 1024
 
 
 def _image_extension(mime_type: str) -> str:
@@ -326,6 +331,130 @@ def _message_image_url(value: object) -> str:
     return str(value or "").strip()
 
 
+def _blocked_remote_address(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return True
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    return ip.is_multicast or not ip.is_global
+
+
+def _validate_remote_image_url(source: str):
+    parsed = urlparse(source)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"})
+    try:
+        host = parsed.hostname
+        _ = parsed.port
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"}) from exc
+    if not host:
+        raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"})
+    try:
+        addresses = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail={"error": "image_url host could not be resolved"}) from exc
+    if not addresses:
+        raise HTTPException(status_code=400, detail={"error": "image_url host could not be resolved"})
+    for address in {item[4][0] for item in addresses if item and len(item) >= 5 and item[4]}:
+        if _blocked_remote_address(address):
+            raise HTTPException(status_code=400, detail={"error": "image_url host is not allowed"})
+    return parsed
+
+
+def _response_header(response: object, name: str) -> str:
+    headers = getattr(response, "headers", {}) or {}
+    if hasattr(headers, "get"):
+        return str(headers.get(name) or headers.get(name.lower()) or headers.get(name.upper()) or "").strip()
+    return ""
+
+
+def _read_limited_response(response: object, max_bytes: int, size_error: str) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    iterator = getattr(response, "iter_content", None)
+    if callable(iterator):
+        for chunk in iterator(chunk_size=REMOTE_IMAGE_CHUNK_SIZE):
+            if not chunk:
+                continue
+            if isinstance(chunk, str):
+                chunk = chunk.encode()
+            total += len(chunk)
+            if total > max_bytes:
+                raise HTTPException(status_code=400, detail={"error": size_error})
+            chunks.append(bytes(chunk))
+        return b"".join(chunks)
+
+    data = getattr(response, "content", b"")
+    if isinstance(data, str):
+        data = data.encode()
+    data = bytes(data or b"")
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=400, detail={"error": size_error})
+    return data
+
+
+def safe_download_remote_image_url(
+        source: str,
+        *,
+        max_bytes: int,
+        timeout: int | float,
+        user_agent: str,
+        size_error: str,
+) -> tuple[bytes, object, str]:
+    current = str(source or "").strip()
+    _validate_remote_image_url(current)
+    response = None
+    try:
+        for _redirect in range(REMOTE_IMAGE_MAX_REDIRECTS + 1):
+            response = requests.get(
+                current,
+                headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": user_agent},
+                timeout=timeout,
+                allow_redirects=False,
+                stream=True,
+                **proxy_settings.build_session_kwargs(),
+            )
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if status_code in {301, 302, 303, 307, 308}:
+                location = _response_header(response, "location")
+                if not location:
+                    raise HTTPException(status_code=400, detail={"error": "image_url redirect missing location"})
+                current = urljoin(current, location)
+                _validate_remote_image_url(current)
+                closer = getattr(response, "close", None)
+                if callable(closer):
+                    closer()
+                response = None
+                continue
+            break
+        else:
+            raise HTTPException(status_code=400, detail={"error": "image_url redirects too many times"})
+
+        if response is None:
+            raise HTTPException(status_code=400, detail={"error": "image_url fetch failed"})
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if not 200 <= status_code < 300:
+            raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {status_code}"})
+        content_length = _response_header(response, "content-length")
+        if content_length.isdigit() and int(content_length) > max_bytes:
+            raise HTTPException(status_code=400, detail={"error": size_error})
+        data = _read_limited_response(response, max_bytes, size_error)
+        if not data:
+            raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
+        return data, response, current
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
+    finally:
+        closer = getattr(response, "close", None)
+        if callable(closer):
+            closer()
+
+
 def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
     source = _message_image_url(value)
     if source.startswith("data:"):
@@ -334,31 +463,15 @@ def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
         return base64.b64decode(data), mime
     if not source.startswith(("http://", "https://")):
         return None
-    parsed = urlparse(source)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return None
-
-    try:
-        response = requests.get(
-            source,
-            headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api vision fetcher"},
-            timeout=REMOTE_IMAGE_TIMEOUT_SECONDS,
-            allow_redirects=True,
-            **proxy_settings.build_session_kwargs(),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
-    if not 200 <= response.status_code < 300:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
-    content_length = str(response.headers.get("content-length") or "").strip()
-    if content_length.isdigit() and int(content_length) > MAX_JSON_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
-    image_data = response.content
-    if not image_data:
-        raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
-    if len(image_data) > MAX_JSON_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
-    mime = str(response.headers.get("content-type") or "image/png").split(";", 1)[0].lower()
+    image_data, response, final_url = safe_download_remote_image_url(
+        source,
+        max_bytes=MAX_JSON_IMAGE_BYTES,
+        timeout=REMOTE_IMAGE_TIMEOUT_SECONDS,
+        user_agent="chatgpt2api vision fetcher",
+        size_error="image_url exceeds 10MB limit",
+    )
+    parsed = urlparse(final_url)
+    mime = _response_header(response, "content-type").split(";", 1)[0].lower() or "image/png"
     guessed_mime = mimetypes.guess_type(parsed.path)[0] or ""
     if mime and not mime.startswith("image/") and mime not in {"application/octet-stream", "binary/octet-stream"}:
         raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
@@ -452,8 +565,8 @@ def parse_image_count(raw_value: object) -> int:
         value = int(raw_value or 1)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail={"error": "n must be an integer"}) from exc
-    if value < 1 or value > 10:
-        raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 10"})
+    if value < 1 or value > MAX_IMAGE_COUNT:
+        raise HTTPException(status_code=400, detail={"error": f"n must be between 1 and {MAX_IMAGE_COUNT}"})
     return value
 
 

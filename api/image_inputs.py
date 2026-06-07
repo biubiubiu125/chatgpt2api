@@ -9,12 +9,11 @@ from pathlib import PurePosixPath
 from typing import Any, TypeGuard
 from urllib.parse import unquote, unquote_to_bytes, urlparse
 
-from curl_cffi import requests
 from fastapi import HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
-from services.proxy_service import proxy_settings
+from utils.helper import parse_image_count, safe_download_remote_image_url
 
 ImageInput = tuple[bytes, str, str]
 ImageSource = str | UploadFile | ImageInput
@@ -50,13 +49,7 @@ def _parse_bool(value: object) -> bool | None:
 
 def _parse_count(value: object) -> int:
     """解析生成数量：保持图片接口的 1 到 10 限制。"""
-    try:
-        count = int(value or 1)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail={"error": "n must be an integer"}) from exc
-    if count < 1 or count > 10:
-        raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 10"})
-    return count
+    return parse_image_count(value)
 
 
 def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
@@ -219,7 +212,7 @@ def _decode_data_url(url: str) -> ImageInput:
     return data, f"image_url.{_extension_from_mime(mime_type)}", mime_type
 
 
-def _response_mime_type(response: requests.Response, parsed_path: str) -> str:
+def _response_mime_type(response: object, parsed_path: str) -> str:
     """识别下载图片类型：优先响应头，必要时按 URL 后缀推断。"""
     header_type = str(response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
     guessed_type = mimetypes.guess_type(parsed_path)[0] or ""
@@ -248,28 +241,16 @@ def _download_image_url(url: str) -> ImageInput:
     parsed = urlparse(source)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"})
-    try:
-        response = requests.get(
-            source,
-            headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image fetcher"},
-            timeout=60,
-            allow_redirects=True,
-            **proxy_settings.build_session_kwargs(),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
-    if not 200 <= response.status_code < 300:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
-    content_length = _clean(response.headers.get("content-length"))
-    if content_length and content_length.isdigit() and int(content_length) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
-    data = response.content
-    if not data:
-        raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
-    if len(data) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
-    mime_type = _response_mime_type(response, parsed.path)
-    return data, _filename_from_url(parsed.path, mime_type), mime_type
+    data, response, final_url = safe_download_remote_image_url(
+        source,
+        max_bytes=MAX_IMAGE_REFERENCE_BYTES,
+        timeout=60,
+        user_agent="chatgpt2api image fetcher",
+        size_error="image_url exceeds 50MB limit",
+    )
+    final_path = urlparse(final_url).path or parsed.path
+    mime_type = _response_mime_type(response, final_path)
+    return data, _filename_from_url(final_path, mime_type), mime_type
 
 
 async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:

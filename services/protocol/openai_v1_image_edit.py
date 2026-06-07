@@ -11,6 +11,7 @@ from services.protocol.conversation import (
     stream_image_chunks,
     stream_image_outputs_with_pool,
 )
+from utils.helper import parse_image_count
 from utils.image_tokens import count_image_inputs_tokens, count_image_output_items_tokens, image_usage
 
 
@@ -18,7 +19,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     prompt = str(body.get("prompt") or "")
     images = body.get("images") or []
     model = str(body.get("model") or "gpt-image-2")
-    n = int(body.get("n") or 1)
+    n = parse_image_count(body.get("n"))
     size = body.get("size")
     quality = str(body.get("quality") or "auto")
     response_format = str(body.get("response_format") or "b64_json")

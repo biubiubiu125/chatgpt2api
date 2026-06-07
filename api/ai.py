@@ -19,12 +19,13 @@ from services.protocol import (
     openai_v1_response,
     openai_search,
 )
+from utils.helper import parse_image_count
 
 
 class ImageGenerationRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     model: str = "gpt-image-2"
-    n: int = Field(default=1, ge=1, le=10)
+    n: int = 1
     size: str | None = None
     quality: str = "auto"
     response_format: str = "b64_json"
@@ -96,6 +97,7 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
+        payload["n"] = parse_image_count(payload.get("n"))
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
         await filter_or_log(call, body.prompt)

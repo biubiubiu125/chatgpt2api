@@ -509,7 +509,7 @@ export function ImageComposer({
                               type="number"
                               inputMode="numeric"
                               min="1"
-                              max="100"
+                              max="10"
                               step="1"
                               value={imageCount}
                               onChange={(event) => onImageCountChange(event.target.value)}

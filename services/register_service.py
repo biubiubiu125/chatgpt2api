@@ -10,6 +10,7 @@ from pathlib import Path
 
 from services.account_service import account_service
 from services.config import DATA_DIR
+from services.log_service import LOG_TYPE_ACCOUNT, log_service
 from services.register import openai_register
 
 
@@ -136,6 +137,17 @@ class RegisterService:
             if self._runner and self._runner.is_alive():
                 self._config["enabled"] = True
                 self._save()
+                if trigger == "auto_refill":
+                    current_available = int(self._config.get("stats", {}).get("current_available") or 0)
+                    auto_refill = self._config.get("auto_refill") if isinstance(self._config.get("auto_refill"), dict) else {}
+                    self._log_auto_refill_decision(
+                        started=False,
+                        reason="register_task_running",
+                        current_available=current_available,
+                        min_available=max(1, int(auto_refill.get("min_available") or 1)),
+                        batch_total=max(1, int((run_overrides or {}).get("total") or auto_refill.get("batch_total") or 1)),
+                        message=trigger_log or "",
+                    )
                 return self.get()
             run_config = self._inject_proxy_to_run_config(_normalize({**self._config, **(run_overrides or {})}))
             self._config["enabled"] = True
@@ -164,6 +176,15 @@ class RegisterService:
             self._runner.start()
             if trigger_log:
                 self._append_log(trigger_log, "yellow")
+            if trigger == "auto_refill":
+                self._log_auto_refill_decision(
+                    started=True,
+                    reason="below_min_available",
+                    current_available=int(metrics.get("current_available") or 0),
+                    min_available=max(1, int(run_config.get("auto_refill", {}).get("min_available") or 1)),
+                    batch_total=max(1, int(run_config.get("total") or 1)),
+                    message=trigger_log or "",
+                )
             self._append_log(f"注册任务启动，模式={run_config['mode']}，线程数={run_config['threads']}，触发={trigger}", "yellow")
             return self.get()
 
@@ -201,6 +222,35 @@ class RegisterService:
         with self._lock:
             self._logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})
             self._logs = self._logs[-300:]
+
+    @staticmethod
+    def _add_account_log(summary: str, detail: dict) -> None:
+        try:
+            log_service.add(LOG_TYPE_ACCOUNT, summary, detail)
+        except Exception:
+            pass
+
+    def _log_auto_refill_decision(
+        self,
+        *,
+        started: bool,
+        reason: str,
+        current_available: int,
+        min_available: int,
+        batch_total: int,
+        message: str = "",
+    ) -> None:
+        detail = {
+            "trigger": "auto_refill",
+            "started": started,
+            "reason": reason,
+            "current_available": current_available,
+            "min_available": min_available,
+            "batch_total": batch_total,
+        }
+        if message:
+            detail["message"] = message
+        self._add_account_log("自动补号启动" if started else "自动补号跳过", detail)
 
     def _pool_metrics(self) -> dict:
         items = account_service.list_accounts()
@@ -295,7 +345,15 @@ class RegisterService:
                 min_available = max(1, int(auto_refill.get("min_available") or 1))
                 batch_total = max(1, int(auto_refill.get("batch_total") or 1))
                 running = bool(cfg.get("enabled")) or self.is_running()
-                if metrics["current_available"] < min_available and not running:
+                if metrics["current_available"] < min_available and running:
+                    self._log_auto_refill_decision(
+                        started=False,
+                        reason="register_task_running",
+                        current_available=metrics["current_available"],
+                        min_available=min_available,
+                        batch_total=batch_total,
+                    )
+                elif metrics["current_available"] < min_available:
                     trigger_log = (
                         f"自动补号触发：当前正常账号={metrics['current_available']}，"
                         f"阈值={min_available}，本轮注册={batch_total}"

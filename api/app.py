@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 
 from api import accounts, ai, image_tasks, register, system
 from api.errors import install_exception_handlers
-from api.support import resolve_web_asset, start_limited_account_watcher
+from api.support import resolve_web_asset, start_account_refresh_watcher
 from services.backup_service import backup_service
 from services.config import config
 from services.image_service import start_image_cleanup_scheduler
@@ -22,7 +22,7 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         stop_event = Event()
-        thread = start_limited_account_watcher(stop_event)
+        thread = start_account_refresh_watcher(stop_event)
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
         auto_refill_thread = register_service.start_auto_refill_watcher(stop_event)
         backup_service.start()

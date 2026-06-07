@@ -1257,6 +1257,7 @@ def _generate_single_image(
     poll_timeout_retry_count = 0
     account_email = ""
     current_token = str(access_token or "").strip()
+    attempted_tokens: set[str] = {current_token} if current_token else set()
     use_lease_pool = token_pool is not None or bool(current_token)
     if token_pool is None and current_token:
         token_pool = ImageTokenLeasePool(request, {current_token})
@@ -1272,6 +1273,7 @@ def _generate_single_image(
             plan_type=plan_type,
             source_type="codex" if codex_model else None,
             plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
+            excluded_tokens=attempted_tokens,
         )
 
     def release_current_token(success: bool) -> None:
@@ -1297,6 +1299,7 @@ def _generate_single_image(
                 request.progress_callback("getting_account")
             token = acquire_token()
             current_token = token
+            attempted_tokens.add(token)
         except RuntimeError as exc:
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
 
