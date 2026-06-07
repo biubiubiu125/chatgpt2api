@@ -359,6 +359,14 @@ class RegisterService:
                         f"阈值={min_available}，本轮注册={batch_total}"
                     )
                     self.start_auto_refill(batch_total, trigger_log=trigger_log)
+                else:
+                    self._log_auto_refill_decision(
+                        started=False,
+                        reason="enough_available",
+                        current_available=metrics["current_available"],
+                        min_available=min_available,
+                        batch_total=batch_total,
+                    )
             if stop_event.wait(interval):
                 break
 

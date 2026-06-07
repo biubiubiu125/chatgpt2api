@@ -107,6 +107,13 @@ def _status_counts(items: object) -> dict[str, int]:
     return counts
 
 
+def _add_account_log(summary: str, detail: dict[str, Any]) -> None:
+    try:
+        log_service.add(LOG_TYPE_ACCOUNT, summary, detail)
+    except Exception as exc:
+        print(f"[account-watcher] log fail {exc}")
+
+
 def run_account_refresh_cycle() -> dict[str, Any]:
     tokens = account_service.list_tokens()
     interval_minute = _refresh_account_interval_minute()
@@ -116,7 +123,7 @@ def run_account_refresh_cycle() -> dict[str, Any]:
         "full_refresh": True,
         "defer_invalid_removal": False,
     }
-    log_service.add(LOG_TYPE_ACCOUNT, "自动刷新账号开始", start_detail)
+    _add_account_log("自动刷新账号开始", start_detail)
 
     try:
         if tokens:
@@ -126,8 +133,7 @@ def run_account_refresh_cycle() -> dict[str, Any]:
             print("[account-watcher] no accounts to refresh")
             refresh_result = {"refreshed": 0, "errors": [], "items": [], "relogined": 0}
 
-        log_service.add(
-            LOG_TYPE_ACCOUNT,
+        _add_account_log(
             "自动刷新账号完成",
             {
                 **start_detail,
@@ -138,8 +144,7 @@ def run_account_refresh_cycle() -> dict[str, Any]:
             },
         )
     except Exception as exc:
-        log_service.add(
-            LOG_TYPE_ACCOUNT,
+        _add_account_log(
             "自动刷新账号失败",
             {**start_detail, "error": str(exc)},
         )
@@ -151,8 +156,7 @@ def run_account_refresh_cycle() -> dict[str, Any]:
         print(f"[account-watcher] keepalive {len(keepalive_tokens)} refresh tokens")
         try:
             keepalive_result = account_service.keepalive_refresh_tokens(keepalive_tokens)
-            log_service.add(
-                LOG_TYPE_ACCOUNT,
+            _add_account_log(
                 "refresh_token 保活完成",
                 {
                     "total": len(keepalive_tokens),
@@ -163,8 +167,7 @@ def run_account_refresh_cycle() -> dict[str, Any]:
             if keepalive_result.get("errors"):
                 print(f"[account-watcher] keepalive errors: {keepalive_result['errors']}")
         except Exception as exc:
-            log_service.add(
-                LOG_TYPE_ACCOUNT,
+            _add_account_log(
                 "refresh_token 保活失败",
                 {"total": len(keepalive_tokens), "error": str(exc)},
             )
