@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urljoin, urlparse
 
-from curl_cffi import requests
+from curl_cffi import CurlOpt, requests
 from fastapi import HTTPException
 from services.proxy_service import proxy_settings
 from utils.log import logger
@@ -341,13 +341,26 @@ def _blocked_remote_address(address: str) -> bool:
     return ip.is_multicast or not ip.is_global
 
 
-def _validate_remote_image_url(source: str):
+def _remote_image_port(parsed) -> int:
+    if parsed.port:
+        return int(parsed.port)
+    return 443 if parsed.scheme == "https" else 80
+
+
+def _resolve_entry_address(address: str) -> str:
+    ip = ipaddress.ip_address(address)
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    return f"[{ip}]" if ip.version == 6 else str(ip)
+
+
+def _validate_remote_image_url(source: str) -> tuple[object, str, int, list[str]]:
     parsed = urlparse(source)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"})
     try:
         host = parsed.hostname
-        _ = parsed.port
+        port = _remote_image_port(parsed)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"}) from exc
     if not host:
@@ -358,10 +371,28 @@ def _validate_remote_image_url(source: str):
         raise HTTPException(status_code=400, detail={"error": "image_url host could not be resolved"}) from exc
     if not addresses:
         raise HTTPException(status_code=400, detail={"error": "image_url host could not be resolved"})
-    for address in {item[4][0] for item in addresses if item and len(item) >= 5 and item[4]}:
+    resolved = sorted({item[4][0] for item in addresses if item and len(item) >= 5 and item[4]})
+    for address in resolved:
         if _blocked_remote_address(address):
             raise HTTPException(status_code=400, detail={"error": "image_url host is not allowed"})
-    return parsed
+    return parsed, host, port, resolved
+
+
+def _remote_image_resolve_options(host: str, port: int, addresses: list[str]) -> dict:
+    if not addresses:
+        return {}
+    resolved_addresses = ",".join(_resolve_entry_address(address) for address in addresses)
+    return {CurlOpt.RESOLVE: [f"{host}:{port}:{resolved_addresses}"]}
+
+
+def _remote_image_request_kwargs() -> dict[str, object]:
+    kwargs = proxy_settings.build_session_kwargs()
+    if kwargs.get("proxy") or kwargs.get("proxies"):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "remote image URLs are not supported when an outbound proxy is configured"},
+        )
+    return kwargs
 
 
 def _response_header(response: object, name: str) -> str:
@@ -403,19 +434,22 @@ def safe_download_remote_image_url(
         timeout: int | float,
         user_agent: str,
         size_error: str,
-) -> tuple[bytes, object, str]:
+    ) -> tuple[bytes, object, str]:
     current = str(source or "").strip()
     _validate_remote_image_url(current)
     response = None
     try:
         for _redirect in range(REMOTE_IMAGE_MAX_REDIRECTS + 1):
+            _parsed, host, port, addresses = _validate_remote_image_url(current)
+            request_kwargs = _remote_image_request_kwargs()
             response = requests.get(
                 current,
                 headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": user_agent},
                 timeout=timeout,
                 allow_redirects=False,
                 stream=True,
-                **proxy_settings.build_session_kwargs(),
+                curl_options=_remote_image_resolve_options(host, port, addresses),
+                **request_kwargs,
             )
             status_code = int(getattr(response, "status_code", 0) or 0)
             if status_code in {301, 302, 303, 307, 308}:
