@@ -128,7 +128,7 @@ def run_account_refresh_cycle() -> dict[str, Any]:
         "expiring_access_tokens": len(expiring_tokens),
         "interval_minute": interval_minute,
         "full_refresh": True,
-        "defer_invalid_removal": False,
+        "defer_invalid_removal": True,
     }
     _add_account_log("自动刷新账号开始", start_detail)
 
@@ -140,7 +140,7 @@ def run_account_refresh_cycle() -> dict[str, Any]:
                 f"{len(normal_tokens)} normal accounts, "
                 f"{len(expiring_tokens)} expiring access tokens"
             )
-            refresh_result = account_service.refresh_accounts(tokens, defer_invalid_removal=False)
+            refresh_result = account_service.refresh_accounts(tokens, defer_invalid_removal=True)
         else:
             print("[account-watcher] no accounts to refresh")
             refresh_result = {"refreshed": 0, "errors": [], "items": [], "relogined": 0}

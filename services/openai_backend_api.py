@@ -802,7 +802,38 @@ class OpenAIBackendAPI:
             retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
             raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
 
-    def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
+    @staticmethod
+    def _image_generation_metadata(size: str | None = None, quality: str = "auto") -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {
+            "developer_mode_connector_ids": [],
+            "selected_github_repos": [],
+            "selected_all_github_repos": False,
+            "system_hints": ["picture_v2"],
+            "serialization_metadata": {"custom_symbol_offsets": []},
+        }
+        normalized_quality = str(quality or "auto")
+        image_generation: Dict[str, Any] = {
+            "model": "gpt-image-2",
+            "output_format": "png",
+        }
+        if size:
+            image_generation["size"] = str(size)
+        if size or normalized_quality != "auto":
+            image_generation["quality"] = normalized_quality
+        if len(image_generation) > 2:
+            metadata["image_generation"] = image_generation
+            metadata["requested_image_size"] = image_generation.get("size")
+            metadata["requested_image_quality"] = image_generation.get("quality")
+        return metadata
+
+    def _prepare_image_conversation(
+            self,
+            prompt: str,
+            requirements: ChatRequirements,
+            model: str,
+            size: str | None = None,
+            quality: str = "auto",
+    ) -> str:
         """为图片生成准备 conduit token。"""
         path = "/backend-api/f/conversation/prepare"
         payload = {
@@ -819,6 +850,7 @@ class OpenAIBackendAPI:
                 "id": new_uuid(),
                 "author": {"role": "user"},
                 "content": {"content_type": "text", "parts": [prompt]},
+                "metadata": self._image_generation_metadata(size, quality),
             },
             "supports_buffering": True,
             "supported_encodings": ["v1"],
@@ -907,8 +939,16 @@ class OpenAIBackendAPI:
             "height": height,
         }
 
-    def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
-                                references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
+    def _start_image_generation(
+            self,
+            prompt: str,
+            requirements: ChatRequirements,
+            conduit_token: str,
+            model: str,
+            references: Optional[list[Dict[str, Any]]] = None,
+            size: str | None = None,
+            quality: str = "auto",
+    ) -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
         references = references or []
         parts = [{
@@ -921,13 +961,7 @@ class OpenAIBackendAPI:
         parts.append(prompt)
         content = {"content_type": "multimodal_text", "parts": parts} if references else {"content_type": "text",
                                                                                           "parts": [prompt]}
-        metadata = {
-            "developer_mode_connector_ids": [],
-            "selected_github_repos": [],
-            "selected_all_github_repos": False,
-            "system_hints": ["picture_v2"],
-            "serialization_metadata": {"custom_symbol_offsets": []},
-        }
+        metadata = self._image_generation_metadata(size, quality)
         if references:
             metadata["attachments"] = [{
                 "id": item["file_id"],
@@ -2479,10 +2513,12 @@ class OpenAIBackendAPI:
             prompt: str = "",
             images: Optional[list[str]] = None,
             system_hints: Optional[list[str]] = None,
+            size: str | None = None,
+            quality: str = "auto",
     ) -> Iterator[str]:
         system_hints = system_hints or []
         if "picture_v2" in system_hints:
-            yield from self._stream_picture_conversation(prompt, model, images or [])
+            yield from self._stream_picture_conversation(prompt, model, images or [], size, quality)
             return
 
         normalized = messages or [{"role": "user", "content": prompt}]
@@ -2516,6 +2552,8 @@ class OpenAIBackendAPI:
             prompt: str,
             model: str,
             images: list[str],
+            size: str | None = None,
+            quality: str = "auto",
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
@@ -2526,9 +2564,9 @@ class OpenAIBackendAPI:
         self._report_progress("getting_token")
         requirements = self._get_chat_requirements()
         self._report_progress("preparing_conversation")
-        conduit_token = self._prepare_image_conversation(prompt, requirements, model)
+        conduit_token = self._prepare_image_conversation(prompt, requirements, model, size, quality)
         self._report_progress("starting_generation")
-        response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
+        response = self._start_image_generation(prompt, requirements, conduit_token, model, references, size, quality)
         self._report_progress("generating")
         try:
             yield from iter_sse_payloads(response)

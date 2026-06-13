@@ -20,6 +20,7 @@ TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_ERROR = "error"
 TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
+MAX_TASK_GROUP_WORKERS = 20
 
 
 def _now_iso() -> str:
@@ -52,6 +53,11 @@ def _task_key(owner_id: str, task_id: str) -> str:
     return f"{owner_id}:{task_id}"
 
 
+def _task_group_key(owner_id: str, group_id: str, task_id: str) -> str:
+    group = _clean(group_id) or _clean(task_id)
+    return f"{owner_id}:{group}"
+
+
 def _collect_image_urls(data: list[Any]) -> list[str]:
     urls: list[str] = []
     for item in data:
@@ -67,6 +73,7 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "id": task.get("id"),
         "status": task.get("status"),
         "mode": task.get("mode"),
+        "group_id": task.get("group_id"),
         "model": task.get("model"),
         "size": task.get("size"),
         "quality": task.get("quality"),
@@ -112,6 +119,9 @@ class ImageTaskService:
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
+        self._runtime: dict[str, dict[str, Any]] = {}
+        self._group_active: dict[str, int] = {}
+        self._group_queues: dict[str, list[str]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._tasks = self._load_locked()
@@ -125,6 +135,7 @@ class ImageTaskService:
         identity: dict[str, object],
         *,
         client_task_id: str,
+        group_id: str | None = None,
         prompt: str,
         model: str,
         size: str | None,
@@ -141,13 +152,14 @@ class ImageTaskService:
             "response_format": "url",
             "base_url": base_url,
         }
-        return self._submit(identity, client_task_id=client_task_id, mode="generate", payload=payload)
+        return self._submit(identity, client_task_id=client_task_id, group_id=group_id, mode="generate", payload=payload)
 
     def submit_edit(
         self,
         identity: dict[str, object],
         *,
         client_task_id: str,
+        group_id: str | None = None,
         prompt: str,
         model: str,
         size: str | None,
@@ -168,7 +180,7 @@ class ImageTaskService:
             "response_format": "url",
             "base_url": base_url,
         }
-        return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
+        return self._submit(identity, client_task_id=client_task_id, group_id=group_id, mode="edit", payload=payload)
 
     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
         owner = _owner_id(identity)
@@ -199,6 +211,7 @@ class ImageTaskService:
         identity: dict[str, object],
         *,
         client_task_id: str,
+        group_id: str | None,
         mode: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
@@ -207,8 +220,9 @@ class ImageTaskService:
             raise ValueError("client_task_id is required")
         owner = _owner_id(identity)
         key = _task_key(owner, task_id)
+        group_key = _task_group_key(owner, group_id or task_id, task_id)
+        normalized_group_id = _clean(group_id) or task_id
         now = _now_iso()
-        should_start = False
         with self._lock:
             cleaned = self._cleanup_locked()
             task = self._tasks.get(key)
@@ -221,6 +235,8 @@ class ImageTaskService:
                 "owner_id": owner,
                 "status": TASK_STATUS_QUEUED,
                 "mode": mode,
+                "group_id": normalized_group_id,
+                "group_key": group_key,
                 "model": _clean(payload.get("model"), "gpt-image-2"),
                 "size": _clean(payload.get("size")),
                 "quality": _clean(payload.get("quality"), "auto"),
@@ -229,18 +245,55 @@ class ImageTaskService:
                 "created_ts": time.time(),
             }
             self._tasks[key] = task
+            self._runtime[key] = {"payload": payload, "identity": dict(identity)}
             self._save_locked()
-            should_start = True
+            self._enqueue_task_locked(group_key, key)
+            self._schedule_group_locked(group_key)
+        return _public_task(task)
 
-        if should_start:
+    def _enqueue_task_locked(self, group_key: str, key: str) -> None:
+        queue = self._group_queues.setdefault(group_key, [])
+        if key not in queue:
+            queue.append(key)
+
+    def _schedule_group_locked(self, group_key: str) -> None:
+        queue = self._group_queues.setdefault(group_key, [])
+        while queue and self._group_active.get(group_key, 0) < MAX_TASK_GROUP_WORKERS:
+            key = queue.pop(0)
+            task = self._tasks.get(key)
+            if task is None or task.get("status") != TASK_STATUS_QUEUED:
+                continue
+            runtime = self._runtime.get(key) or {}
+            payload = dict(runtime.get("payload") or {})
+            identity = dict(runtime.get("identity") or {})
+            if not payload:
+                task["status"] = TASK_STATUS_ERROR
+                task["error"] = "task runtime payload is missing"
+                self._save_locked()
+                continue
+            mode = _clean(task.get("mode"), "generate")
+            model = _clean(task.get("model"), "gpt-image-2")
+            self._group_active[group_key] = self._group_active.get(group_key, 0) + 1
             thread = threading.Thread(
                 target=self._run_task,
-                args=(key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2")),
-                name=f"image-task-{task_id[:16]}",
+                args=(key, mode, payload, identity, model, group_key),
+                name=f"image-task-{_clean(task.get('id'))[:16]}",
                 daemon=True,
             )
             thread.start()
-        return _public_task(task)
+        if not queue:
+            self._group_queues.pop(group_key, None)
+
+    def _finish_group_task(self, group_key: str) -> None:
+        if not group_key:
+            return
+        with self._lock:
+            active = max(0, int(self._group_active.get(group_key, 0)) - 1)
+            if active:
+                self._group_active[group_key] = active
+            else:
+                self._group_active.pop(group_key, None)
+            self._schedule_group_locked(group_key)
 
     def _run_task(
         self,
@@ -249,6 +302,7 @@ class ImageTaskService:
         payload: dict[str, Any],
         identity: dict[str, object],
         model: str,
+        group_key: str = "",
     ) -> None:
         started = time.time()
         self._update_task(key, status=TASK_STATUS_RUNNING, error="")
@@ -308,6 +362,10 @@ class ImageTaskService:
                 error=error_message,
                 account_email=account_email,
             )
+        finally:
+            with self._lock:
+                self._runtime.pop(key, None)
+            self._finish_group_task(group_key)
 
     def _log_call(
         self,
@@ -385,6 +443,8 @@ class ImageTaskService:
                 "owner_id": owner,
                 "status": status,
                 "mode": "edit" if item.get("mode") == "edit" else "generate",
+                "group_id": _clean(item.get("group_id")),
+                "group_key": _clean(item.get("group_key")),
                 "model": _clean(item.get("model"), "gpt-image-2"),
                 "size": _clean(item.get("size")),
                 "quality": _clean(item.get("quality"), "auto"),
@@ -487,7 +547,7 @@ class ImageTaskService:
         started = time.time()
         try:
             from services.openai_backend_api import OpenAIBackendAPI
-            from services.protocol.conversation import format_image_result
+            from services.protocol.conversation import ensure_image_canvas_size, format_image_result
 
             backend = OpenAIBackendAPI(proxy_url=config.proxy_url or None)
             file_ids, sediment_ids = backend._poll_image_results(
@@ -505,15 +565,14 @@ class ImageTaskService:
             if not image_urls:
                 raise RuntimeError("图片 URL 解析失败")
 
+            with self._lock:
+                task = self._tasks.get(key)
+                size = _clean(task.get("size")) if task else None
             image_items = [
-                {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
+                {"b64_json": __import__("base64").b64encode(ensure_image_canvas_size(image_data, size)).decode("ascii")}
                 for image_data in backend.download_image_bytes(image_urls)
             ]
             # 获取 task 的原始 prompt（从 _public_task 的 mode 判断）
-            with self._lock:
-                task = self._tasks.get(key)
-                quality = _clean(task.get("quality"), "auto") if task else "auto"
-                size = _clean(task.get("size")) if task else None
             data = format_image_result(
                 image_items,
                 "",  # prompt 已不重要，结果已经拿到了

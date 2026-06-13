@@ -13,6 +13,7 @@ from services.log_service import LoggedCall
 
 class ImageGenerationTaskRequest(BaseModel):
     client_task_id: str = Field(..., min_length=1)
+    group_id: str | None = None
     prompt: str = Field(..., min_length=1)
     model: str = "gpt-image-2"
     size: str | None = None
@@ -59,6 +60,7 @@ def create_router() -> APIRouter:
                 image_task_service.submit_generation,
                 identity,
                 client_task_id=body.client_task_id,
+                group_id=body.group_id,
                 prompt=body.prompt,
                 model=body.model,
                 size=body.size,
@@ -78,6 +80,7 @@ def create_router() -> APIRouter:
         client_task_id = str(payload.get("client_task_id") or "").strip()
         if not client_task_id:
             raise HTTPException(status_code=400, detail={"error": "client_task_id is required"})
+        group_id = str(payload.get("group_id") or "").strip() or None
         prompt = str(payload["prompt"])
         model = str(payload["model"])
         await filter_or_log(LoggedCall(identity, "/api/image-tasks/edits", model, "图生图任务", request_text=prompt), prompt)
@@ -88,6 +91,7 @@ def create_router() -> APIRouter:
                 image_task_service.submit_edit,
                 identity,
                 client_task_id=client_task_id,
+                group_id=group_id,
                 prompt=prompt,
                 model=model,
                 size=payload["size"],

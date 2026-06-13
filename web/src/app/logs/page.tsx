@@ -32,6 +32,16 @@ function getDetailText(item: SystemLog, key: string) {
   return typeof value === "string" || typeof value === "number" ? String(value) : "-";
 }
 
+function getAccountText(item: SystemLog) {
+  const detail = item.detail || {};
+  for (const key of ["account_email", "email", "account_id", "token", "source_type"]) {
+    const value = detail[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number") return String(value);
+  }
+  return "-";
+}
+
 function formatDuration(item: SystemLog) {
   const value = item.detail?.duration_ms;
   return typeof value === "number" ? `${(value / 1000).toFixed(2)} s` : "-";
@@ -196,6 +206,7 @@ function LogsContent() {
                   <TableHead>时间</TableHead>
                   <TableHead>类型</TableHead>
                   {isCallLog ? <TableHead>令牌名称</TableHead> : null}
+                  <TableHead>账号</TableHead>
                   {isCallLog ? <TableHead>调用耗时</TableHead> : null}
                   {isCallLog ? <TableHead>状态</TableHead> : null}
                   {isCallLog ? <TableHead className="w-36">图片</TableHead> : null}
@@ -214,6 +225,9 @@ function LogsContent() {
                       <TableCell className="whitespace-nowrap">{item.time}</TableCell>
                       <TableCell><Badge variant="secondary" className="rounded-md">{typeLabels[item.type] || item.type}</Badge></TableCell>
                       {isCallLog ? <TableCell>{getDetailText(item, "key_name")}</TableCell> : null}
+                      <TableCell className="max-w-[240px] truncate font-mono text-xs text-stone-700" title={getAccountText(item)}>
+                        {getAccountText(item)}
+                      </TableCell>
                       {isCallLog ? <TableCell>{formatDuration(item)}</TableCell> : null}
                       {isCallLog ? (
                         <TableCell>

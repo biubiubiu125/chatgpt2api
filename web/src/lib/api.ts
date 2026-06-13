@@ -282,6 +282,7 @@ export type ImageTask = {
   id: string;
   status: "queued" | "running" | "success" | "error";
   mode: "generate" | "edit";
+  group_id?: string;
   model?: ImageModel;
   size?: string;
   quality?: string;
@@ -510,11 +511,12 @@ export async function editImage(files: File | File[], prompt: string, model?: Im
   );
 }
 
-export async function createImageGenerationTask(clientTaskId: string, prompt: string, model?: ImageModel, size?: string, quality = "auto") {
+export async function createImageGenerationTask(clientTaskId: string, prompt: string, model?: ImageModel, size?: string, quality = "auto", groupId?: string) {
   return httpRequest<ImageTask>("/api/image-tasks/generations", {
     method: "POST",
     body: {
       client_task_id: clientTaskId,
+      ...(groupId ? { group_id: groupId } : {}),
       prompt,
       ...(model ? { model } : {}),
       ...(size ? { size } : {}),
@@ -530,6 +532,7 @@ export async function createImageEditTask(
   model?: ImageModel,
   size?: string,
   quality = "auto",
+  groupId?: string,
 ) {
   const formData = new FormData();
   const uploadFiles = Array.isArray(files) ? files : [files];
@@ -538,6 +541,9 @@ export async function createImageEditTask(
     formData.append("image", file);
   });
   formData.append("client_task_id", clientTaskId);
+  if (groupId) {
+    formData.append("group_id", groupId);
+  }
   formData.append("prompt", prompt);
   if (model) {
     formData.append("model", model);
