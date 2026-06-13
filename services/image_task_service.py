@@ -12,6 +12,7 @@ from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from utils.helper import parse_image_size
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -130,11 +131,12 @@ class ImageTaskService:
         quality: str = "auto",
         base_url: str = "",
     ) -> dict[str, Any]:
+        normalized_size = parse_image_size(size)
         payload = {
             "prompt": prompt,
             "model": model,
             "n": 1,
-            "size": size,
+            "size": normalized_size,
             "quality": quality,
             "response_format": "url",
             "base_url": base_url,
@@ -154,13 +156,14 @@ class ImageTaskService:
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
     ) -> dict[str, Any]:
+        normalized_size = parse_image_size(size)
         payload = {
             "prompt": prompt,
             "images": images or [],
             "mask": masks or [],
             "model": model,
             "n": 1,
-            "size": size,
+            "size": normalized_size,
             "quality": quality,
             "response_format": "url",
             "base_url": base_url,

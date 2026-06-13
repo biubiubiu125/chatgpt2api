@@ -32,6 +32,11 @@ SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "imag
 MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_JSON_EDIT_IMAGES = 10
 MAX_IMAGE_COUNT = 50
+MAX_IMAGE_PIXELS = 3840 * 2160
+MAX_IMAGE_SIDE = 3840
+IMAGE_SIZE_MULTIPLE = 16
+MIN_IMAGE_RATIO = 1 / 3
+MAX_IMAGE_RATIO = 3
 DATA_URL_IMAGE_RE = re.compile(r"^data:(?P<mime>[-+./\w]+);base64,(?P<data>.*)$", re.DOTALL)
 REMOTE_IMAGE_TIMEOUT_SECONDS = 20
 REMOTE_IMAGE_MAX_REDIRECTS = 5
@@ -621,6 +626,31 @@ def parse_image_count(raw_value: object) -> int:
     if value < 1 or value > MAX_IMAGE_COUNT:
         raise HTTPException(status_code=400, detail={"error": f"n must be between 1 and {MAX_IMAGE_COUNT}"})
     return value
+
+
+def parse_image_size(raw_value: object) -> str | None:
+    text = str(raw_value or "").strip().lower()
+    if not text or text == "auto":
+        return None
+    match = re.fullmatch(r"(\d{2,5})\s*[x×]\s*(\d{2,5})", text)
+    if not match:
+        raise HTTPException(status_code=400, detail={"error": "size must be WIDTHxHEIGHT"})
+    width, height = int(match.group(1)), int(match.group(2))
+    if width <= 0 or height <= 0:
+        raise HTTPException(status_code=400, detail={"error": "size width and height must be positive"})
+    if width > MAX_IMAGE_SIDE or height > MAX_IMAGE_SIDE:
+        raise HTTPException(status_code=400, detail={"error": f"size width and height must not exceed {MAX_IMAGE_SIDE}"})
+    if width % IMAGE_SIZE_MULTIPLE != 0 or height % IMAGE_SIZE_MULTIPLE != 0:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": f"size width and height must be multiples of {IMAGE_SIZE_MULTIPLE}"},
+        )
+    ratio = width / height
+    if ratio < MIN_IMAGE_RATIO or ratio > MAX_IMAGE_RATIO:
+        raise HTTPException(status_code=400, detail={"error": "size aspect ratio must be between 1:3 and 3:1"})
+    if width * height > MAX_IMAGE_PIXELS:
+        raise HTTPException(status_code=400, detail={"error": "size must not exceed 3840x2160 total pixels"})
+    return f"{width}x{height}"
 
 
 def build_chat_image_markdown_content(image_result: dict[str, object]) -> str:

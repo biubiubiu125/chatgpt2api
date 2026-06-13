@@ -318,6 +318,8 @@ export function ImageResults({
                                 turn.ratio === "9:16" && "sm:aspect-[9/16]",
                                 turn.ratio === "4:3" && "sm:aspect-[4/3]",
                                 turn.ratio === "3:4" && "sm:aspect-[3/4]",
+                                turn.ratio === "3:1" && "sm:aspect-[3/1]",
+                                turn.ratio === "1:3" && "sm:aspect-[1/3]",
                               )}
                             >
                             <div className="flex h-full min-h-16 flex-col items-center justify-center gap-1.5 px-2 py-2 text-center text-[11px] leading-4 text-rose-600 sm:gap-3 sm:px-6 sm:py-8 sm:text-sm sm:leading-6">
@@ -374,6 +376,8 @@ export function ImageResults({
                               turn.ratio === "9:16" && "aspect-[9/16]",
                               turn.ratio === "4:3" && "aspect-[4/3]",
                               turn.ratio === "3:4" && "aspect-[3/4]",
+                              turn.ratio === "3:1" && "aspect-[3/1]",
+                              turn.ratio === "1:3" && "aspect-[1/3]",
                             )}
                           >
                           <div className="flex h-full flex-col items-center justify-center gap-1.5 px-2 py-3 text-center text-stone-500 sm:gap-3 sm:px-6 sm:py-8">

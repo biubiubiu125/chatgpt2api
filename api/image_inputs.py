@@ -13,7 +13,7 @@ from fastapi import HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
-from utils.helper import parse_image_count, safe_download_remote_image_url
+from utils.helper import parse_image_count, parse_image_size, safe_download_remote_image_url
 
 ImageInput = tuple[bytes, str, str]
 ImageSource = str | UploadFile | ImageInput
@@ -62,7 +62,7 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
         "prompt": prompt,
         "model": _clean(fields.get("model"), "gpt-image-2"),
         "n": _parse_count(fields.get("n")),
-        "size": _clean(fields.get("size")) or None,
+        "size": parse_image_size(fields.get("size")),
         "quality": _clean(fields.get("quality"), "auto"),
         "response_format": _clean(fields.get("response_format"), "b64_json"),
         "stream": _parse_bool(fields.get("stream")),

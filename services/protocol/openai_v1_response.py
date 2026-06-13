@@ -24,6 +24,7 @@ from utils.helper import (
     extract_response_prompt,
     has_response_image_generation_tool,
     parse_image_count,
+    parse_image_size,
 )
 from services.protocol.web_search_tool import (
     WEB_SEARCH_TOOL_TYPES,
@@ -69,6 +70,12 @@ def response_image_count(body: dict[str, Any], tool: dict[str, object]) -> int:
     if "n" in tool:
         return parse_image_count(tool.get("n"))
     return parse_image_count(body.get("n"))
+
+
+def response_image_size(body: dict[str, Any], tool: dict[str, object]) -> str | None:
+    if "size" in tool:
+        return parse_image_size(tool.get("size"))
+    return parse_image_size(body.get("size"))
 
 
 def extract_response_image(input_value: object) -> tuple[bytes, str] | None:
@@ -432,16 +439,18 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     input_image_tokens = count_image_content_tokens(_input_image_parts(body.get("input")), model)
     tool = response_image_tool(body)
     n = response_image_count(body, tool)
+    size = response_image_size(body, tool)
+    quality = str(tool.get("quality") or body.get("quality") or "auto")
     image_outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
         n=n,
-        size=tool.get("size"),
-        quality=str(tool.get("quality") or "auto"),
+        size=size,
+        quality=quality,
         response_format="b64_json",
         images=images,
     ))
-    yield from stream_image_response(image_outputs, prompt, model, input_image_tokens, tool.get("size"), str(tool.get("quality") or "auto"))
+    yield from stream_image_response(image_outputs, prompt, model, input_image_tokens, size, quality)
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:

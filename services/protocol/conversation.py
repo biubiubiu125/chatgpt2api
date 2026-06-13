@@ -22,7 +22,7 @@ from utils.helper import (
     is_supported_image_model,
     split_image_model,
 )
-from utils.image_tokens import count_image_content_tokens
+from utils.image_tokens import count_image_content_tokens, image_size_from_bytes
 from utils.log import logger
 
 
@@ -221,9 +221,12 @@ def assistant_history_messages(messages: list[dict[str, Any]]) -> list[str]:
 def build_image_prompt(prompt: str, size: str | None, quality: str = "auto") -> str:
     hints = []
     if size:
-        hints.append(f"输出图片尺寸为 {size}。")
+        hints.append(
+            f"Generate the image at exactly {size} pixels. "
+            "Use that canvas size directly; do not choose a smaller resolution. "
+        )
     if quality:
-        hints.append(f"输出图片质量为 {quality}。")
+        hints.append(f"Use image quality: {quality}. ")
     return f"{prompt.strip()}\n\n{''.join(hints)}" if hints else prompt
 
 
@@ -279,18 +282,23 @@ def format_image_result(
         b64_json = str(item.get("b64_json") or "").strip()
         if not b64_json:
             continue
+        image_bytes = base64.b64decode(b64_json)
+        image_size = image_size_from_bytes(image_bytes)
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         if response_format == "b64_json":
-            data.append({
+            result_item = {
                 "b64_json": b64_json,
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                "url": save_image_bytes(image_bytes, base_url),
                 "revised_prompt": revised_prompt,
-            })
+            }
         else:
-            data.append({
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+            result_item = {
+                "url": save_image_bytes(image_bytes, base_url),
                 "revised_prompt": revised_prompt,
-            })
+            }
+        if image_size:
+            result_item["width"], result_item["height"] = image_size
+        data.append(result_item)
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if message and not data:
         result["message"] = message

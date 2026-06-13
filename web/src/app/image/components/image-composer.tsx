@@ -67,15 +67,20 @@ const aspectOptions = [
   { ratio: "1:1", tier: "1k", width: "1024", height: "1024", label: "1:1", icon: Square },
   { ratio: "2:3", tier: "1k", width: "1024", height: "1536", label: "2:3", icon: RectangleVertical },
   { ratio: "3:2", tier: "1k", width: "1536", height: "1024", label: "3:2", icon: RectangleHorizontal },
-  { ratio: "3:4", tier: "1k", width: "1024", height: "1365", label: "3:4", icon: RectangleVertical },
-  { ratio: "4:3", tier: "1k", width: "1365", height: "1024", label: "4:3", icon: RectangleHorizontal },
+  { ratio: "3:4", tier: "1k", width: "1024", height: "1360", label: "3:4", icon: RectangleVertical },
+  { ratio: "4:3", tier: "1k", width: "1360", height: "1024", label: "4:3", icon: RectangleHorizontal },
   { ratio: "9:16", tier: "1k", width: "1088", height: "1920", label: "9:16", icon: RectangleVertical },
   { ratio: "16:9", tier: "1k", width: "1920", height: "1088", label: "16:9", icon: RectangleHorizontal },
+  { ratio: "16:9", tier: "2k", width: "2048", height: "1152", label: "16:9(2k)", icon: RectangleHorizontal },
+  { ratio: "9:16", tier: "2k", width: "1152", height: "2048", label: "9:16(2k)", icon: RectangleVertical },
   { ratio: "1:1", tier: "2k", width: "2048", height: "2048", label: "1:1(2k)", icon: Square },
   { ratio: "16:9", tier: "2k", width: "2560", height: "1440", label: "16:9(2k)", icon: RectangleHorizontal },
   { ratio: "9:16", tier: "2k", width: "1440", height: "2560", label: "9:16(2k)", icon: RectangleVertical },
+  { ratio: "1:1", tier: "4k", width: "2880", height: "2880", label: "1:1(max)", icon: Square },
   { ratio: "16:9", tier: "4k", width: "3840", height: "2160", label: "16:9(4k)", icon: RectangleHorizontal },
   { ratio: "9:16", tier: "4k", width: "2160", height: "3840", label: "9:16(4k)", icon: RectangleVertical },
+  { ratio: "3:1", tier: "4k", width: "3840", height: "1280", label: "3:1(4k)", icon: RectangleHorizontal },
+  { ratio: "1:3", tier: "4k", width: "1280", height: "3840", label: "1:3(4k)", icon: RectangleVertical },
   { ratio: "auto", tier: "auto", width: "1024", height: "1024", label: "auto", icon: null },
 ];
 const MAX_IMAGE_COUNT = 50;
@@ -128,7 +133,6 @@ export function ImageComposer({
   const ratioLabel = imageRatio === "auto" ? "auto" : `${imageRatio}(${imageTier})`;
   const imageSizeLabel = `${qualityLabel} · ${ratioLabel} · ${imageCount || 1} 张`;
   const selectedModelLabel = modelOptions.find((option) => option.value === imageModel)?.label || imageModel;
-  const isCodexModel = imageModel.toLowerCase().includes("codex");
 
   useEffect(() => {
     if (!isSizeMenuOpen) {
@@ -453,21 +457,15 @@ export function ImageComposer({
                             {aspectOptions.map((option) => {
                               const active = option.ratio === imageRatio && option.tier === imageTier && option.width === imageWidth && option.height === imageHeight;
                               const Icon = option.icon;
-                              const disabled = !isCodexModel && (option.tier === "2k" || option.tier === "4k");
                               return (
                                 <button
                                   key={`${option.ratio}-${option.tier}-${option.label}`}
                                   type="button"
-                                  disabled={disabled}
                                   className={cn(
                                     "flex h-[64px] cursor-pointer flex-col items-center justify-center gap-1 rounded-2xl border border-stone-200 bg-white text-sm text-stone-800 transition hover:border-stone-300 hover:bg-stone-50",
                                     active && "border-stone-950",
-                                    disabled && "cursor-not-allowed border-stone-100 bg-stone-50 text-stone-300 hover:border-stone-100 hover:bg-stone-50",
                                   )}
                                   onClick={() => {
-                                    if (disabled) {
-                                      return;
-                                    }
                                     onImageRatioChange(option.ratio);
                                     onImageTierChange(option.tier);
                                     onImageWidthChange(option.width);
