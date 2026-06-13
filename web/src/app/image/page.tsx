@@ -55,7 +55,7 @@ const IMAGE_MODEL_STORAGE_KEY = "chatgpt2api:image_last_model";
 const IMAGE_COUNT_STORAGE_KEY = "chatgpt2api:image_last_count";
 const SCROLL_POSITIONS_STORAGE_KEY = "chatgpt2api:image_scroll_positions";
 const SCROLL_TO_LATEST_THRESHOLD = 160;
-const MAX_IMAGE_COUNT = 10;
+const MAX_IMAGE_COUNT = 50;
 
 function loadScrollPositions(): Map<string, number> {
   if (typeof window === "undefined") return new Map();

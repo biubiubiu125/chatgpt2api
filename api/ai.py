@@ -111,12 +111,14 @@ def create_router() -> APIRouter:
             authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
-        payload, image_sources = await parse_image_edit_request(request)
+        payload, image_sources, mask_sources = await parse_image_edit_request(request)
         prompt = str(payload["prompt"])
         model = str(payload["model"])
         call = LoggedCall(identity, "/v1/images/edits", model, "图生图", request_text=prompt)
         await filter_or_log(call, prompt)
         payload["images"] = await read_image_sources(image_sources)
+        if mask_sources:
+            payload["mask"] = await read_image_sources(mask_sources)
         payload["base_url"] = resolve_image_base_url(request)
         return await call.run(openai_v1_image_edit.handle, payload)
 

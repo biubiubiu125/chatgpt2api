@@ -222,7 +222,7 @@ class OpenAIBackendAPI:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
         )
-        fp.setdefault("impersonate", "edge101")
+        fp.setdefault("impersonate", "chrome110")
         fp.setdefault("oai-device-id", new_uuid())
         fp.setdefault("oai-session-id", new_uuid())
         fp.setdefault("sec-ch-ua", '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"')
@@ -2548,22 +2548,65 @@ class OpenAIBackendAPI:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
 
     def _get_chat_requirements(self) -> ChatRequirements:
-        """获取当前模式对话所需的 sentinel token。"""
-        path = "/backend-api/sentinel/chat-requirements" if self.access_token else "/backend-anon/sentinel/chat-requirements"
-        context = "auth_chat_requirements" if self.access_token else "noauth_chat_requirements"
-        body = {"p": build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)}
+        """获取当前模式对话所需的 sentinel token（prepare + finalize 两步流程）。"""
+        base = "/backend-api/sentinel/chat-requirements" if self.access_token else "/backend-anon/sentinel/chat-requirements"
+        p_token = build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)
+
+        prepare_path = base + "/prepare"
         response = self.session.post(
-            self.base_url + path,
-            headers=self._headers(path, {"Content-Type": "application/json"}),
-            json=body,
+            self.base_url + prepare_path,
+            headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
+            json={"p": p_token},
             timeout=30,
         )
-        ensure_ok(response, context)
-        requirements = self._build_requirements(response.json(), "" if self.access_token else body["p"])
-        if not requirements.token:
+        ensure_ok(response, "chat_requirements_prepare")
+        prepare_data = response.json()
+
+        if (prepare_data.get("arkose") or {}).get("required"):
+            raise RuntimeError("chat requirements requires arkose token, which is not implemented")
+
+        proof_token = ""
+        proof_info = prepare_data.get("proofofwork") or {}
+        if proof_info.get("required"):
+            proof_token = build_proof_token(
+                proof_info.get("seed", ""),
+                proof_info.get("difficulty", ""),
+                self.user_agent,
+                script_sources=self.pow_script_sources,
+                data_build=self.pow_data_build,
+            )
+
+        turnstile_token = ""
+        turnstile_info = prepare_data.get("turnstile") or {}
+        if turnstile_info.get("required") and turnstile_info.get("dx"):
+            turnstile_token = solve_turnstile_token(turnstile_info["dx"], p_token) or ""
+
+        finalize_path = base + "/finalize"
+        response = self.session.post(
+            self.base_url + finalize_path,
+            headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
+            json={
+                "prepare_token": prepare_data.get("prepare_token", ""),
+                "proof_token": proof_token,
+                "turnstile_token": turnstile_token,
+            },
+            timeout=30,
+        )
+        ensure_ok(response, "chat_requirements_finalize")
+        data = response.json()
+
+        token = data.get("token", "")
+        if not token:
             message = "missing auth chat requirements token" if self.access_token else "missing chat requirements token"
-            raise RuntimeError(f"{message}: {requirements.raw_finalize}")
-        return requirements
+            raise RuntimeError(f"{message}: {data}")
+
+        return ChatRequirements(
+            token=token,
+            proof_token=proof_token,
+            turnstile_token=turnstile_token,
+            so_token=data.get("so_token", ""),
+            raw_finalize=data,
+        )
 
     def _chat_target(self) -> tuple[str, str]:
         if self.access_token:

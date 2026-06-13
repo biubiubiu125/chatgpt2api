@@ -25,6 +25,15 @@ from utils.helper import (
     has_response_image_generation_tool,
     parse_image_count,
 )
+from services.protocol.web_search_tool import (
+    WEB_SEARCH_TOOL_TYPES,
+    has_unsupported_tools,
+    has_web_search_tool,
+    normalized_sources,
+    run_web_search,
+    search_query_from_messages,
+    text_with_url_citations,
+)
 from utils.image_tokens import (
     count_image_content_tokens,
     count_image_output_items_tokens,
@@ -33,7 +42,7 @@ from utils.image_tokens import (
 )
 
 TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
-    "This compatibility backend cannot execute local tools, shell commands, web searches, "
+    "This compatibility backend cannot execute local tools, shell commands, non-search tools, "
     "or file operations. Do not claim to have run tools or inspected external resources. "
     "If a user asks you to use a tool, say that tool execution is unavailable through this backend."
 )
@@ -45,14 +54,8 @@ def is_text_response_request(body: dict[str, Any]) -> bool:
     return not has_response_image_generation_tool(body)
 
 
-def has_non_image_tools(body: dict[str, Any]) -> bool:
-    tools = body.get("tools")
-    if not isinstance(tools, list):
-        return False
-    return any(
-        isinstance(tool, dict) and str(tool.get("type") or "").strip() != "image_generation"
-        for tool in tools
-    )
+def has_unsupported_response_tools(body: dict[str, Any]) -> bool:
+    return has_unsupported_tools(body, {"image_generation", *WEB_SEARCH_TOOL_TYPES})
 
 
 def response_image_tool(body: dict[str, Any]) -> dict[str, object]:
@@ -176,13 +179,43 @@ def messages_from_input(input_value: object, instructions: object = None) -> lis
     return messages
 
 
-def text_output_item(text: str, item_id: str | None = None, status: str = "completed") -> dict[str, Any]:
+def text_output_item(
+    text: str,
+    item_id: str | None = None,
+    status: str = "completed",
+    annotations: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     return {
         "id": item_id or f"msg_{uuid.uuid4().hex}",
         "type": "message",
         "status": status,
         "role": "assistant",
-        "content": [{"type": "output_text", "text": text, "annotations": []}],
+        "content": [{"type": "output_text", "text": text, "annotations": annotations or []}],
+    }
+
+
+def web_search_call_item(
+    query: str,
+    item_id: str | None = None,
+    status: str = "completed",
+    sources: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    action: dict[str, Any] = {
+        "type": "search",
+        "query": query,
+        "queries": [query],
+    }
+    if sources:
+        action["sources"] = [
+            {"type": "url", "url": source["url"]}
+            for source in sources
+            if source.get("url")
+        ]
+    return {
+        "id": item_id or f"ws_{uuid.uuid4().hex}",
+        "type": "web_search_call",
+        "status": status,
+        "action": action,
     }
 
 
@@ -247,7 +280,7 @@ def response_completed(
 def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     model = str(body.get("model") or "auto").strip() or "auto"
     messages = normalize_text_messages(normalize_messages(messages_from_input(body.get("input"), body.get("instructions"))))
-    if has_non_image_tools(body):
+    if has_unsupported_response_tools(body):
         messages.insert(0, {"role": "system", "content": TOOL_UNAVAILABLE_SYSTEM_MESSAGE})
     return model, messages
 
@@ -274,6 +307,44 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
         output_text_tokens=count_text_tokens(full_text, model),
     )
     yield response_completed(response_id, model, created, [item], usage)
+
+
+def stream_web_search_response(body: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Iterator[dict[str, Any]]:
+    model = str(body.get("model") or "auto").strip() or "auto"
+    messages = messages if messages is not None else messages_from_input(body.get("input"), body.get("instructions"))
+    query = search_query_from_messages(messages) or extract_response_prompt(body.get("input"))
+    if not query:
+        raise HTTPException(status_code=400, detail={"error": "input text is required for web_search"})
+
+    response_id = f"resp_{uuid.uuid4().hex}"
+    search_id = f"ws_{uuid.uuid4().hex}"
+    item_id = f"msg_{uuid.uuid4().hex}"
+    created = int(time.time())
+    yield response_created(response_id, model, created)
+
+    searching_item = web_search_call_item(query, search_id, "in_progress")
+    yield {"type": "response.output_item.added", "output_index": 0, "item": searching_item}
+    yield {"type": "response.web_search_call.in_progress", "output_index": 0, "item_id": search_id}
+    yield {"type": "response.web_search_call.searching", "output_index": 0, "item_id": search_id}
+    result = run_web_search(query)
+    search_item = web_search_call_item(query, search_id, "completed", normalized_sources(result))
+    yield {"type": "response.web_search_call.completed", "output_index": 0, "item_id": search_id}
+    yield {"type": "response.output_item.done", "output_index": 0, "item": search_item}
+
+    text, annotations = text_with_url_citations(result)
+    message_item = text_output_item("", item_id, "in_progress", annotations)
+    yield {"type": "response.output_item.added", "output_index": 1, "item": message_item}
+    if text:
+        yield {"type": "response.output_text.delta", "item_id": item_id, "output_index": 1, "content_index": 0, "delta": text}
+    yield {"type": "response.output_text.done", "item_id": item_id, "output_index": 1, "content_index": 0, "text": text}
+    message_item = text_output_item(text, item_id, "completed", annotations)
+    yield {"type": "response.output_item.done", "output_index": 1, "item": message_item}
+    usage = token_usage(
+        input_text_tokens=count_message_text_tokens(messages, model),
+        input_image_tokens=count_message_image_tokens(messages, model),
+        output_text_tokens=count_text_tokens(text, model),
+    )
+    yield response_completed(response_id, model, created, [search_item, message_item], usage)
 
 
 def stream_image_response(
@@ -338,6 +409,9 @@ def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
 def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     if is_text_response_request(body):
         model, messages = text_response_parts(body)
+        if has_web_search_tool(body) and not has_unsupported_response_tools(body):
+            yield from stream_web_search_response(body, messages)
+            return
         key = cache_key(body, messages, stream=bool(body.get("stream")))
         yield from chat_completion_cache.get_or_compute_stream(
             key,

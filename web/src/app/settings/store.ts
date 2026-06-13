@@ -12,6 +12,7 @@ import {
   fetchBackups,
   fetchRegisterConfig,
   resetRegister as resetRegisterApi,
+  resetOutlookPool as resetOutlookPoolApi,
   fetchSettingsConfig,
   runBackupNow,
   syncImageStorage,
@@ -30,13 +31,102 @@ import {
   type CPARemoteFile,
   type ImageStorageMode,
   type ImageStorageSettings,
+  type ProxyRuntimeClearanceMode,
+  type ProxyRuntimeEgressMode,
+  type ProxyRuntimeSettings,
   type RegisterConfig,
   type SettingsConfig,
+  type ThirdPartyAppsSettings,
 } from "@/lib/api";
 
 export const PAGE_SIZE_OPTIONS = ["50", "100", "200"] as const;
 
 export type PageSizeOption = (typeof PAGE_SIZE_OPTIONS)[number];
+
+const DEFAULT_PROXY_RUNTIME: ProxyRuntimeSettings = {
+  enabled: false,
+  egress_mode: "direct",
+  proxy_url: "",
+  resource_proxy_url: "",
+  skip_ssl_verify: false,
+  reset_session_status_codes: [403],
+  clearance: {
+    enabled: false,
+    mode: "none",
+    cf_cookies: "",
+    cf_clearance: "",
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    browser: "chrome",
+    flaresolverr_url: "",
+    timeout_sec: 60,
+    refresh_interval: 3600,
+    warm_up_on_start: false,
+    has_cf_cookies: false,
+    has_cf_clearance: false,
+  },
+};
+
+const DEFAULT_THIRD_PARTY_APPS: ThirdPartyAppsSettings = {
+  infinite_canvas: {
+    enabled: false,
+    url: "https://canvas.best",
+  },
+};
+
+function normalizeProxyRuntime(value: unknown): ProxyRuntimeSettings {
+  const source = typeof value === "object" && value !== null ? value as Partial<ProxyRuntimeSettings> : {};
+  const clearanceSource = typeof source.clearance === "object" && source.clearance !== null
+    ? source.clearance as Partial<ProxyRuntimeSettings["clearance"]>
+    : {};
+  const egressMode = source.egress_mode === "single_proxy" ? "single_proxy" : "direct";
+  const clearanceMode: ProxyRuntimeClearanceMode = clearanceSource.mode === "manual" || clearanceSource.mode === "flaresolverr"
+    ? clearanceSource.mode
+    : "none";
+  const statusCodes = Array.isArray(source.reset_session_status_codes)
+    ? source.reset_session_status_codes
+      .map((item) => Number(item))
+      .filter((item) => Number.isInteger(item) && item >= 100 && item <= 599)
+    : [];
+  return {
+    ...DEFAULT_PROXY_RUNTIME,
+    ...source,
+    enabled: Boolean(source.enabled),
+    egress_mode: egressMode as ProxyRuntimeEgressMode,
+    proxy_url: String(source.proxy_url || ""),
+    resource_proxy_url: String(source.resource_proxy_url || ""),
+    skip_ssl_verify: Boolean(source.skip_ssl_verify),
+    reset_session_status_codes: statusCodes.length > 0 ? statusCodes : [403],
+    clearance: {
+      ...DEFAULT_PROXY_RUNTIME.clearance,
+      ...clearanceSource,
+      enabled: Boolean(clearanceSource.enabled),
+      mode: clearanceMode,
+      cf_cookies: String(clearanceSource.cf_cookies || ""),
+      cf_clearance: String(clearanceSource.cf_clearance || ""),
+      user_agent: String(clearanceSource.user_agent || DEFAULT_PROXY_RUNTIME.clearance.user_agent),
+      browser: String(clearanceSource.browser || "chrome"),
+      flaresolverr_url: String(clearanceSource.flaresolverr_url || ""),
+      timeout_sec: Number(clearanceSource.timeout_sec || 60),
+      refresh_interval: Number(clearanceSource.refresh_interval || 3600),
+      warm_up_on_start: Boolean(clearanceSource.warm_up_on_start),
+      has_cf_cookies: Boolean(clearanceSource.has_cf_cookies),
+      has_cf_clearance: Boolean(clearanceSource.has_cf_clearance),
+    },
+  };
+}
+
+function normalizeThirdPartyApps(value: unknown): ThirdPartyAppsSettings {
+  const source = typeof value === "object" && value !== null ? value as Partial<ThirdPartyAppsSettings> : {};
+  const canvas = typeof source.infinite_canvas === "object" && source.infinite_canvas
+    ? source.infinite_canvas
+    : {};
+  return {
+    infinite_canvas: {
+      enabled: Boolean(canvas.enabled),
+      url: String(canvas.url || DEFAULT_THIRD_PARTY_APPS.infinite_canvas.url),
+    },
+  };
+}
 
 function normalizeConfig(config: SettingsConfig): SettingsConfig {
   const imageStorage = typeof config.image_storage === "object" && config.image_storage
@@ -115,6 +205,8 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
       webdav_root_path: String(imageStorage.webdav_root_path || "chatgpt2api/images"),
       public_base_url: String(imageStorage.public_base_url || ""),
     },
+    proxy_runtime: normalizeProxyRuntime(config.proxy_runtime),
+    third_party_apps: normalizeThirdPartyApps(config.third_party_apps),
     backup: {
       ...backup,
       enabled: Boolean(backup.enabled),
@@ -223,6 +315,10 @@ type SettingsStore = {
   setSensitiveWordsText: (value: string) => void;
   setAIReviewField: (key: "enabled" | "base_url" | "api_key" | "model" | "prompt", value: string | boolean) => void;
   setImageStorageField: (key: keyof ImageStorageSettings, value: string | boolean) => void;
+  setProxyRuntimeField: <K extends keyof ProxyRuntimeSettings>(key: K, value: ProxyRuntimeSettings[K]) => void;
+  setProxyRuntimeClearanceField: <K extends keyof ProxyRuntimeSettings["clearance"]>(key: K, value: ProxyRuntimeSettings["clearance"][K]) => void;
+  setProxyRuntimeStatusCodesText: (value: string) => void;
+  setInfiniteCanvasField: <K extends keyof ThirdPartyAppsSettings["infinite_canvas"]>(key: K, value: ThirdPartyAppsSettings["infinite_canvas"][K]) => void;
   testImageStorage: () => Promise<void>;
   syncImagesToWebDAV: () => Promise<void>;
   setBackupField: (key: keyof BackupSettings, value: string | boolean) => void;
@@ -248,6 +344,7 @@ type SettingsStore = {
   saveRegister: () => Promise<void>;
   toggleRegister: () => Promise<void>;
   resetRegister: () => Promise<void>;
+  resetOutlookPool: (scope: "all" | "failed" | "unused") => Promise<void>;
 
   loadPools: (silent?: boolean) => Promise<void>;
   openAddDialog: () => void;
@@ -381,6 +478,32 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           webdav_root_path: String(config.image_storage?.webdav_root_path || "chatgpt2api/images").trim(),
           public_base_url: String(config.image_storage?.public_base_url || "").trim(),
         },
+        proxy_runtime: {
+          ...normalizeProxyRuntime(config.proxy_runtime),
+          proxy_url: String(config.proxy_runtime?.proxy_url || "").trim(),
+          resource_proxy_url: String(config.proxy_runtime?.resource_proxy_url || "").trim(),
+          reset_session_status_codes: normalizeProxyRuntime({
+            reset_session_status_codes: (config.proxy_runtime?.reset_session_status_codes || [403])
+              .map((item) => Number(item))
+              .filter((item) => Number.isInteger(item) && item >= 100 && item <= 599),
+          }).reset_session_status_codes,
+          clearance: {
+            ...normalizeProxyRuntime(config.proxy_runtime).clearance,
+            cf_cookies: String(config.proxy_runtime?.clearance?.cf_cookies || "").trim(),
+            cf_clearance: String(config.proxy_runtime?.clearance?.cf_clearance || "").trim(),
+            user_agent: String(config.proxy_runtime?.clearance?.user_agent || DEFAULT_PROXY_RUNTIME.clearance.user_agent).trim(),
+            browser: String(config.proxy_runtime?.clearance?.browser || "chrome").trim(),
+            flaresolverr_url: String(config.proxy_runtime?.clearance?.flaresolverr_url || "").trim(),
+            timeout_sec: Math.max(1, Number(config.proxy_runtime?.clearance?.timeout_sec) || 60),
+            refresh_interval: Math.max(60, Number(config.proxy_runtime?.clearance?.refresh_interval) || 3600),
+          },
+        },
+        third_party_apps: {
+          infinite_canvas: {
+            enabled: Boolean(config.third_party_apps?.infinite_canvas?.enabled),
+            url: String(config.third_party_apps?.infinite_canvas?.url || DEFAULT_THIRD_PARTY_APPS.infinite_canvas.url).trim(),
+          },
+        },
         backup: {
           ...(config.backup as BackupSettings),
           account_id: String(config.backup?.account_id || "").trim(),
@@ -396,6 +519,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       set({
         config: normalizeConfig(data.config),
       });
+      window.dispatchEvent(new Event("third-party-apps-updated"));
       toast.success("配置已保存");
       return true;
     } catch (error) {
@@ -529,6 +653,90 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         config: {
           ...state.config,
           image_storage: next,
+        },
+      };
+    });
+  },
+
+  setProxyRuntimeField: (key, value) => {
+    set((state) => {
+      if (!state.config) {
+        return {};
+      }
+      const runtime = normalizeProxyRuntime(state.config.proxy_runtime);
+      const nextRuntime = normalizeProxyRuntime({
+        ...runtime,
+        [key]: value,
+      });
+      return {
+        config: {
+          ...state.config,
+          proxy_runtime: nextRuntime,
+        },
+      };
+    });
+  },
+
+  setProxyRuntimeClearanceField: (key, value) => {
+    set((state) => {
+      if (!state.config) {
+        return {};
+      }
+      const runtime = normalizeProxyRuntime(state.config.proxy_runtime);
+      const nextRuntime = normalizeProxyRuntime({
+        ...runtime,
+        clearance: {
+          ...runtime.clearance,
+          [key]: value,
+        },
+      });
+      return {
+        config: {
+          ...state.config,
+          proxy_runtime: nextRuntime,
+        },
+      };
+    });
+  },
+
+  setProxyRuntimeStatusCodesText: (value) => {
+    const codes = value
+      .split(/[,\s]+/)
+      .map((item) => Number(item.trim()))
+      .filter((item) => Number.isInteger(item) && item >= 100 && item <= 599);
+    set((state) => {
+      if (!state.config) {
+        return {};
+      }
+      const runtime = normalizeProxyRuntime(state.config.proxy_runtime);
+      return {
+        config: {
+          ...state.config,
+          proxy_runtime: normalizeProxyRuntime({
+            ...runtime,
+            reset_session_status_codes: codes.length > 0 ? codes : [403],
+          }),
+        },
+      };
+    });
+  },
+
+  setInfiniteCanvasField: (key, value) => {
+    set((state) => {
+      if (!state.config) {
+        return {};
+      }
+      const apps = normalizeThirdPartyApps(state.config.third_party_apps);
+      return {
+        config: {
+          ...state.config,
+          third_party_apps: {
+            ...apps,
+            infinite_canvas: {
+              ...apps.infinite_canvas,
+              [key]: value,
+            },
+          },
         },
       };
     });
@@ -855,6 +1063,19 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       toast.success("注册统计已重置");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "重置注册统计失败");
+    } finally {
+      set({ isSavingRegister: false });
+    }
+  },
+
+  resetOutlookPool: async (scope) => {
+    set({ isSavingRegister: true });
+    try {
+      const data = await resetOutlookPoolApi(scope);
+      set({ registerConfig: data.register });
+      toast.success(scope === "unused" ? "已清空未使用邮箱" : scope === "failed" ? "已清除失败/占用的邮箱状态" : "Outlook 邮箱池状态已全部重置");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "重置邮箱池状态失败");
     } finally {
       set({ isSavingRegister: false });
     }

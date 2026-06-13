@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from io import BytesIO
 from typing import Any, Iterator
+
+from PIL import Image
 
 from services.protocol.conversation import (
     ConversationRequest,
@@ -15,9 +18,41 @@ from utils.helper import parse_image_count
 from utils.image_tokens import count_image_inputs_tokens, count_image_output_items_tokens, image_usage
 
 
+def _composite_mask(
+    images: list[tuple[bytes, str, str]],
+    masks: list[tuple[bytes, str, str]],
+) -> list[tuple[bytes, str, str]]:
+    """将 mask 的 alpha 通道合成到图片中，标识需要编辑的区域。
+    mask 的透明区域（低 alpha）= 需要编辑的区域，
+    mask 的不透明区域（高 alpha）= 保留的区域。
+    如果无 mask 则返回原图。
+    """
+    if not masks:
+        return images
+    result: list[tuple[bytes, str, str]] = []
+    for i, (data, filename, mime_type) in enumerate(images):
+        mask_data = masks[i][0] if i < len(masks) else masks[-1][0]
+        img = Image.open(BytesIO(data)).convert("RGBA")
+        mask_img = Image.open(BytesIO(mask_data))
+        if mask_img.mode == "RGBA":
+            alpha = mask_img.split()[3]
+        elif mask_img.mode == "L":
+            alpha = mask_img
+        else:
+            alpha = mask_img.convert("L")
+        alpha = alpha.resize(img.size, Image.LANCZOS)
+        img.putalpha(alpha)
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        result.append((buf.getvalue(), filename, "image/png"))
+    return result
+
+
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     prompt = str(body.get("prompt") or "")
     images = body.get("images") or []
+    masks = body.get("mask") or []
+    images = _composite_mask(images, masks)
     model = str(body.get("model") or "gpt-image-2")
     n = parse_image_count(body.get("n"))
     size = body.get("size")

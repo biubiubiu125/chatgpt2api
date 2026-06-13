@@ -24,7 +24,7 @@ from services.image_service import (
 from services.image_storage_service import ImageStorageError, image_storage_service
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
 from services.log_service import log_service
-from services.proxy_service import test_proxy
+from services.proxy_service import proxy_settings, test_clearance, test_proxy
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -33,6 +33,10 @@ class SettingsUpdateRequest(BaseModel):
 
 class ProxyTestRequest(BaseModel):
     url: str = ""
+
+
+class ClearanceTestRequest(BaseModel):
+    target_url: str = "https://chatgpt.com"
 
 
 class ImageDeleteRequest(BaseModel):
@@ -76,6 +80,11 @@ def create_router(app_version: str) -> APIRouter:
     async def get_settings(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"config": config.get()}
+
+    @router.get("/api/third-party-apps")
+    async def get_third_party_apps(authorization: str | None = Header(default=None)):
+        require_identity(authorization)
+        return {"third_party_apps": config.get_third_party_apps_settings()}
 
     @router.post("/api/settings")
     async def save_settings(body: SettingsUpdateRequest, authorization: str | None = Header(default=None)):
@@ -131,10 +140,32 @@ def create_router(app_version: str) -> APIRouter:
     @router.post("/api/proxy/test")
     async def test_proxy_endpoint(body: ProxyTestRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        candidate = (body.url or "").strip() or config.get_proxy_settings()
-        if not candidate:
-            raise HTTPException(status_code=400, detail={"error": "proxy url is required"})
-        return {"result": await run_in_threadpool(test_proxy, candidate)}
+        return {"result": await run_in_threadpool(test_proxy, (body.url or "").strip())}
+
+    @router.get("/api/proxy/runtime")
+    async def get_proxy_runtime_endpoint(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {
+            "runtime": config.get_public_proxy_runtime_settings(),
+            "status": proxy_settings.get_runtime_status(),
+        }
+
+    @router.post("/api/proxy/runtime")
+    async def save_proxy_runtime_endpoint(body: SettingsUpdateRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            config.update({"proxy_runtime": body.model_dump(mode="python")})
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        return {
+            "runtime": config.get_public_proxy_runtime_settings(),
+            "status": proxy_settings.get_runtime_status(),
+        }
+
+    @router.post("/api/proxy/clearance/test")
+    async def test_proxy_clearance_endpoint(body: ClearanceTestRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {"result": await run_in_threadpool(test_clearance, body.target_url)}
 
     @router.get("/api/storage/info")
     async def get_storage_info(authorization: str | None = Header(default=None)):
@@ -275,6 +306,7 @@ def create_router(app_version: str) -> APIRouter:
             "healthy": healthy,
             "version": app_version,
             "storage": {"backend": storage.get_backend_info(), "health": storage_health},
+            "proxy_runtime": proxy_settings.get_runtime_status(),
             "accounts": stats,
         }
         if format == "json":

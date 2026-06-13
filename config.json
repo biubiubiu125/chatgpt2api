@@ -12,6 +12,28 @@
     "warning"
   ],
   "proxy": "",
+  "proxy_runtime": {
+    "enabled": false,
+    "egress_mode": "single_proxy",
+    "proxy_url": "http://privoxy:8118",
+    "resource_proxy_url": "",
+    "skip_ssl_verify": true,
+    "reset_session_status_codes": [
+      403
+    ],
+    "clearance": {
+      "enabled": true,
+      "mode": "flaresolverr",
+      "cf_cookies": "",
+      "cf_clearance": "",
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+      "browser": "chrome",
+      "flaresolverr_url": "http://flaresolverr:8191",
+      "timeout_sec": 60,
+      "refresh_interval": 3600,
+      "warm_up_on_start": true
+    }
+  },
   "base_url": "",
   "sensitive_words": [],
   "global_system_prompt": "",
@@ -74,5 +96,11 @@
   "image_check_before_hit_enabled": false,
   "image_settle_secs": 2,
   "auto_relogin_after_refresh": false,
-  "image_timeout_retry_secs": 30
+  "image_timeout_retry_secs": 30,
+  "third_party_apps": {
+    "infinite_canvas": {
+      "enabled": true,
+      "url": "https://canvas.best"
+    }
+  }
 }

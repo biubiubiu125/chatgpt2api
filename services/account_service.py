@@ -454,7 +454,7 @@ class AccountService:
         from curl_cffi import requests
         from services.proxy_service import proxy_settings
 
-        session = requests.Session(**proxy_settings.build_session_kwargs(account=account, impersonate="chrome", verify=True))
+        session = requests.Session(**proxy_settings.build_session_kwargs(account=account, impersonate="chrome110", verify=True))
         try:
             response = session.post(
                 self._OAUTH_TOKEN_URL,
@@ -1184,8 +1184,19 @@ class AccountService:
             return dict(account) if account else None
 
     def list_accounts(self) -> list[dict]:
+        """返回所有账号的副本，并为每个账号附加当前图片在途数 image_inflight。
+
+        image_inflight 为内存态并发计数(账号正在生成、尚未结束的图片数)。号池空闲时
+        若某账号该值持续 > 0，说明其并发槽位泄漏、已被静默排除出调度，可借此在 UI 上诊断。
+        """
         with self._lock:
-            return [dict(item) for item in self._accounts.values()]
+            result = []
+            for item in self._accounts.values():
+                account = dict(item)
+                token = account.get("access_token") or ""
+                account["image_inflight"] = int(self._image_inflight.get(token, 0))
+                result.append(account)
+            return result
 
     def list_limited_tokens(self) -> list[str]:
         with self._lock:
@@ -1193,6 +1204,15 @@ class AccountService:
                 token
                 for item in self._accounts.values()
                 if item.get("status") == "限流"
+                   and (token := item.get("access_token") or "")
+            ]
+
+    def list_normal_tokens(self) -> list[str]:
+        with self._lock:
+            return [
+                token
+                for item in self._accounts.values()
+                if item.get("status") == "正常"
                    and (token := item.get("access_token") or "")
             ]
 

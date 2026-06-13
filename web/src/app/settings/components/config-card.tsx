@@ -106,7 +106,9 @@ export function ConfigCard() {
               placeholder="http://127.0.0.1:7890"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">留空表示不使用代理。</p>
+            <p className="text-xs leading-5 text-stone-500">
+              留空表示不使用代理。支持协议://账号:密码@主机:端口，也可直接粘贴代理商的 主机:端口:账号:密码；示例 http://user:pass@127.0.0.1:7890、127.0.0.1:7890:user:pass。账号密码含 @/: 等特殊字符时需 URL 编码。
+            </p>
             {proxyTestResult ? (
               <div
                 className={`rounded-xl border px-3 py-2 text-xs leading-6 ${

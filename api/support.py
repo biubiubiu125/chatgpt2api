@@ -115,11 +115,17 @@ def _add_account_log(summary: str, detail: dict[str, Any]) -> None:
 
 
 def run_account_refresh_cycle() -> dict[str, Any]:
-    tokens = account_service.list_tokens()
+    limited_tokens = account_service.list_limited_tokens()
+    normal_tokens = account_service.list_normal_tokens()
+    expiring_tokens = account_service.list_expiring_access_tokens()
+    tokens = list(dict.fromkeys([*limited_tokens, *normal_tokens, *expiring_tokens]))
     interval_minute = _refresh_account_interval_minute()
     start_detail = {
         "event_type": "account_auto_refresh_start",
         "total": len(tokens),
+        "limited": len(limited_tokens),
+        "normal": len(normal_tokens),
+        "expiring_access_tokens": len(expiring_tokens),
         "interval_minute": interval_minute,
         "full_refresh": True,
         "defer_invalid_removal": False,
@@ -128,7 +134,12 @@ def run_account_refresh_cycle() -> dict[str, Any]:
 
     try:
         if tokens:
-            print(f"[account-watcher] refreshing all {len(tokens)} accounts")
+            print(
+                "[account-watcher] checking "
+                f"{len(limited_tokens)} limited accounts, "
+                f"{len(normal_tokens)} normal accounts, "
+                f"{len(expiring_tokens)} expiring access tokens"
+            )
             refresh_result = account_service.refresh_accounts(tokens, defer_invalid_removal=False)
         else:
             print("[account-watcher] no accounts to refresh")
@@ -153,6 +164,8 @@ def run_account_refresh_cycle() -> dict[str, Any]:
         raise
 
     keepalive_tokens = account_service.list_refresh_token_keepalive_tokens()
+    expiring_token_set = set(expiring_tokens)
+    keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
     keepalive_result: dict[str, Any] = {"refreshed": 0, "errors": [], "items": [], "relogined": 0}
     if keepalive_tokens:
         print(f"[account-watcher] keepalive {len(keepalive_tokens)} refresh tokens")

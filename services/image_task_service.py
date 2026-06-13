@@ -152,10 +152,12 @@ class ImageTaskService:
         quality: str = "auto",
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
+        masks: list[tuple[bytes, str, str]] | None = None,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
             "images": images or [],
+            "mask": masks or [],
             "model": model,
             "n": 1,
             "size": size,
