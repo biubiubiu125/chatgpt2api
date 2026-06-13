@@ -78,7 +78,8 @@ const aspectOptions = [
   { ratio: "9:16", tier: "4k", width: "2160", height: "3840", label: "9:16(4k)", icon: RectangleVertical },
   { ratio: "auto", tier: "auto", width: "1024", height: "1024", label: "auto", icon: null },
 ];
-const countOptions = Array.from({ length: 10 }, (_, index) => String(index + 1));
+const MAX_IMAGE_COUNT = 50;
+const countOptions = Array.from({ length: MAX_IMAGE_COUNT }, (_, index) => String(index + 1));
 
 export function ImageComposer({
   prompt,
@@ -346,7 +347,7 @@ export function ImageComposer({
                     {isSizeMenuOpen ? (
                       <div
                         ref={sizeMenuRef}
-                        className="fixed z-[80] max-h-[62dvh] overflow-y-auto rounded-[24px] border border-stone-200/70 bg-white p-4 shadow-[0_30px_90px_-34px_rgba(15,23,42,0.42)] sm:max-h-none sm:overflow-visible"
+                        className="fixed z-[80] max-h-[62dvh] overflow-y-auto rounded-[24px] border border-stone-200/70 bg-white p-4 shadow-[0_30px_90px_-34px_rgba(15,23,42,0.42)] sm:max-h-[72vh]"
                         style={{
                           top: sizeMenuPos.top,
                           left: sizeMenuPos.left,
@@ -509,7 +510,7 @@ export function ImageComposer({
                               type="number"
                               inputMode="numeric"
                               min="1"
-                              max="10"
+                              max={String(MAX_IMAGE_COUNT)}
                               step="1"
                               value={imageCount}
                               onChange={(event) => onImageCountChange(event.target.value)}
