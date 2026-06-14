@@ -37,6 +37,7 @@ class ImageGenerationError(Exception):
         code: str | None = "upstream_error",
         param: str | None = None,
         account_email: str = "",
+        account_id: str = "",
         conversation_id: str = "",
     ) -> None:
         super().__init__(message)
@@ -45,6 +46,7 @@ class ImageGenerationError(Exception):
         self.code = code
         self.param = param
         self.account_email = account_email
+        self.account_id = account_id
         self.conversation_id = conversation_id
 
     def to_openai_error(self) -> dict[str, Any]:
@@ -56,8 +58,6 @@ class ImageGenerationError(Exception):
                 "code": self.code,
             }
         }
-        if self.account_email:
-            error_dict["error"]["account_email"] = self.account_email
         return error_dict
 
 
@@ -377,6 +377,7 @@ class ImageOutput:
     upstream_event_type: str = ""
     data: list[dict[str, Any]] = field(default_factory=list)
     account_email: str = ""
+    access_token: str = ""
     conversation_id: str = ""
 
     def to_chunk(self) -> dict[str, Any]:
@@ -1412,10 +1413,19 @@ def _generate_single_image(
         returned_result = False
         account = account_service.get_account(token) or {}
         account_email = str(account.get("email") or "").strip()
+        account_id = str(account.get("account_id") or account.get("user_id") or "").strip()
+
+        def attach_account_context(exc: Exception) -> None:
+            if account_email and not getattr(exc, "account_email", ""):
+                setattr(exc, "account_email", account_email)
+            if account_id and not getattr(exc, "account_id", ""):
+                setattr(exc, "account_id", account_id)
+
         logger.debug({
             "event": "image_account_lookup",
             "token_prefix": token[:12] + "..." if len(token) > 12 else token,
             "account_email": account_email,
+            "account_id": account_id,
             "account_found": bool(account),
             "index": index,
         })
@@ -1428,6 +1438,8 @@ def _generate_single_image(
             for output in stream_fn(backend, request, index, total):
                 if account_email and not output.account_email:
                     output.account_email = account_email
+                if token and not output.access_token:
+                    output.access_token = token
                 if output.kind == "message" and request.message_as_error:
                     raise ImageGenerationError(
                         output.text or "Image generation was rejected by upstream policy.",
@@ -1435,6 +1447,7 @@ def _generate_single_image(
                         error_type="invalid_request_error",
                         code="content_policy_violation",
                         account_email=account_email,
+                        account_id=account_id,
                         conversation_id=output.conversation_id,
                     )
                 emitted_for_token = True
@@ -1454,14 +1467,14 @@ def _generate_single_image(
                         error_type="invalid_request_error",
                         code="no_image_generated",
                         account_email=account_email,
+                        account_id=account_id,
                         conversation_id=conv_id,
                     )
                 return outputs
             release_current_token(True)
             return outputs
         except ImagePollTimeoutError as exc:
-            if account_email:
-                setattr(exc, "account_email", account_email)
+            attach_account_context(exc)
             if not emitted_for_token:
                 poll_timeout_retry_count += 1
                 if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
@@ -1501,11 +1514,11 @@ def _generate_single_image(
                 error_type="invalid_request_error",
                 code="content_policy_violation",
                 account_email=account_email,
+                account_id=account_id,
                 conversation_id=getattr(exc, "conversation_id", ""),
             ) from exc
         except ImageGenerationError as exc:
-            if account_email and not getattr(exc, "account_email", ""):
-                exc.account_email = account_email
+            attach_account_context(exc)
             error_text = str(exc)
             if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
                 text_reply_retry_count += 1
@@ -1537,6 +1550,7 @@ def _generate_single_image(
                     error_type="server_error",
                     code="upstream_text_reply",
                     account_email=account_email,
+                    account_id=account_id,
                     conversation_id=getattr(exc, "conversation_id", ""),
                 ) from exc
             logger.warning({
@@ -1569,7 +1583,7 @@ def _generate_single_image(
                 if switch_token(False):
                     continue
                 release_current_token(False)
-                raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
+                raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, account_id=account_id, conversation_id="") from exc
             if not emitted_for_token and is_tls_connection_error(last_error):
                 tls_retry_count += 1
                 if tls_retry_count <= MAX_TLS_RETRIES:
@@ -1599,7 +1613,7 @@ def _generate_single_image(
                     time.sleep(wait_secs)
                     continue
             release_current_token(False)
-            raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
+            raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, account_id=account_id, conversation_id="") from exc
 
 
 def _acquire_unique_image_tokens(request: ConversationRequest, count: int) -> tuple[list[str], ImageTokenLeasePool]:
@@ -1621,6 +1635,27 @@ def _acquire_unique_image_tokens(request: ConversationRequest, count: int) -> tu
             param="n",
         ) from exc
     return tokens, token_pool
+
+
+def _collect_error_account_context(errors: dict[int, Exception]) -> tuple[str, str, list[str], str]:
+    account_id = ""
+    account_email = ""
+    account_emails: list[str] = []
+    conversation_id = ""
+    for index in sorted(errors):
+        error = errors[index]
+        error_email = str(getattr(error, "account_email", "") or "").strip()
+        if error_email and error_email not in account_emails:
+            account_emails.append(error_email)
+        if error_email and not account_email:
+            account_email = error_email
+        error_id = str(getattr(error, "account_id", "") or "").strip()
+        if error_id and not account_id:
+            account_id = error_id
+        error_conversation_id = str(getattr(error, "conversation_id", "") or "").strip()
+        if error_conversation_id and not conversation_id:
+            conversation_id = error_conversation_id
+    return account_id, account_email, account_emails, conversation_id
 
 
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
@@ -1724,11 +1759,28 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     if not emitted:
         if not last_error:
             last_error = "no account in the pool could generate images — check account quota and rate-limit status"
+        account_id, account_email, account_emails, conversation_id = _collect_error_account_context(errors)
         for index in range(1, request.n + 1):
             error = errors.get(index)
             if isinstance(error, ImageGenerationError):
+                if account_email and not getattr(error, "account_email", ""):
+                    error.account_email = account_email
+                if account_id and not getattr(error, "account_id", ""):
+                    error.account_id = account_id
+                if conversation_id and not getattr(error, "conversation_id", ""):
+                    error.conversation_id = conversation_id
+                if account_emails:
+                    setattr(error, "account_emails", account_emails)
                 raise error
-        raise ImageGenerationError(image_stream_error_message(last_error), conversation_id="")
+        wrapped = ImageGenerationError(
+            image_stream_error_message(last_error),
+            account_email=account_email,
+            account_id=account_id,
+            conversation_id=conversation_id,
+        )
+        if account_emails:
+            setattr(wrapped, "account_emails", account_emails)
+        raise wrapped
 
 
 def stream_image_chunks(outputs: Iterable[ImageOutput]) -> Iterator[dict[str, Any]]:
@@ -1742,10 +1794,16 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
     message = ""
     progress_parts: list[str] = []
     account_email = ""
+    account_emails: list[str] = []
+    access_token = ""
     for output in outputs:
         created = created or output.created
+        if output.account_email and output.account_email not in account_emails:
+            account_emails.append(output.account_email)
         if output.account_email and not account_email:
             account_email = output.account_email
+        if output.access_token and not access_token:
+            access_token = output.access_token
         if output.kind == "progress" and output.text:
             progress_parts.append(output.text)
         elif output.kind == "message":
@@ -1760,4 +1818,8 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
             result["message"] = text
     if account_email:
         result["_account_email"] = account_email
+    if account_emails:
+        result["_account_emails"] = account_emails
+    if access_token:
+        result["_access_token"] = access_token
     return result

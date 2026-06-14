@@ -12,6 +12,7 @@ from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from services.account_service import account_service
 from utils.helper import parse_image_size
 
 TASK_STATUS_QUEUED = "queued"
@@ -66,6 +67,55 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
             if isinstance(url, str) and url:
                 urls.append(url)
     return urls
+
+
+def _collect_account_emails(value: object) -> list[str]:
+    emails: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"_account_email", "account_email"} and isinstance(item, str) and item.strip():
+                emails.append(item.strip())
+            elif key in {"_account_emails", "account_emails"} and isinstance(item, list):
+                emails.extend(str(email).strip() for email in item if str(email or "").strip())
+            else:
+                emails.extend(_collect_account_emails(item))
+    elif isinstance(value, list):
+        for item in value:
+            emails.extend(_collect_account_emails(item))
+    return list(dict.fromkeys(emails))
+
+
+def _account_ref_from_token(access_token: str) -> dict[str, str]:
+    access_token = _clean(access_token)
+    if not access_token:
+        return {}
+    account = account_service.get_account(access_token) or {}
+    account_id = _clean(account.get("account_id") or account.get("user_id"))
+    account_email = _clean(account.get("email"))
+    ref: dict[str, str] = {}
+    if account_id:
+        ref["account_id"] = account_id
+    if account_email:
+        ref["account_email"] = account_email
+    return ref
+
+
+def _resolve_account_token(account_id: str = "", account_email: str = "") -> str:
+    normalized_id = _clean(account_id)
+    normalized_email = _clean(account_email).lower()
+    if not normalized_id and not normalized_email:
+        return ""
+    for account in account_service.list_accounts():
+        token = _clean(account.get("access_token"))
+        if not token:
+            continue
+        candidate_id = _clean(account.get("account_id") or account.get("user_id"))
+        if normalized_id and candidate_id == normalized_id:
+            return account_service.refresh_access_token(token, event="image_resume_poll") or token
+        candidate_email = _clean(account.get("email")).lower()
+        if normalized_email and candidate_email == normalized_email:
+            return account_service.refresh_access_token(token, event="image_resume_poll") or token
+    return ""
 
 
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
@@ -320,6 +370,13 @@ class ImageTaskService:
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")
             account_email = _clean(result.get("_account_email") or result.get("account_email"))
+            account_emails = _collect_account_emails(result)
+            access_token = _clean(result.get("_access_token"))
+            account_ref = _account_ref_from_token(access_token)
+            if not account_email and account_ref.get("account_email"):
+                account_email = account_ref["account_email"]
+            if account_email and account_email not in account_emails:
+                account_emails.insert(0, account_email)
             if not isinstance(data, list) or not data:
                 upstream = _clean(result.get("message"))
                 if upstream:
@@ -329,10 +386,24 @@ class ImageTaskService:
                 error = RuntimeError(message)
                 if account_email:
                     setattr(error, "account_email", account_email)
+                if account_emails:
+                    setattr(error, "account_emails", account_emails)
+                if account_ref.get("account_id"):
+                    setattr(error, "account_id", account_ref["account_id"])
                 raise error
             usage = result.get("usage")
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, usage=usage, error="", duration_ms=duration_ms)
+            self._update_task(
+                key,
+                status=TASK_STATUS_SUCCESS,
+                data=data,
+                usage=usage,
+                error="",
+                duration_ms=duration_ms,
+                **({"account_email": account_email} if account_email else {}),
+                **({"account_emails": account_emails} if account_emails else {}),
+                **({"account_id": account_ref["account_id"]} if account_ref.get("account_id") else {}),
+            )
             self._log_call(
                 identity,
                 mode,
@@ -342,15 +413,21 @@ class ImageTaskService:
                 request_preview=request_text(payload.get("prompt")),
                 urls=_collect_image_urls(data),
                 account_email=account_email,
+                account_emails=account_emails,
             )
         except Exception as exc:
             error_message = str(exc) or "image task failed"
             account_email = _clean(getattr(exc, "account_email", ""))
+            account_emails = _collect_account_emails({"account_emails": getattr(exc, "account_emails", []), "account_email": account_email})
+            account_id = _clean(getattr(exc, "account_id", ""))
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
                               duration_ms=duration_ms,
-                              **({"conversation_id": conversation_id} if conversation_id else {}))
+                              **({"conversation_id": conversation_id} if conversation_id else {}),
+                              **({"account_email": account_email} if account_email else {}),
+                              **({"account_emails": account_emails} if account_emails else {}),
+                              **({"account_id": account_id} if account_id else {}))
             self._log_call(
                 identity,
                 mode,
@@ -361,6 +438,7 @@ class ImageTaskService:
                 status="failed",
                 error=error_message,
                 account_email=account_email,
+                account_emails=account_emails,
             )
         finally:
             with self._lock:
@@ -380,6 +458,7 @@ class ImageTaskService:
         error: str = "",
         urls: list[str] | None = None,
         account_email: str = "",
+        account_emails: list[str] | None = None,
     ) -> None:
         endpoint = "/v1/images/edits" if mode == "edit" else "/v1/images/generations"
         summary_prefix = "图生图" if mode == "edit" else "文生图"
@@ -400,6 +479,9 @@ class ImageTaskService:
             detail["error"] = error
         if account_email:
             detail["account_email"] = account_email
+        clean_emails = _collect_account_emails({"account_emails": account_emails or [], "account_email": account_email})
+        if clean_emails:
+            detail["account_emails"] = clean_emails
         if urls:
             detail["urls"] = list(dict.fromkeys(urls))
         try:
@@ -464,6 +546,25 @@ class ImageTaskService:
             error = _clean(item.get("error"))
             if error:
                 task["error"] = error
+            account_email = _clean(item.get("account_email"))
+            if account_email:
+                task["account_email"] = account_email
+            account_emails = _collect_account_emails(item.get("account_emails"))
+            if account_emails:
+                task["account_emails"] = account_emails
+            account_id = _clean(item.get("account_id"))
+            if account_id:
+                task["account_id"] = account_id
+            conversation_id = _clean(item.get("conversation_id"))
+            if conversation_id:
+                task["conversation_id"] = conversation_id
+            access_token = _clean(item.get("access_token"))
+            if access_token:
+                account_ref = _account_ref_from_token(access_token)
+                if account_ref.get("account_id"):
+                    task["account_id"] = account_ref["account_id"]
+                if not task.get("account_email") and account_ref.get("account_email"):
+                    task["account_email"] = account_ref["account_email"]
             tasks[_task_key(owner, task_id)] = task
         return tasks
 
@@ -519,15 +620,28 @@ class ImageTaskService:
             conversation_id = _clean(task.get("conversation_id"))
             if not conversation_id:
                 raise ValueError("task has no conversation_id")
+            account_id = _clean(task.get("account_id"))
+            account_email = _clean(task.get("account_email"))
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
+
+        access_token = _resolve_account_token(account_id, account_email)
+        if not access_token:
+            raise ValueError("task account is not available for resume poll")
+
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None:
+                raise ValueError("task not found")
+            if task.get("status") != TASK_STATUS_ERROR:
+                raise ValueError("task is not in error state")
             # 将任务状态重置为 running
             self._update_task(key, status=TASK_STATUS_RUNNING, error="")
 
         # 启动新线程继续轮询
         thread = threading.Thread(
             target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
+            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model, access_token, account_email),
             name=f"image-resume-{_clean(task_id)[:16]}",
             daemon=True,
         )
@@ -542,6 +656,8 @@ class ImageTaskService:
         identity: dict[str, object],
         mode: str,
         model: str,
+        access_token: str,
+        account_email: str = "",
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
@@ -549,7 +665,7 @@ class ImageTaskService:
             from services.openai_backend_api import OpenAIBackendAPI
             from services.protocol.conversation import ensure_image_canvas_size, format_image_result
 
-            backend = OpenAIBackendAPI(proxy_url=config.proxy_url or None)
+            backend = OpenAIBackendAPI(access_token=access_token)
             file_ids, sediment_ids = backend._poll_image_results(
                 conversation_id,
                 extra_timeout_secs,
@@ -589,6 +705,8 @@ class ImageTaskService:
                 "调用完成（续轮询）",
                 status="success",
                 urls=_collect_image_urls(data),
+                account_email=account_email,
+                account_emails=[account_email] if account_email else [],
             )
         except Exception as exc:
             error_message = str(exc) or "resume poll failed"
@@ -602,6 +720,8 @@ class ImageTaskService:
                 "调用失败（续轮询）",
                 status="failed",
                 error=error_message,
+                account_email=account_email,
+                account_emails=[account_email] if account_email else [],
             )
 
 

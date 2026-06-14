@@ -49,6 +49,27 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
     "or file operations. Do not claim to have run tools or inspected external resources. "
     "If a user asks you to use a tool, say that tool execution is unavailable through this backend."
 )
+INTERNAL_ACCOUNT_KEYS = ("_account_email", "_account_emails")
+
+
+def _copy_account_context(source: dict[str, Any], target: dict[str, Any]) -> None:
+    for key in INTERNAL_ACCOUNT_KEYS:
+        value = source.get(key)
+        if value:
+            target[key] = value
+
+
+def _append_account_email(account_emails: list[str], account_email: str) -> None:
+    email = str(account_email or "").strip()
+    if email and email not in account_emails:
+        account_emails.append(email)
+
+
+def _attach_account_context(target: dict[str, Any], account_emails: list[str]) -> None:
+    if not account_emails:
+        return
+    target["_account_email"] = account_emails[0]
+    target["_account_emails"] = list(account_emails)
 
 
 def completion_chunk(model: str, delta: dict[str, Any], finish_reason: str | None = None, completion_id: str = "", created: int | None = None) -> dict[str, Any]:
@@ -229,6 +250,7 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         output_tokens=count_image_output_items_tokens(result.get("data"), size, quality),
     )
     response["usage"] = chat_usage_from_image_usage(usage)
+    _copy_account_context(result, response)
     return response
 
 
@@ -251,7 +273,9 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
     created = int(time.time())
     sent_role = False
     sent_text = ""
+    account_emails: list[str] = []
     for output in image_outputs:
+        _append_account_email(account_emails, output.account_email)
         content = ""
         if output.kind == "progress":
             content = output.text
@@ -264,12 +288,18 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
             continue
         if not sent_role:
             sent_role = True
-            yield completion_chunk(model, {"role": "assistant", "content": content}, None, completion_id, created)
+            chunk = completion_chunk(model, {"role": "assistant", "content": content}, None, completion_id, created)
         else:
-            yield completion_chunk(model, {"content": content}, None, completion_id, created)
+            chunk = completion_chunk(model, {"content": content}, None, completion_id, created)
+        _attach_account_context(chunk, account_emails)
+        yield chunk
     if not sent_role:
-        yield completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
-    yield completion_chunk(model, {}, "stop", completion_id, created)
+        chunk = completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
+        _attach_account_context(chunk, account_emails)
+        yield chunk
+    chunk = completion_chunk(model, {}, "stop", completion_id, created)
+    _attach_account_context(chunk, account_emails)
+    yield chunk
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:

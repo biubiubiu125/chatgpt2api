@@ -87,7 +87,6 @@ const docs: ApiDoc[] = [
     output: [
       ["answer", "string", "搜索后的回答内容，具体字段以返回结果为准。"],
       ["sources", "array", "可选，搜索引用来源。"],
-      ["_account_email", "string", "本次使用的账号邮箱。"],
     ],
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/search \\
   -H "Content-Type: application/json" \\
@@ -102,7 +101,7 @@ const docs: ApiDoc[] = [
     input: [
       ["prompt", "string", "图片生成提示词。"],
       ["model", "string", "可选，默认 gpt-image-2。"],
-      ["n", "number", "可选，生成数量，当前限制 1-4。"],
+      ["n", "number", "可选，生成数量，当前限制 1-50。"],
       ["size", "string", "可选，图片尺寸。"],
       ["quality", "string", "可选，默认 auto。"],
       ["response_format", "string", "可选，默认 b64_json。"],
@@ -126,7 +125,7 @@ const docs: ApiDoc[] = [
       ["image", "file | file[] | URL", "参考图，支持 multipart 上传，也支持 JSON 图片链接。"],
       ["prompt", "string", "编辑提示词。"],
       ["model", "string", "可选，默认 gpt-image-2。"],
-      ["n", "number", "可选，生成数量，当前限制 1-4。"],
+      ["n", "number", "可选，生成数量，当前限制 1-50。"],
       ["size", "string", "可选，图片尺寸。"],
       ["quality", "string", "可选，默认 auto。"],
     ],

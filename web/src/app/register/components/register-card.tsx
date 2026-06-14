@@ -46,7 +46,9 @@ export function RegisterCard() {
   const providers = config.mail.providers || [];
   const logs = config.logs || [];
   const updateProviderType = (index: number, type: string) => {
+    const providerId = String(providers[index]?.provider_id || providers[index]?.id || "");
     updateProvider(index, {
+      ...(providerId ? { provider_id: providerId } : {}),
       type,
       enable: true,
       ...(type === "cloudmail_gen" ? { api_base: "", admin_email: "", admin_password: "", domain: [], subdomain: [], email_prefix: "" } : {}),

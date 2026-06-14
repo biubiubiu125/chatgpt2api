@@ -34,6 +34,12 @@ function getDetailText(item: SystemLog, key: string) {
 
 function getAccountText(item: SystemLog) {
   const detail = item.detail || {};
+  const accountEmails = detail.account_emails;
+  if (Array.isArray(accountEmails)) {
+    const emails = accountEmails.filter((value): value is string => typeof value === "string" && value.trim().length > 0);
+    if (emails.length > 1) return `${emails[0]} 等 ${emails.length} 个账号`;
+    if (emails.length === 1) return emails[0];
+  }
   for (const key of ["account_email", "email", "account_id", "token", "source_type"]) {
     const value = detail[key];
     if (typeof value === "string" && value.trim()) return value.trim();

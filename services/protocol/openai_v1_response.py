@@ -47,8 +47,22 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
     "or file operations. Do not claim to have run tools or inspected external resources. "
     "If a user asks you to use a tool, say that tool execution is unavailable through this backend."
 )
+INTERNAL_ACCOUNT_KEYS = ("_account_email", "_account_emails")
 
 RESPONSE_CONTENT_PART_TYPES = {"text", "input_text", "output_text", "image_url", "input_image", "image"}
+
+
+def _append_account_email(account_emails: list[str], account_email: str) -> None:
+    email = str(account_email or "").strip()
+    if email and email not in account_emails:
+        account_emails.append(email)
+
+
+def _attach_account_context(target: dict[str, Any], account_emails: list[str]) -> None:
+    if not account_emails:
+        return
+    target["_account_email"] = account_emails[0]
+    target["_account_emails"] = list(account_emails)
 
 
 def is_text_response_request(body: dict[str, Any]) -> bool:
@@ -367,8 +381,10 @@ def stream_image_response(
     items: list[dict[str, Any]] = []
     output_image_data: list[dict[str, Any]] = []
     fallback_message = ""
+    account_emails: list[str] = []
     yield response_created(response_id, model, created)
     for output in image_outputs:
+        _append_account_email(account_emails, output.account_email)
         if output.kind == "message":
             fallback_message = output.text or fallback_message
             continue
@@ -386,7 +402,9 @@ def stream_image_response(
         )
         for output_index, item in enumerate(items):
             yield {"type": "response.output_item.done", "output_index": output_index, "item": item}
-        yield response_completed(response_id, model, created, items, usage)
+        event = response_completed(response_id, model, created, items, usage)
+        _attach_account_context(event, account_emails)
+        yield event
         return
     if fallback_message:
         item = text_output_item(fallback_message)
@@ -398,7 +416,9 @@ def stream_image_response(
         yield {"type": "response.output_text.delta", "item_id": item["id"], "output_index": 0, "content_index": 0, "delta": fallback_message}
         yield {"type": "response.output_text.done", "item_id": item["id"], "output_index": 0, "content_index": 0, "text": fallback_message}
         yield {"type": "response.output_item.done", "output_index": 0, "item": item}
-        yield response_completed(response_id, model, created, [item], usage)
+        event = response_completed(response_id, model, created, [item], usage)
+        _attach_account_context(event, account_emails)
+        yield event
         return
     raise RuntimeError("image generation failed")
 
@@ -408,6 +428,10 @@ def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     for event in events:
         if event.get("type") == "response.completed":
             completed = event.get("response") if isinstance(event.get("response"), dict) else {}
+            for key in INTERNAL_ACCOUNT_KEYS:
+                value = event.get(key)
+                if value:
+                    completed[key] = value
     if not completed:
         raise RuntimeError("response generation failed")
     return completed

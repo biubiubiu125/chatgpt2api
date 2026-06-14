@@ -33,6 +33,24 @@ def _merge_outlook_pool(old_text: str, new_text: str) -> str:
     return _serialize_outlook_pool(list(merged.values()))
 
 
+def _provider_id(value: object) -> str:
+    text = str(value or "").strip()
+    return text if text else uuid.uuid4().hex
+
+
+def _normalize_mail_providers(cfg: dict) -> None:
+    mail = cfg.get("mail")
+    if not isinstance(mail, dict):
+        return
+    providers = mail.get("providers")
+    if not isinstance(providers, list):
+        mail["providers"] = []
+        return
+    for provider in providers:
+        if isinstance(provider, dict):
+            provider["provider_id"] = _provider_id(provider.get("provider_id") or provider.get("id"))
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -89,6 +107,7 @@ def _normalize(raw: dict) -> dict:
     cfg["auto_refill"] = auto_refill
     if isinstance(cfg.get("mail"), dict):
         cfg["mail"].pop("proxy", None)
+    _normalize_mail_providers(cfg)
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
@@ -159,17 +178,31 @@ class RegisterService:
         """对 outlook_token provider：把前端新导入的 mailboxes 与已存池按邮箱合并去重。
 
         前端 mailboxes 是只写导入框，留空表示不改动；填入的新行追加/覆盖已存凭据。
-        按数组下标与已存的同类型 provider 对齐。
+        优先按 provider_id 对齐；旧配置没有 provider_id 时才按数组下标兼容。
         """
         mail = updates.get("mail")
         if not isinstance(mail, dict) or not isinstance(mail.get("providers"), list):
             return
         old_mail = self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}
         old_providers = old_mail.get("providers") if isinstance(old_mail.get("providers"), list) else []
+        old_by_id = {
+            str(item.get("provider_id") or "").strip(): item
+            for item in old_providers
+            if isinstance(item, dict) and item.get("type") == "outlook_token" and str(item.get("provider_id") or "").strip()
+        }
+        old_outlook_providers = [item for item in old_providers if isinstance(item, dict) and item.get("type") == "outlook_token"]
+        outlook_without_id_index = 0
         for index, provider in enumerate(mail["providers"]):
             if not isinstance(provider, dict) or provider.get("type") != "outlook_token":
                 continue
-            old = old_providers[index] if index < len(old_providers) and isinstance(old_providers[index], dict) else {}
+            incoming_provider_id = str(provider.get("provider_id") or provider.get("id") or "").strip()
+            provider["provider_id"] = _provider_id(incoming_provider_id)
+            old = (old_by_id.get(incoming_provider_id) or {}) if incoming_provider_id else {}
+            if not old and not incoming_provider_id and outlook_without_id_index < len(old_outlook_providers):
+                old = old_outlook_providers[outlook_without_id_index]
+                outlook_without_id_index += 1
+            if not old and not incoming_provider_id and index < len(old_providers) and isinstance(old_providers[index], dict):
+                old = old_providers[index]
             old_text = str(old.get("mailboxes") or "") if old.get("type") == "outlook_token" else ""
             new_text = str(provider.get("mailboxes") or "")
             provider["mailboxes"] = _merge_outlook_pool(old_text, new_text) if (old_text or new_text) else ""

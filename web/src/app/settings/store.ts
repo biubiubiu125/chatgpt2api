@@ -39,6 +39,13 @@ import {
   type ThirdPartyAppsSettings,
 } from "@/lib/api";
 
+function createProviderId() {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `provider-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 export const PAGE_SIZE_OPTIONS = ["50", "100", "200"] as const;
 
 export type PageSizeOption = (typeof PAGE_SIZE_OPTIONS)[number];
@@ -964,7 +971,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           ...state.registerConfig.mail,
           providers: [
             ...(state.registerConfig.mail.providers || []),
-            { enable: true, type: "cloudmail_gen", api_base: "", admin_email: "", admin_password: "", domain: [], subdomain: [], email_prefix: "" },
+            { provider_id: createProviderId(), enable: true, type: "cloudmail_gen", api_base: "", admin_email: "", admin_password: "", domain: [], subdomain: [], email_prefix: "" },
           ],
         },
       },
