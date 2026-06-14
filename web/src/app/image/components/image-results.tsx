@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState, type CSSProperties } from "react";
 import { Clock3, Download, EyeOff, LoaderCircle, RotateCcw, Sparkles, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -45,6 +45,19 @@ function getStoredImageSrc(image: StoredImage) {
     return url;
   }
   return image.url || "";
+}
+
+function turnAspectStyle(size: string): CSSProperties | undefined {
+  const match = /^(\d+)x(\d+)$/.exec(size || "");
+  if (!match) {
+    return undefined;
+  }
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return undefined;
+  }
+  return { aspectRatio: `${width} / ${height}` };
 }
 
 async function downloadStoredImage(image: StoredImage, index: number) {
@@ -263,6 +276,7 @@ export function ImageResults({
                               src={imageSrc}
                               alt={`Generated result ${index + 1}`}
                               className="group block aspect-square w-full cursor-zoom-in overflow-hidden rounded-xl sm:aspect-auto"
+                              style={turnAspectStyle(turn.size)}
                               onLoad={(event) => {
                                 updateImageDimensions(
                                   image.id,
@@ -310,6 +324,7 @@ export function ImageResults({
                         return (
                           <div key={image.id} className="break-inside-avoid">
                             <div
+                              style={turnAspectStyle(turn.size)}
                               className={cn(
                                 "overflow-hidden rounded-xl border border-rose-200 bg-rose-50",
                                 "aspect-square",
@@ -318,6 +333,7 @@ export function ImageResults({
                                 turn.ratio === "9:16" && "sm:aspect-[9/16]",
                                 turn.ratio === "4:3" && "sm:aspect-[4/3]",
                                 turn.ratio === "3:4" && "sm:aspect-[3/4]",
+                                turn.ratio === "21:9" && "sm:aspect-[21/9]",
                                 turn.ratio === "3:1" && "sm:aspect-[3/1]",
                                 turn.ratio === "1:3" && "sm:aspect-[1/3]",
                               )}
@@ -369,6 +385,7 @@ export function ImageResults({
                       return (
                         <div key={image.id} className="break-inside-avoid">
                           <div
+                            style={turnAspectStyle(turn.size)}
                             className={cn(
                               "overflow-hidden rounded-xl border border-stone-200/80 bg-stone-100/80 relative",
                               turn.ratio === "1:1" && "aspect-square",
@@ -376,6 +393,7 @@ export function ImageResults({
                               turn.ratio === "9:16" && "aspect-[9/16]",
                               turn.ratio === "4:3" && "aspect-[4/3]",
                               turn.ratio === "3:4" && "aspect-[3/4]",
+                              turn.ratio === "21:9" && "aspect-[21/9]",
                               turn.ratio === "3:1" && "aspect-[3/1]",
                               turn.ratio === "1:3" && "aspect-[1/3]",
                             )}
@@ -508,10 +526,18 @@ function formatImageDimensions(width: number, height: number) {
   return `${width} x ${height}`;
 }
 
-const LazyImage = memo(function LazyImage({ src, alt, className, onLoad, onOpen }: {
+const LazyImage = memo(function LazyImage({
+  src,
+  alt,
+  className,
+  style,
+  onLoad,
+  onOpen,
+}: {
   src: string;
   alt: string;
   className: string;
+  style?: CSSProperties;
   onLoad?: (event: React.SyntheticEvent<HTMLImageElement>) => void;
   onOpen?: () => void;
 }) {
@@ -542,6 +568,7 @@ const LazyImage = memo(function LazyImage({ src, alt, className, onLoad, onOpen 
           type="button"
           onClick={onOpen}
           className={className}
+          style={style}
         >
           <img
             src={src}
@@ -551,7 +578,10 @@ const LazyImage = memo(function LazyImage({ src, alt, className, onLoad, onOpen 
           />
         </button>
       ) : (
-        <div className={`animate-pulse rounded-xl bg-stone-100 min-h-[200px] sm:min-h-[280px] ${className}`} />
+        <div
+          className={`animate-pulse rounded-xl bg-stone-100 min-h-[200px] sm:min-h-[280px] ${className}`}
+          style={style}
+        />
       )}
     </div>
   );

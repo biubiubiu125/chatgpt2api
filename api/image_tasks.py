@@ -17,6 +17,7 @@ class ImageGenerationTaskRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     model: str = "gpt-image-2"
     size: str | None = None
+    aspect_ratio: str | None = None
     quality: str = "auto"
 
 
@@ -64,6 +65,7 @@ def create_router() -> APIRouter:
                 prompt=body.prompt,
                 model=body.model,
                 size=body.size,
+                aspect_ratio=body.aspect_ratio,
                 quality=body.quality,
                 base_url=resolve_image_base_url(request),
             )
@@ -95,6 +97,7 @@ def create_router() -> APIRouter:
                 prompt=prompt,
                 model=model,
                 size=payload["size"],
+                aspect_ratio=payload.get("aspect_ratio"),
                 quality=payload["quality"],
                 base_url=resolve_image_base_url(request),
                 images=images,

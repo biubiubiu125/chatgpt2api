@@ -179,6 +179,12 @@ def ensure_image_canvas_size(image_data: bytes, size: str | None) -> bytes:
             resized = converted.resize(target_size, Image.Resampling.LANCZOS)
             output = BytesIO()
             resized.save(output, format="PNG")
+            logger.info({
+                "event": "image_canvas_resized",
+                "target_size": size,
+                "current_size": current_size,
+                "final_size": target_size,
+            })
             return output.getvalue()
     except Exception as exc:
         logger.warning({

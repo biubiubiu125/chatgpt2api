@@ -5,6 +5,7 @@ import { ArrowDown, History, LoaderCircle, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { ImageComposer } from "@/app/image/components/image-composer";
+import { IMAGE_SIZE_PRESET_BY_RATIO_TIER } from "@/app/image/image-size-presets";
 import { ImageResults, type ImageLightboxItem } from "@/app/image/components/image-results";
 import { ImageSidebar } from "@/app/image/components/image-sidebar";
 import { ImageLightbox } from "@/components/image-lightbox";
@@ -50,12 +51,25 @@ import {
 const ACTIVE_CONVERSATION_STORAGE_KEY = "chatgpt2api:image_active_conversation_id";
 const IMAGE_RATIO_STORAGE_KEY = "chatgpt2api:image_last_ratio";
 const IMAGE_TIER_STORAGE_KEY = "chatgpt2api:image_last_tier";
+const IMAGE_WIDTH_STORAGE_KEY = "chatgpt2api:image_last_width";
+const IMAGE_HEIGHT_STORAGE_KEY = "chatgpt2api:image_last_height";
 const IMAGE_QUALITY_STORAGE_KEY = "chatgpt2api:image_last_quality";
 const IMAGE_MODEL_STORAGE_KEY = "chatgpt2api:image_last_model";
 const IMAGE_COUNT_STORAGE_KEY = "chatgpt2api:image_last_count";
 const SCROLL_POSITIONS_STORAGE_KEY = "chatgpt2api:image_scroll_positions";
 const SCROLL_TO_LATEST_THRESHOLD = 160;
 const MAX_IMAGE_COUNT = 50;
+const MAX_IMAGE_SIDE = 3840;
+const MAX_IMAGE_PIXELS = 3840 * 2160;
+const IMAGE_SIZE_MULTIPLE = 16;
+const MIN_IMAGE_RATIO = 1 / 3;
+const MAX_IMAGE_RATIO = 3;
+const DEFAULT_IMAGE_RATIO = "1:1";
+const DEFAULT_IMAGE_TIER = "2k";
+const DEFAULT_IMAGE_PRESET = IMAGE_SIZE_PRESET_BY_RATIO_TIER[`${DEFAULT_IMAGE_RATIO}:${DEFAULT_IMAGE_TIER}`] ?? {
+  width: "2048",
+  height: "2048",
+};
 
 function loadScrollPositions(): Map<string, number> {
   if (typeof window === "undefined") return new Map();
@@ -85,7 +99,125 @@ function clampImageCount(value: string) {
 }
 function parseImageSize(size: string) {
   const match = size.match(/^(\d+)x(\d+)$/);
-  return match ? { width: match[1], height: match[2] } : { width: "1024", height: "1024" };
+  return match ? { width: match[1], height: match[2] } : DEFAULT_IMAGE_PRESET;
+}
+
+function isDefaultImageSizeRequest(size: string | null | undefined) {
+  const value = String(size || "").trim().toLowerCase();
+  return !value || value === "auto";
+}
+
+function safeImageSize(size: string) {
+  if (isDefaultImageSizeRequest(size)) {
+    const preset = imageSizePresetFor(DEFAULT_IMAGE_RATIO, DEFAULT_IMAGE_TIER);
+    return `${preset.width}x${preset.height}`;
+  }
+  const parsed = parseImageSize(size);
+  if (!isValidImageSize(parsed.width, parsed.height)) {
+    const preset = imageSizePresetFor(DEFAULT_IMAGE_RATIO, DEFAULT_IMAGE_TIER);
+    return `${preset.width}x${preset.height}`;
+  }
+  return `${parsed.width}x${parsed.height}`;
+}
+
+function normalizeImageDimension(value: string | null | undefined, fallback: string) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) {
+    return fallback;
+  }
+  return String(Math.floor(number));
+}
+
+function imageSizePresetFor(ratio: string, tier: string) {
+  return IMAGE_SIZE_PRESET_BY_RATIO_TIER[`${ratio}:${tier}`] ?? DEFAULT_IMAGE_PRESET;
+}
+
+function strictImageSizePresetFor(ratio: string, tier: string) {
+  return IMAGE_SIZE_PRESET_BY_RATIO_TIER[`${ratio}:${tier}`] ?? null;
+}
+
+function isValidImageSize(widthValue: string, heightValue: string) {
+  const width = Number(widthValue);
+  const height = Number(heightValue);
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+    return false;
+  }
+  if (width > MAX_IMAGE_SIDE || height > MAX_IMAGE_SIDE) {
+    return false;
+  }
+  if (width % IMAGE_SIZE_MULTIPLE !== 0 || height % IMAGE_SIZE_MULTIPLE !== 0) {
+    return false;
+  }
+  const ratio = width / height;
+  if (ratio < MIN_IMAGE_RATIO || ratio > MAX_IMAGE_RATIO) {
+    return false;
+  }
+  return width * height <= MAX_IMAGE_PIXELS;
+}
+
+function resolveImageSizeMode(ratio: string, tier: string, size: string) {
+  const nextRatio = ratio || DEFAULT_IMAGE_RATIO;
+  const nextTier = tier || DEFAULT_IMAGE_TIER;
+  if (nextRatio === "auto" || nextTier === "auto") {
+    return { ratio: DEFAULT_IMAGE_RATIO, tier: DEFAULT_IMAGE_TIER };
+  }
+  if (nextRatio === "custom" || nextTier === "custom") {
+    return { ratio: "custom", tier: "custom" };
+  }
+
+  const match = /^(\d+)x(\d+)$/.exec(size || "");
+  if (!match) {
+    return { ratio: "custom", tier: "custom" };
+  }
+
+  const preset = strictImageSizePresetFor(nextRatio, nextTier);
+  if (!preset) {
+    return { ratio: "custom", tier: "custom" };
+  }
+  if (match[1] !== preset.width || match[2] !== preset.height) {
+    return { ratio: "custom", tier: "custom" };
+  }
+
+  return { ratio: nextRatio, tier: nextTier };
+}
+
+function normalizeTurnSizeMode(turn: ImageTurn) {
+  const nextSize = safeImageSize(turn.size);
+  const sizeMode = resolveImageSizeMode(turn.ratio, turn.tier, nextSize);
+  if (sizeMode.ratio === turn.ratio && sizeMode.tier === turn.tier && nextSize === turn.size) {
+    return turn;
+  }
+  return {
+    ...turn,
+    size: nextSize,
+    ratio: sizeMode.ratio,
+    tier: sizeMode.tier,
+  };
+}
+
+function validateImageSize(widthValue: string, heightValue: string) {
+  if (isValidImageSize(widthValue, heightValue)) {
+    return "";
+  }
+  const width = Number(widthValue);
+  const height = Number(heightValue);
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+    return "图片宽高必须是正整数";
+  }
+  if (width > MAX_IMAGE_SIDE || height > MAX_IMAGE_SIDE) {
+    return `图片宽高不能超过 ${MAX_IMAGE_SIDE}`;
+  }
+  if (width % IMAGE_SIZE_MULTIPLE !== 0 || height % IMAGE_SIZE_MULTIPLE !== 0) {
+    return `图片宽高必须是 ${IMAGE_SIZE_MULTIPLE} 的倍数`;
+  }
+  const ratio = width / height;
+  if (ratio < MIN_IMAGE_RATIO || ratio > MAX_IMAGE_RATIO) {
+    return "图片比例必须在 1:3 到 3:1 之间";
+  }
+  if (width * height > MAX_IMAGE_PIXELS) {
+    return "图片总像素不能超过 3840x2160";
+  }
+  return "图片尺寸不合法";
 }
 
 const activeConversationQueueIds = new Set<string>();
@@ -379,30 +511,40 @@ async function syncConversationImageTasks(items: ImageConversation[]) {
 async function recoverConversationHistory(items: ImageConversation[]) {
   let changed = false;
   const normalized = items.map((conversation) => {
+    let shouldTouchUpdatedAt = false;
     const turns = conversation.turns.map((turn) => {
+      const normalizedTurn = normalizeTurnSizeMode(turn);
+      let turnChanged = normalizedTurn !== turn;
       if (turn.status !== "queued" && turn.status !== "generating" && turn.status !== "error") {
-        return turn;
+        if (!turnChanged) {
+          return turn;
+        }
+        changed = true;
+        return normalizedTurn;
       }
 
-      let turnChanged = false;
-      const images = turn.images.map((image) => {
+      const images = normalizedTurn.images.map((image) => {
         if (image.status !== "loading" || image.taskId) {
           return image;
         }
         turnChanged = true;
+        shouldTouchUpdatedAt = true;
         return {
           ...image,
           status: "error" as const,
           error: "页面刷新或任务中断，未找到可恢复的任务 ID",
         };
       });
-      const derived = deriveTurnStatus({ ...turn, images });
-      if (!turnChanged && derived.status === turn.status && derived.error === turn.error) {
-        return turn;
+      const derived = deriveTurnStatus({ ...normalizedTurn, images });
+      if (!turnChanged && derived.status === normalizedTurn.status && derived.error === normalizedTurn.error) {
+        return normalizedTurn;
       }
       changed = true;
+      if (derived.status !== normalizedTurn.status || derived.error !== normalizedTurn.error) {
+        shouldTouchUpdatedAt = true;
+      }
       return {
-        ...turn,
+        ...normalizedTurn,
         ...derived,
         images,
       };
@@ -415,7 +557,7 @@ async function recoverConversationHistory(items: ImageConversation[]) {
     return {
       ...conversation,
       turns,
-      updatedAt: new Date().toISOString(),
+      updatedAt: shouldTouchUpdatedAt ? new Date().toISOString() : conversation.updatedAt,
     };
   });
 
@@ -444,13 +586,14 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   const config = useSettingsStore((state) => state.config);
   const imageTimeoutRetrySecs = Number(config?.image_timeout_retry_secs || 30);
+  const didLoadImagePreferencesRef = useRef(false);
 
   const [imagePrompt, setImagePrompt] = useState("");
   const [imageCount, setImageCount] = useState("3");
-  const [imageRatio, setImageRatio] = useState("auto");
-  const [imageTier, setImageTier] = useState("1k");
-  const [imageWidth, setImageWidth] = useState("1024");
-  const [imageHeight, setImageHeight] = useState("1024");
+  const [imageRatio, setImageRatio] = useState(DEFAULT_IMAGE_RATIO);
+  const [imageTier, setImageTier] = useState(DEFAULT_IMAGE_TIER);
+  const [imageWidth, setImageWidth] = useState(DEFAULT_IMAGE_PRESET.width);
+  const [imageHeight, setImageHeight] = useState(DEFAULT_IMAGE_PRESET.height);
   const [imageQuality, setImageQuality] = useState("auto");
   const [imageModel, setImageModel] = useState<ImageModel>("gpt-image-2");
   const [imageModels, setImageModels] = useState<ImageModel[]>(["gpt-image-2"]);
@@ -591,16 +734,35 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_RATIO_STORAGE_KEY) : null;
       const storedTier =
         typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_TIER_STORAGE_KEY) : null;
+      const storedWidth =
+        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_WIDTH_STORAGE_KEY) : null;
+      const storedHeight =
+        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_HEIGHT_STORAGE_KEY) : null;
       const storedQuality =
         typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_QUALITY_STORAGE_KEY) : null;
       const storedCount =
         typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_COUNT_STORAGE_KEY) : null;
-      setImageRatio(storedRatio || "1:1");
-      setImageTier(storedTier || "1k");
-      setImageWidth("1024");
-      setImageHeight("1024");
+      let nextRatio = storedRatio || DEFAULT_IMAGE_RATIO;
+      let nextTier = storedTier || DEFAULT_IMAGE_TIER;
+      if (nextRatio === "auto" || nextTier === "auto") {
+        nextRatio = DEFAULT_IMAGE_RATIO;
+        nextTier = DEFAULT_IMAGE_TIER;
+      } else if (nextRatio === "custom" || nextTier === "custom") {
+        nextRatio = "custom";
+        nextTier = "custom";
+      } else if (!strictImageSizePresetFor(nextRatio, nextTier)) {
+        nextRatio = DEFAULT_IMAGE_RATIO;
+        nextTier = DEFAULT_IMAGE_TIER;
+      }
+      const preset = imageSizePresetFor(nextRatio, nextTier);
+      const useStoredDimensions = nextRatio === "custom" || nextTier === "custom";
+      setImageRatio(nextRatio);
+      setImageTier(nextTier);
+      setImageWidth(useStoredDimensions ? normalizeImageDimension(storedWidth, preset.width) : preset.width);
+      setImageHeight(useStoredDimensions ? normalizeImageDimension(storedHeight, preset.height) : preset.height);
       setImageQuality(storedQuality || "auto");
       setImageCount(storedCount ? clampImageCount(storedCount) : "1");
+      didLoadImagePreferencesRef.current = true;
 
       const items = await listImageConversations();
       const normalizedItems = await recoverConversationHistory(items);
@@ -837,12 +999,17 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     if (typeof window === "undefined") {
       return;
     }
+    if (!didLoadImagePreferencesRef.current) {
+      return;
+    }
 
     window.localStorage.setItem(IMAGE_RATIO_STORAGE_KEY, imageRatio);
     window.localStorage.setItem(IMAGE_TIER_STORAGE_KEY, imageTier);
+    window.localStorage.setItem(IMAGE_WIDTH_STORAGE_KEY, normalizeImageDimension(imageWidth, DEFAULT_IMAGE_PRESET.width));
+    window.localStorage.setItem(IMAGE_HEIGHT_STORAGE_KEY, normalizeImageDimension(imageHeight, DEFAULT_IMAGE_PRESET.height));
     window.localStorage.setItem(IMAGE_QUALITY_STORAGE_KEY, imageQuality);
     window.localStorage.setItem(IMAGE_MODEL_STORAGE_KEY, imageModel);
-  }, [imageRatio, imageTier, imageQuality, imageModel]);
+  }, [imageRatio, imageTier, imageWidth, imageHeight, imageQuality, imageModel]);
 
   useEffect(() => {
     if (typeof window !== "undefined" && parsedCount > 0) {
@@ -1117,9 +1284,11 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     setSelectedConversationId(conversationId);
     setImagePrompt(turn.prompt);
     setImageCount(String(Math.max(1, turn.count || turn.images.length || 1)));
-    setImageRatio(turn.ratio);
-    setImageTier(turn.tier);
-    const parsedSize = parseImageSize(turn.size);
+    const safeSize = safeImageSize(turn.size);
+    const parsedSize = parseImageSize(safeSize);
+    const sizeMode = resolveImageSizeMode(turn.ratio, turn.tier, safeSize);
+    setImageRatio(sizeMode.ratio);
+    setImageTier(sizeMode.tier);
     setImageWidth(parsedSize.width);
     setImageHeight(parsedSize.height);
     setImageQuality(turn.quality);
@@ -1215,8 +1384,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
           pendingImages.map((image) => {
             const taskId = image.taskId || image.id;
             return activeTurn.mode === "edit"
-              ? createImageEditTask(taskId, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeTurn.id)
-              : createImageGenerationTask(taskId, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeTurn.id);
+              ? createImageEditTask(taskId, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeTurn.id, activeTurn.ratio)
+              : createImageGenerationTask(taskId, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeTurn.id, activeTurn.ratio);
           }),
         );
         await applyTasks(submitted);
@@ -1267,8 +1436,25 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
               const resubmitted = await Promise.all(
                 missingImages.map((image) =>
                   activeTurn.mode === "edit"
-                    ? createImageEditTask(image.taskId || image.id, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeTurn.id)
-                    : createImageGenerationTask(image.taskId || image.id, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeTurn.id),
+                    ? createImageEditTask(
+                        image.taskId || image.id,
+                        referenceFiles,
+                        activeTurn.prompt,
+                        activeTurn.model,
+                        activeTurn.size,
+                        activeTurn.quality,
+                        activeTurn.id,
+                        activeTurn.ratio,
+                      )
+                    : createImageGenerationTask(
+                        image.taskId || image.id,
+                        activeTurn.prompt,
+                        activeTurn.model,
+                        activeTurn.size,
+                        activeTurn.quality,
+                        activeTurn.id,
+                        activeTurn.ratio,
+                      ),
                 ),
               );
               if (resubmitted.length > 0) {
@@ -1337,6 +1523,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       const now = new Date().toISOString();
       const nextTurnId = createId();
       const count = Math.max(1, sourceTurn.count || sourceTurn.images.length || 1);
+      const imageSize = safeImageSize(sourceTurn.size);
+      const sizeMode = resolveImageSizeMode(sourceTurn.ratio, sourceTurn.tier, imageSize);
       const nextTurn: ImageTurn = {
         id: nextTurnId,
         prompt: sourceTurn.prompt,
@@ -1344,9 +1532,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         mode: sourceTurn.mode,
         referenceImages: sourceTurn.referenceImages,
         count,
-        size: sourceTurn.size,
-        ratio: sourceTurn.ratio,
-        tier: sourceTurn.tier,
+        size: imageSize,
+        ratio: sizeMode.ratio,
+        tier: sizeMode.tier,
         quality: sourceTurn.quality,
         images: createLoadingImages(nextTurnId, count),
         createdAt: now,
@@ -1526,6 +1714,15 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     }
 
     const effectiveImageMode: ImageConversationMode = referenceImageFiles.length > 0 ? "edit" : "generate";
+    const sizeError = validateImageSize(imageWidth, imageHeight);
+    if (sizeError) {
+      toast.error(sizeError);
+      return;
+    }
+    const normalizedWidth = normalizeImageDimension(imageWidth, DEFAULT_IMAGE_PRESET.width);
+    const normalizedHeight = normalizeImageDimension(imageHeight, DEFAULT_IMAGE_PRESET.height);
+    const imageSize = `${normalizedWidth}x${normalizedHeight}`;
+    const sizeMode = resolveImageSizeMode(imageRatio, imageTier, imageSize);
 
     const targetConversation = selectedConversationId
       ? conversationsRef.current.find((conversation) => conversation.id === selectedConversationId) ?? null
@@ -1533,7 +1730,6 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     const now = new Date().toISOString();
     const conversationId = targetConversation?.id ?? createId();
     const turnId = createId();
-    const imageSize = `${imageWidth || 1024}x${imageHeight || 1024}`;
     const draftTurn: ImageTurn = {
       id: turnId,
       prompt,
@@ -1542,8 +1738,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       referenceImages: effectiveImageMode === "edit" ? referenceImages : [],
       count: parsedCount,
       size: imageSize,
-      ratio: imageRatio,
-      tier: imageTier,
+      ratio: sizeMode.ratio,
+      tier: sizeMode.tier,
       quality: imageQuality,
       images: createLoadingImages(turnId, parsedCount),
       createdAt: now,

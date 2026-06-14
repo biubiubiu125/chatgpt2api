@@ -37,6 +37,34 @@ MAX_IMAGE_SIDE = 3840
 IMAGE_SIZE_MULTIPLE = 16
 MIN_IMAGE_RATIO = 1 / 3
 MAX_IMAGE_RATIO = 3
+DEFAULT_IMAGE_ASPECT_RATIO = "1:1"
+DEFAULT_IMAGE_RESOLUTION_TIER = "2k"
+IMAGE_SIZE_PRESETS = {
+    ("1:1", "1k"): "1024x1024",
+    ("1:1", "2k"): "2048x2048",
+    ("1:1", "4k"): "2880x2880",
+    ("3:2", "1k"): "1536x1024",
+    ("3:2", "2k"): "2160x1440",
+    ("3:2", "4k"): "3456x2304",
+    ("2:3", "1k"): "1024x1536",
+    ("2:3", "2k"): "1440x2160",
+    ("2:3", "4k"): "2304x3456",
+    ("16:9", "1k"): "1280x720",
+    ("16:9", "2k"): "2560x1440",
+    ("16:9", "4k"): "3840x2160",
+    ("9:16", "1k"): "720x1280",
+    ("9:16", "2k"): "1440x2560",
+    ("9:16", "4k"): "2160x3840",
+    ("4:3", "1k"): "1024x768",
+    ("4:3", "2k"): "2048x1536",
+    ("4:3", "4k"): "3200x2400",
+    ("3:4", "1k"): "768x1024",
+    ("3:4", "2k"): "1536x2048",
+    ("3:4", "4k"): "2400x3200",
+    ("21:9", "1k"): "1280x544",
+    ("21:9", "2k"): "2560x1088",
+    ("21:9", "4k"): "3840x1600",
+}
 DATA_URL_IMAGE_RE = re.compile(r"^data:(?P<mime>[-+./\w]+);base64,(?P<data>.*)$", re.DOTALL)
 REMOTE_IMAGE_TIMEOUT_SECONDS = 20
 REMOTE_IMAGE_MAX_REDIRECTS = 5
@@ -628,13 +656,20 @@ def parse_image_count(raw_value: object) -> int:
     return value
 
 
-def parse_image_size(raw_value: object) -> str | None:
+def parse_image_size(raw_value: object, aspect_ratio: object = None) -> str | None:
     text = str(raw_value or "").strip().lower()
+    ratio_text = str(aspect_ratio or "").strip().lower() or DEFAULT_IMAGE_ASPECT_RATIO
     if not text or text == "auto":
-        return None
+        text = DEFAULT_IMAGE_RESOLUTION_TIER
+    if text in {"1k", "2k", "4k"}:
+        preset = IMAGE_SIZE_PRESETS.get((ratio_text, text))
+        if not preset:
+            supported_ratios = ", ".join(sorted({ratio for ratio, _ in IMAGE_SIZE_PRESETS}))
+            raise HTTPException(status_code=400, detail={"error": f"aspect_ratio must be one of: {supported_ratios}"})
+        return preset
     match = re.fullmatch(r"(\d{2,5})\s*[x×]\s*(\d{2,5})", text)
     if not match:
-        raise HTTPException(status_code=400, detail={"error": "size must be WIDTHxHEIGHT"})
+        raise HTTPException(status_code=400, detail={"error": "size must be WIDTHxHEIGHT, 1k, 2k, or 4k"})
     width, height = int(match.group(1)), int(match.group(2))
     if width <= 0 or height <= 0:
         raise HTTPException(status_code=400, detail={"error": "size width and height must be positive"})

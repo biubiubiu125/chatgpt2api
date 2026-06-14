@@ -167,7 +167,7 @@ def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, str | None, st
     prompt = extract_chat_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "prompt is required"})
-    size = parse_image_size(body.get("size"))
+    size = parse_image_size(body.get("size"), body.get("aspect_ratio"))
     quality = str(body.get("quality") or "auto")
     images = [
         (data, f"image_{idx}.png", mime)

@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { IMAGE_SIZE_PRESETS } from "@/app/image/image-size-presets";
 import type { ImageModel } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -63,26 +64,16 @@ const qualityOptions = [
   { value: "medium", label: "中" },
   { value: "high", label: "高" },
 ];
-const aspectOptions = [
-  { ratio: "1:1", tier: "1k", width: "1024", height: "1024", label: "1:1", icon: Square },
-  { ratio: "2:3", tier: "1k", width: "1024", height: "1536", label: "2:3", icon: RectangleVertical },
-  { ratio: "3:2", tier: "1k", width: "1536", height: "1024", label: "3:2", icon: RectangleHorizontal },
-  { ratio: "3:4", tier: "1k", width: "1024", height: "1360", label: "3:4", icon: RectangleVertical },
-  { ratio: "4:3", tier: "1k", width: "1360", height: "1024", label: "4:3", icon: RectangleHorizontal },
-  { ratio: "9:16", tier: "1k", width: "1088", height: "1920", label: "9:16", icon: RectangleVertical },
-  { ratio: "16:9", tier: "1k", width: "1920", height: "1088", label: "16:9", icon: RectangleHorizontal },
-  { ratio: "16:9", tier: "2k", width: "2048", height: "1152", label: "16:9(2k)", icon: RectangleHorizontal },
-  { ratio: "9:16", tier: "2k", width: "1152", height: "2048", label: "9:16(2k)", icon: RectangleVertical },
-  { ratio: "1:1", tier: "2k", width: "2048", height: "2048", label: "1:1(2k)", icon: Square },
-  { ratio: "16:9", tier: "2k", width: "2560", height: "1440", label: "16:9(2k)", icon: RectangleHorizontal },
-  { ratio: "9:16", tier: "2k", width: "1440", height: "2560", label: "9:16(2k)", icon: RectangleVertical },
-  { ratio: "1:1", tier: "4k", width: "2880", height: "2880", label: "1:1(max)", icon: Square },
-  { ratio: "16:9", tier: "4k", width: "3840", height: "2160", label: "16:9(4k)", icon: RectangleHorizontal },
-  { ratio: "9:16", tier: "4k", width: "2160", height: "3840", label: "9:16(4k)", icon: RectangleVertical },
-  { ratio: "3:1", tier: "4k", width: "3840", height: "1280", label: "3:1(4k)", icon: RectangleHorizontal },
-  { ratio: "1:3", tier: "4k", width: "1280", height: "3840", label: "1:3(4k)", icon: RectangleVertical },
-  { ratio: "auto", tier: "auto", width: "1024", height: "1024", label: "auto", icon: null },
-];
+const aspectOptions = IMAGE_SIZE_PRESETS.map((preset) => ({
+  ...preset,
+  label: `${preset.ratio}(${preset.tier.toUpperCase()})`,
+  icon:
+    preset.ratio === "1:1"
+      ? Square
+      : Number(preset.width) >= Number(preset.height)
+        ? RectangleHorizontal
+        : RectangleVertical,
+}));
 const MAX_IMAGE_COUNT = 50;
 const countOptions = Array.from({ length: MAX_IMAGE_COUNT }, (_, index) => String(index + 1));
 
@@ -130,9 +121,23 @@ export function ImageComposer({
     [imageModels],
   );
   const qualityLabel = qualityOptions.find((option) => option.value === imageQuality)?.label || "自动";
-  const ratioLabel = imageRatio === "auto" ? "auto" : `${imageRatio}(${imageTier})`;
-  const imageSizeLabel = `${qualityLabel} · ${ratioLabel} · ${imageCount || 1} 张`;
+  const ratioLabel =
+    imageRatio === "custom"
+      ? "自定义"
+      : `${imageRatio}(${String(imageTier).toUpperCase()})`;
+  const pixelSizeLabel = `${imageWidth || 1024}x${imageHeight || 1024}`;
+  const imageSizeLabel = `${qualityLabel} · ${ratioLabel} · ${pixelSizeLabel} · ${imageCount || 1} 张`;
   const selectedModelLabel = modelOptions.find((option) => option.value === imageModel)?.label || imageModel;
+  const updateCustomWidth = (value: string) => {
+    onImageRatioChange("custom");
+    onImageTierChange("custom");
+    onImageWidthChange(value);
+  };
+  const updateCustomHeight = (value: string) => {
+    onImageRatioChange("custom");
+    onImageTierChange("custom");
+    onImageHeightChange(value);
+  };
 
   useEffect(() => {
     if (!isSizeMenuOpen) {
@@ -431,7 +436,7 @@ export function ImageComposer({
                                 inputMode="numeric"
                                 min="1"
                                 value={imageWidth}
-                                onChange={(event) => onImageWidthChange(event.target.value)}
+                                onChange={(event) => updateCustomWidth(event.target.value)}
                                 className="h-7 border-0 bg-transparent px-0 text-sm font-medium text-stone-800 shadow-none focus-visible:ring-0"
                               />
                             </div>
@@ -443,7 +448,7 @@ export function ImageComposer({
                                 inputMode="numeric"
                                 min="1"
                                 value={imageHeight}
-                                onChange={(event) => onImageHeightChange(event.target.value)}
+                                onChange={(event) => updateCustomHeight(event.target.value)}
                                 className="h-7 border-0 bg-transparent px-0 text-sm font-medium text-stone-800 shadow-none focus-visible:ring-0"
                               />
                             </div>
@@ -459,7 +464,7 @@ export function ImageComposer({
                               const Icon = option.icon;
                               return (
                                 <button
-                                  key={`${option.ratio}-${option.tier}-${option.label}`}
+                                  key={`${option.ratio}-${option.tier}-${option.width}x${option.height}`}
                                   type="button"
                                   className={cn(
                                     "flex h-[64px] cursor-pointer flex-col items-center justify-center gap-1 rounded-2xl border border-stone-200 bg-white text-sm text-stone-800 transition hover:border-stone-300 hover:bg-stone-50",

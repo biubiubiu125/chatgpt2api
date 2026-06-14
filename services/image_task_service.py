@@ -189,10 +189,11 @@ class ImageTaskService:
         prompt: str,
         model: str,
         size: str | None,
+        aspect_ratio: str | None = None,
         quality: str = "auto",
         base_url: str = "",
     ) -> dict[str, Any]:
-        normalized_size = parse_image_size(size)
+        normalized_size = parse_image_size(size, aspect_ratio)
         payload = {
             "prompt": prompt,
             "model": model,
@@ -213,12 +214,13 @@ class ImageTaskService:
         prompt: str,
         model: str,
         size: str | None,
+        aspect_ratio: str | None = None,
         quality: str = "auto",
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
     ) -> dict[str, Any]:
-        normalized_size = parse_image_size(size)
+        normalized_size = parse_image_size(size, aspect_ratio)
         payload = {
             "prompt": prompt,
             "images": images or [],

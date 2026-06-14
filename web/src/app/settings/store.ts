@@ -125,7 +125,7 @@ function normalizeProxyRuntime(value: unknown): ProxyRuntimeSettings {
 function normalizeThirdPartyApps(value: unknown): ThirdPartyAppsSettings {
   const source = typeof value === "object" && value !== null ? value as Partial<ThirdPartyAppsSettings> : {};
   const canvas = typeof source.infinite_canvas === "object" && source.infinite_canvas
-    ? source.infinite_canvas
+    ? source.infinite_canvas as Partial<ThirdPartyAppsSettings["infinite_canvas"]>
     : {};
   return {
     infinite_canvas: {

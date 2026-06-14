@@ -17,7 +17,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     prompt = str(body.get("prompt") or "")
     model = str(body.get("model") or "gpt-image-2")
     n = parse_image_count(body.get("n"))
-    size = parse_image_size(body.get("size"))
+    size = parse_image_size(body.get("size"), body.get("aspect_ratio"))
     quality = str(body.get("quality") or "auto")
     response_format = str(body.get("response_format") or "b64_json")
     base_url = str(body.get("base_url") or "") or None

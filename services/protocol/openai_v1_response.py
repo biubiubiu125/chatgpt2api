@@ -88,8 +88,8 @@ def response_image_count(body: dict[str, Any], tool: dict[str, object]) -> int:
 
 def response_image_size(body: dict[str, Any], tool: dict[str, object]) -> str | None:
     if "size" in tool:
-        return parse_image_size(tool.get("size"))
-    return parse_image_size(body.get("size"))
+        return parse_image_size(tool.get("size"), tool.get("aspect_ratio") or body.get("aspect_ratio"))
+    return parse_image_size(body.get("size"), tool.get("aspect_ratio") or body.get("aspect_ratio"))
 
 
 def extract_response_image(input_value: object) -> tuple[bytes, str] | None:
