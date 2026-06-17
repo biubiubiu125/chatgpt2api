@@ -268,6 +268,12 @@ class ImageStorageService:
         safe_rel = _safe_relative_path(rel)
         return _is_image_rel(safe_rel) and _local_image_path(safe_rel).is_file()
 
+    def list_png_items_for_cleanup(self) -> list[dict[str, object]]:
+        items = self.list_items("")
+        png_items = [item for item in items if Path(str(item.get("path") or item.get("rel") or "")).suffix.lower() == ".png"]
+        png_items.sort(key=lambda item: str(item.get("created_at") or ""))
+        return png_items
+
     def list_items(self, base_url: str, start_date: str = "", end_date: str = "") -> list[dict[str, object]]:
         with self._index_lock:
             indexed = self._load_clean_index()

@@ -2,6 +2,7 @@
   "auth-key": "chatgpt2api",
   "refresh_account_interval_minute": 60,
   "image_retention_days": 15,
+  "image_max_storage_mb": 0,
   "image_poll_timeout_secs": 120,
   "auto_remove_rate_limited_accounts": false,
   "auto_remove_invalid_accounts": true,
@@ -81,7 +82,6 @@
     "webdav_root_path": "chatgpt2api/images",
     "public_base_url": ""
   },
-  "image_min_free_mb": 500,
   "chat_completion_cache": {
     "enabled": true,
     "ttl_seconds": 60,

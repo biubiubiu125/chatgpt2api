@@ -166,6 +166,7 @@ export type SettingsConfig = {
   };
   refresh_account_interval_minute?: number | string;
   image_retention_days?: number | string;
+  image_max_storage_mb?: number | string;
   image_poll_timeout_secs?: number | string;
   image_account_concurrency?: number | string;
   image_parallel_generation?: boolean;
@@ -723,9 +724,9 @@ export async function compressAllImages() {
   return httpRequest<{ compressed: number; saved_bytes: number; saved_mb: number }>("/api/images/storage/compress", { method: "POST" });
 }
 
-export async function deleteToTarget(targetFreeMb: number) {
+export async function deleteToStorageTarget(targetStorageMb: number) {
   return httpRequest<{ removed: number; freed_mb: number; done: boolean }>(
-    `/api/images/storage/cleanup-to-target?target_free_mb=${targetFreeMb}&dry_run=false`,
+    `/api/images/storage/cleanup-to-storage-target?target_storage_mb=${targetStorageMb}&dry_run=false`,
     { method: "POST" },
   );
 }

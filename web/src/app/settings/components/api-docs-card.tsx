@@ -102,7 +102,7 @@ const docs: ApiDoc[] = [
       ["prompt", "string", "图片生成提示词。"],
       ["model", "string", "可选，默认 gpt-image-2。"],
       ["n", "number", "可选，生成数量，当前限制 1-50。"],
-      ["size", "string", "可选，图片尺寸。"],
+      ["size", "string", "可选，支持 WIDTHxHEIGHT 精确尺寸，或 1k/2k/4k 档位；未传时默认按 2k 和当前比例处理。"],
       ["quality", "string", "可选，默认 auto。"],
       ["response_format", "string", "可选，默认 b64_json。"],
     ],
@@ -126,7 +126,7 @@ const docs: ApiDoc[] = [
       ["prompt", "string", "编辑提示词。"],
       ["model", "string", "可选，默认 gpt-image-2。"],
       ["n", "number", "可选，生成数量，当前限制 1-50。"],
-      ["size", "string", "可选，图片尺寸。"],
+      ["size", "string", "可选，支持 WIDTHxHEIGHT 精确尺寸，或 1k/2k/4k 档位；未传时默认按 2k 和当前比例处理。"],
       ["quality", "string", "可选，默认 auto。"],
     ],
     output: [

@@ -13,7 +13,7 @@ from services.config import config
 from services.image_service import (
     compress_images,
     delete_images,
-    delete_to_target,
+    delete_to_storage_target,
     download_images_zip,
     get_image_download_response,
     get_image_response,
@@ -284,14 +284,14 @@ def create_router(app_version: str) -> APIRouter:
         require_admin(authorization)
         return await run_in_threadpool(compress_images)
 
-    @router.post("/api/images/storage/cleanup-to-target")
-    async def cleanup_to_target(
-        target_free_mb: int = 500,
+    @router.post("/api/images/storage/cleanup-to-storage-target")
+    async def cleanup_to_storage_target_endpoint(
+        target_storage_mb: int = 10240,
         dry_run: bool = False,
         authorization: str | None = Header(default=None),
     ):
         require_admin(authorization)
-        return await run_in_threadpool(delete_to_target, target_free_mb, dry_run)
+        return await run_in_threadpool(delete_to_storage_target, target_storage_mb, dry_run)
 
     @router.get("/health", response_model=None)
     async def health_dashboard(format: str = Query(default="html")):

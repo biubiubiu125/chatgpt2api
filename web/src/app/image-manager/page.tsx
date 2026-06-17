@@ -13,7 +13,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { compressAllImages, deleteImageTag, deleteManagedImages, deleteToTarget, downloadImages, downloadSingleImage, fetchImageStorage, fetchImageTags, fetchManagedImages, setImageTags, type ImageStorageStats, type ManagedImage } from "@/lib/api";
+import { compressAllImages, deleteImageTag, deleteManagedImages, deleteToStorageTarget, downloadImages, downloadSingleImage, fetchImageStorage, fetchImageTags, fetchManagedImages, setImageTags, type ImageStorageStats, type ManagedImage } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 const LONG_PRESS_MS = 800;
@@ -72,7 +72,7 @@ function ImageManagerContent() {
   const [storage, setStorage] = useState<ImageStorageStats | null>(null);
   const [storageLoading, setStorageLoading] = useState(false);
   const [compressResult, setCompressResult] = useState<string>("");
-  const [targetFreeMb, setTargetFreeMb] = useState(500);
+  const [targetStorageMb, setTargetStorageMb] = useState(10240);
 
   const loadStorage = useCallback(async () => {
     try {
@@ -381,7 +381,7 @@ function ImageManagerContent() {
               </Button>
               <form onSubmit={async (e) => { e.preventDefault();
                 try {
-                  const r = await deleteToTarget(targetFreeMb);
+                  const r = await deleteToStorageTarget(targetStorageMb);
                   toast.success(`已删除 ${r.removed} 张图片，释放 ${r.freed_mb ?? 0}MB`);
                   void loadStorage();
                 } catch { toast.error("清理失败"); }
@@ -389,9 +389,9 @@ function ImageManagerContent() {
                 <Button size="sm" variant="outline" className="h-7 text-xs border-amber-200 text-amber-700" type="submit">
                   🧹 清理至
                 </Button>
-                <Input className="h-7 w-14 text-xs text-center px-1" type="number" min={50} value={targetFreeMb}
-                  onChange={(e) => setTargetFreeMb(Number(e.target.value) || 500)} />
-                <span className="text-xs text-stone-400">MB 剩余</span>
+                <Input className="h-7 w-16 text-xs text-center px-1" type="number" min={0} value={targetStorageMb}
+                  onChange={(e) => setTargetStorageMb(Number(e.target.value) || 0)} />
+                <span className="text-xs text-stone-400">MB 占用</span>
               </form>
               {compressResult ? <span className="text-xs text-green-600 ml-1">{compressResult}</span> : null}
             </div>

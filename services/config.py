@@ -393,6 +393,13 @@ class ConfigStore:
             return 30
 
     @property
+    def image_max_storage_mb(self) -> int:
+        try:
+            return max(0, int(self.data.get("image_max_storage_mb", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    @property
     def image_poll_timeout_secs(self) -> int:
         try:
             return max(1, int(self.data.get("image_poll_timeout_secs", 120)))
@@ -511,17 +518,9 @@ class ConfigStore:
 
     def cleanup_old_images(self) -> int:
         cutoff = time.time() - self.image_retention_days * 86400
-        removed = 0
-        for path in self.images_dir.rglob("*"):
-            if path.is_file() and path.stat().st_mtime < cutoff:
-                path.unlink()
-                removed += 1
-        for path in sorted((p for p in self.images_dir.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
-            try:
-                path.rmdir()
-            except OSError:
-                pass
-        return removed
+        from services.image_service import delete_images_by_retention
+
+        return delete_images_by_retention(cutoff)
 
     @property
     def base_url(self) -> str:
@@ -541,8 +540,10 @@ class ConfigStore:
 
     def get(self) -> dict[str, object]:
         data = dict(self.data)
+        data.pop("image_min_free_mb", None)
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
+        data["image_max_storage_mb"] = self.image_max_storage_mb
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
@@ -587,6 +588,13 @@ class ConfigStore:
     def update(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
+        next_data.pop("image_min_free_mb", None)
+        for key in ("image_retention_days", "image_max_storage_mb"):
+            if key in next_data:
+                try:
+                    next_data[key] = max(0 if key != "image_retention_days" else 1, int(next_data[key]))
+                except (TypeError, ValueError):
+                    next_data.pop(key, None)
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:

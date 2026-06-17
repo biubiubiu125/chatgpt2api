@@ -182,6 +182,7 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     ...config,
     refresh_account_interval_minute: Number(config.refresh_account_interval_minute || 5),
     image_retention_days: Number(config.image_retention_days || 30),
+    image_max_storage_mb: Number(config.image_max_storage_mb || 0),
     image_poll_timeout_secs: Number(config.image_poll_timeout_secs || 120),
     image_account_concurrency: Number(config.image_account_concurrency || 3),
     image_settle_enabled: Boolean(config.image_settle_enabled !== false),
@@ -306,6 +307,7 @@ type SettingsStore = {
   testBackup: () => Promise<void>;
   setRefreshAccountIntervalMinute: (value: string) => void;
   setImageRetentionDays: (value: string) => void;
+  setImageMaxStorageMb: (value: string) => void;
   setImagePollTimeoutSecs: (value: string) => void;
   setImageAccountConcurrency: (value: string) => void;
   setImageSettleEnabled: (value: boolean) => void;
@@ -456,6 +458,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         ...config,
         refresh_account_interval_minute: Math.max(1, Number(config.refresh_account_interval_minute) || 1),
         image_retention_days: Math.max(1, Number(config.image_retention_days) || 30),
+        image_max_storage_mb: Math.max(0, Number(config.image_max_storage_mb) || 0),
         image_poll_timeout_secs: Math.max(1, Number(config.image_poll_timeout_secs) || 120),
         image_account_concurrency: Math.max(1, Number(config.image_account_concurrency) || 3),
         image_settle_enabled: Boolean(config.image_settle_enabled !== false),
@@ -553,6 +556,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setImageRetentionDays: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_retention_days: value } } : {});
+  },
+
+  setImageMaxStorageMb: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_max_storage_mb: value } } : {});
   },
 
   setImagePollTimeoutSecs: (value) => {
