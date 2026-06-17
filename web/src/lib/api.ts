@@ -92,6 +92,7 @@ export type RefreshProgressResponse = {
   error: string | null;
   status_counts?: Record<string, number>;
   total_quota?: number;
+  removed_count?: number;
   result?: AccountRefreshResponse | null;
   results?: Array<{ token: string; status: string; error?: string | null }>;
 };

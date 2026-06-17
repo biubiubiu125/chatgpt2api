@@ -69,7 +69,7 @@ def _stored_image_size(item: dict[str, object]) -> int:
         return 0
 
 
-def _stored_image_timestamp(item: dict[str, object]) -> float:
+def _stored_image_timestamp(item: dict[str, object]) -> float | None:
     created_at = str(item.get("created_at") or "").strip()
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
         try:
@@ -93,7 +93,7 @@ def _stored_image_timestamp(item: dict[str, object]) -> float:
         path = (config.images_dir / rel).resolve()
         if path.is_file():
             return path.stat().st_mtime
-    return 0.0
+    return None
 
 
 def get_image_response(relative_path: str) -> FileResponse | Response:
@@ -211,7 +211,10 @@ def delete_images_by_retention(cutoff_timestamp: float, dry_run: bool = False) -
         if not rel:
             continue
         item_timestamp = _stored_image_timestamp(item)
-        if item_timestamp and item_timestamp >= cutoff_timestamp:
+        if item_timestamp is None:
+            logger.warning({"event": "image_retention_skip_unknown_time", "path": rel})
+            continue
+        if item_timestamp >= cutoff_timestamp:
             continue
         if not dry_run:
             _delete_image_entry(rel)
@@ -344,7 +347,10 @@ def compress_images(quality: int = 60) -> dict:
     return {"compressed": count, "saved_bytes": saved, "saved_mb": saved // (1024 * 1024)}
 
 
-def delete_to_storage_target(target_storage_mb: int, dry_run: bool = False) -> dict:
+def delete_to_storage_target(
+    target_storage_mb: int,
+    dry_run: bool = False,
+) -> dict:
     current = storage_stats()
     current_storage_bytes = int(current.get("image_size_bytes") or 0)
     target_storage_bytes = max(0, int(target_storage_mb)) * 1024 * 1024
@@ -376,15 +382,43 @@ def delete_to_storage_target(target_storage_mb: int, dry_run: bool = False) -> d
         _cleanup_empty_dirs(config.images_dir)
         _cleanup_empty_dirs(config.image_thumbnails_dir)
 
-    current_storage_mb = max(0, (current_storage_bytes - freed) // (1024 * 1024))
+    final_storage_bytes = max(0, current_storage_bytes - freed)
+    current_storage_mb = final_storage_bytes // (1024 * 1024)
     return {
         "removed": removed,
         "freed_mb": freed // (1024 * 1024),
         "current_storage_mb": current_storage_mb,
+        "current_storage_bytes": final_storage_bytes,
         "target_storage_mb": target_storage_mb,
-        "done": current_storage_mb <= target_storage_mb,
+        "target_storage_bytes": target_storage_bytes,
+        "done": final_storage_bytes <= target_storage_bytes,
         "dry_run": dry_run,
     }
+
+
+def cleanup_images_by_storage_limit() -> dict | None:
+    max_storage_mb = config.image_max_storage_mb
+    if max_storage_mb <= 0:
+        return None
+
+    stats = storage_stats()
+    current_storage_bytes = int(stats.get("image_size_bytes") or 0)
+    target_storage_bytes = max_storage_mb * 1024 * 1024
+    if current_storage_bytes <= target_storage_bytes:
+        return None
+
+    logger.info(
+        {
+            "event": "image_auto_cleanup",
+            "mode": "image_storage_limit",
+            "current_storage_bytes": current_storage_bytes,
+            "target_storage_mb": max_storage_mb,
+            "target_storage_bytes": target_storage_bytes,
+        }
+    )
+    result = delete_to_storage_target(max_storage_mb)
+    logger.info({"event": "image_auto_cleanup_done", "mode": "image_storage_limit", **result})
+    return result
 
 
 def _auto_cleanup_worker(stop_event: threading.Event) -> None:
@@ -398,24 +432,10 @@ def _auto_cleanup_worker(stop_event: threading.Event) -> None:
                         "event": "image_retention_cleanup_done",
                         "removed": removed_by_days,
                         "retention_days": config.image_retention_days,
-                    }
-                )
-
-            max_storage_mb = config.image_max_storage_mb
-            if max_storage_mb > 0:
-                stats = storage_stats()
-                current_storage_mb = int(stats.get("image_size_mb") or 0)
-                if current_storage_mb > max_storage_mb:
-                    logger.info(
-                        {
-                            "event": "image_auto_cleanup",
-                            "mode": "image_storage_limit",
-                            "current_storage_mb": current_storage_mb,
-                            "target_storage_mb": max_storage_mb,
                         }
                     )
-                    result = delete_to_storage_target(max_storage_mb)
-                    logger.info({"event": "image_auto_cleanup_done", "mode": "image_storage_limit", **result})
+
+            cleanup_images_by_storage_limit()
         except Exception:
             pass
 

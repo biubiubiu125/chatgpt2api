@@ -4,7 +4,7 @@
   "image_retention_days": 15,
   "image_max_storage_mb": 0,
   "image_poll_timeout_secs": 120,
-  "auto_remove_rate_limited_accounts": false,
+  "auto_remove_rate_limited_accounts": true,
   "auto_remove_invalid_accounts": true,
   "log_levels": [
     "debug",

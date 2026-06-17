@@ -15,6 +15,7 @@ from fastapi import HTTPException
 from PIL import Image
 
 from services.config import DATA_DIR, config
+from utils.log import logger
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
 IMAGE_INDEX_LOCK = Lock()
@@ -241,6 +242,12 @@ class ImageStorageService:
             items = self._load_clean_index()
             items[rel] = item
             self._save_index(items)
+        try:
+            from services.image_service import cleanup_images_by_storage_limit
+
+            cleanup_images_by_storage_limit()
+        except Exception as exc:
+            logger.warning({"event": "image_storage_limit_cleanup_failed", "error": str(exc)[:200]})
         return StoredImage(rel=rel, url=self._public_url(rel, base_url), storage=str(item["storage"]), size=len(image_data))
 
     def get_bytes(self, rel: str) -> bytes:

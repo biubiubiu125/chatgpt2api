@@ -222,6 +222,12 @@ class AccountService:
         normalized["status"] = normalized.get("status") or "正常"
         normalized["quota"] = max(0, int(normalized.get("quota") if normalized.get("quota") is not None else 0))
         normalized["image_quota_unknown"] = bool(normalized.get("image_quota_unknown"))
+        if (
+            normalized["status"] == "正常"
+            and not normalized["image_quota_unknown"]
+            and normalized["quota"] == 0
+        ):
+            normalized["status"] = "限流"
         normalized["email"] = normalized.get("email") or None
         normalized["user_id"] = normalized.get("user_id") or None
         normalized["proxy"] = str(normalized.get("proxy") or "").strip()
@@ -1332,6 +1338,42 @@ class AccountService:
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
 
+    @staticmethod
+    def _is_rate_limited_account(account: dict) -> bool:
+        if account.get("status") == "限流":
+            return True
+        if bool(account.get("image_quota_unknown")):
+            return False
+        try:
+            quota = int(account.get("quota") or 0)
+        except (TypeError, ValueError):
+            quota = 0
+        return quota == 0
+
+    def _auto_remove_account_if_needed_locked(self, access_token: str, before: dict, after: dict) -> bool:
+        if not config.auto_remove_rate_limited_accounts or not self._is_rate_limited_account(after):
+            return False
+
+        event_type = "account_auto_removed_rate_limited"
+        summary = "自动移除限流账号"
+        self._accounts.pop(access_token, None)
+        self._image_inflight.pop(access_token, None)
+        self._token_aliases = {
+            old: new
+            for old, new in self._token_aliases.items()
+            if old != access_token and new != access_token
+        }
+        if self._accounts:
+            self._index %= len(self._accounts)
+        else:
+            self._index = 0
+        self._save_accounts()
+        self._add_account_log(
+            summary,
+            self._account_log_detail(event_type, access_token, before=before, after=after),
+        )
+        return True
+
     def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
         if not access_token:
             return None
@@ -1343,18 +1385,7 @@ class AccountService:
             account = self._normalize_account({**current, **updates, "access_token": access_token})
             if account is None:
                 return None
-            if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
-                self._accounts.pop(access_token, None)
-                self._save_accounts()
-                self._add_account_log(
-                    "自动移除限流账号",
-                    self._account_log_detail(
-                        "account_auto_removed_rate_limited",
-                        access_token,
-                        before=current,
-                        after=account,
-                    ),
-                )
+            if self._auto_remove_account_if_needed_locked(access_token, current, account):
                 return None
             self._accounts[access_token] = account
             self._save_accounts()
@@ -1465,18 +1496,7 @@ class AccountService:
             account = self._normalize_account(next_item)
             if account is None:
                 return None
-            if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
-                self._accounts.pop(access_token, None)
-                self._save_accounts()
-                self._add_account_log(
-                    "自动移除限流账号",
-                    self._account_log_detail(
-                        "account_auto_removed_rate_limited",
-                        access_token,
-                        before=current,
-                        after=account,
-                    ),
-                )
+            if self._auto_remove_account_if_needed_locked(access_token, current, account):
                 return None
             self._accounts[access_token] = account
             self._save_accounts()
@@ -1542,15 +1562,22 @@ class AccountService:
                 "processed": 0,
                 "done": False,
                 "error": None,
-                "status_counts": {"正常": 0, "限流": 0, "异常": 0, "禁用": 0},
+                "status_counts": {"正常": 0, "限流": 0, "异常": 0, "禁用": 0, "已删除": 0},
                 "total_quota": 0,
+                "removed_count": 0,
             }
 
     def update_refresh_progress(self, progress_id: str, token: str) -> None:
         """刷新单个账号后，更新进度计数。"""
         account = self.get_account(token)
-        status = str(account.get("status") or "正常").strip() if account else "正常"
-        quota = max(0, int(account.get("quota") or 0)) if account else 0
+        removed = False
+        if account:
+            status = str(account.get("status") or "正常").strip()
+            quota = max(0, int(account.get("quota") or 0))
+        else:
+            status = "已删除"
+            quota = 0
+            removed = True
 
         with self._refresh_progress_lock:
             progress = self._refresh_progress.get(progress_id)
@@ -1559,6 +1586,8 @@ class AccountService:
             progress["processed"] += 1
             progress["status_counts"][status] = progress["status_counts"].get(status, 0) + 1
             progress["total_quota"] += quota
+            if removed:
+                progress["removed_count"] = int(progress.get("removed_count") or 0) + 1
 
     def finish_refresh_progress(self, progress_id: str, result: dict | None = None, error: str | None = None) -> None:
         """标记刷新完成。"""

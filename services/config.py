@@ -470,7 +470,7 @@ class ConfigStore:
 
     @property
     def auto_remove_rate_limited_accounts(self) -> bool:
-        value = self.data.get("auto_remove_rate_limited_accounts", False)
+        value = self.data.get("auto_remove_rate_limited_accounts", True)
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
@@ -541,6 +541,7 @@ class ConfigStore:
     def get(self) -> dict[str, object]:
         data = dict(self.data)
         data.pop("image_min_free_mb", None)
+        data.pop("auto_remove_zero_quota_accounts", None)
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
         data["image_max_storage_mb"] = self.image_max_storage_mb
@@ -589,6 +590,7 @@ class ConfigStore:
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
         next_data.pop("image_min_free_mb", None)
+        next_data.pop("auto_remove_zero_quota_accounts", None)
         for key in ("image_retention_days", "image_max_storage_mb"):
             if key in next_data:
                 try:

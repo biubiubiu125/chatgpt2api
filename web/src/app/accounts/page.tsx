@@ -435,6 +435,7 @@ function AccountsPageContent() {
                 current: p.processed,
               }));
               // 实时更新统计卡片：基数 + 已刷新的累加结果
+              const runningRemoved = p.removed_count ?? p.status_counts?.["已删除"] ?? 0;
               const runningActive = baseActive + ((p.status_counts?.["正常"]) ?? 0);
               const runningLimited = baseLimited + ((p.status_counts?.["限流"]) ?? 0);
               const runningAbnormal = baseAbnormal + ((p.status_counts?.["异常"]) ?? 0);
@@ -448,7 +449,7 @@ function AccountsPageContent() {
                 runningQuota = formatCompact(baseQuotaNum + (p.total_quota ?? 0));
               }
               setRefreshSummary({
-                total: accounts.length,
+                total: Math.max(0, accounts.length - runningRemoved),
                 active: runningActive,
                 limited: runningLimited,
                 abnormal: runningAbnormal,
