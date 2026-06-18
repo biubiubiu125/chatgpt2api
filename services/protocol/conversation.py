@@ -338,8 +338,13 @@ def format_image_result(
             }
         if image_size:
             result_item["width"], result_item["height"] = image_size
+            result_item["size"] = f"{image_size[0]}x{image_size[1]}"
         data.append(result_item)
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
+    if data:
+        for key in ("size", "width", "height"):
+            if data[0].get(key):
+                result[key] = data[0][key]
     if message and not data:
         result["message"] = message
     return result
@@ -413,6 +418,10 @@ class ImageOutput:
                 "object": "image.generation.result",
                 "data": self.data,
             })
+            if self.data:
+                for key in ("size", "width", "height"):
+                    if self.data[0].get(key):
+                        chunk[key] = self.data[0][key]
             chunk.pop("progress_text", None)
             chunk.pop("upstream_event_type", None)
         return chunk
@@ -1818,6 +1827,10 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
             data.extend(output.data)
 
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
+    if data:
+        for key in ("size", "width", "height"):
+            if data[0].get(key):
+                result[key] = data[0][key]
     if not data:
         text = message or "".join(progress_parts).strip()
         if text:

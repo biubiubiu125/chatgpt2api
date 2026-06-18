@@ -277,7 +277,10 @@ export type SystemLog = {
 
 export type ImageResponse = {
   created: number;
-  data: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
+  size?: string;
+  width?: number;
+  height?: number;
+  data: Array<{ b64_json?: string; url?: string; revised_prompt?: string; width?: number; height?: number; size?: string }>;
 };
 
 export type ImageTask = {
@@ -291,7 +294,7 @@ export type ImageTask = {
   created_at: string;
   updated_at: string;
   conversation_id?: string;
-  data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
+  data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string; width?: number; height?: number; size?: string }>;
   error?: string;
   progress?: string;
   elapsed_secs?: number;

@@ -60,6 +60,15 @@ function turnAspectStyle(size: string): CSSProperties | undefined {
   return { aspectRatio: `${width} / ${height}` };
 }
 
+function storedImageDimensions(image: StoredImage) {
+  if (typeof image.size === "string" && /^\d+x\d+$/i.test(image.size.trim())) {
+    return image.size.trim().toLowerCase().replace("x", " x ");
+  }
+  return typeof image.width === "number" && typeof image.height === "number" && image.width > 0 && image.height > 0
+    ? formatImageDimensions(image.width, image.height)
+    : undefined;
+}
+
 async function downloadStoredImage(image: StoredImage, index: number) {
   let blob: Blob | null = null;
   try {
@@ -167,13 +176,14 @@ export function ImageResults({
         }));
         const successfulTurnImages = turn.images.flatMap((image) => {
           const src = image.status === "success" ? getStoredImageSrc(image) : "";
+          const dimensions = imageDimensionsRef.current[image.id] || storedImageDimensions(image);
           return src
             ? [
                 {
                   id: image.id,
                   src,
                   sizeLabel: image.b64_json ? formatBase64ImageSize(image.b64_json) : undefined,
-                  dimensions: imageDimensionsRef.current[image.id],
+                  dimensions,
                 },
               ]
             : [];
@@ -264,7 +274,7 @@ export function ImageResults({
                       if (image.status === "success" && imageSrc) {
                         const currentIndex = successfulTurnImages.findIndex((item) => item.id === image.id);
                         const sizeLabel = image.b64_json ? formatBase64ImageSize(image.b64_json) : "";
-                        const dimensions = imageDimensionsRef.current[image.id];
+                        const dimensions = imageDimensionsRef.current[image.id] || storedImageDimensions(image);
                         const imageMeta = [sizeLabel, dimensions].filter(Boolean).join(" · ");
 
                         return (

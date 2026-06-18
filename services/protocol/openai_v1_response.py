@@ -245,13 +245,23 @@ def image_output_items(prompt: str, data: list[dict[str, Any]], item_id: str | N
     for item in data:
         b64_json = str(item.get("b64_json") or "").strip()
         if b64_json:
-            output.append({
+            output_item = {
                 "id": item_id or f"ig_{len(output) + 1}",
                 "type": "image_generation_call",
                 "status": "completed",
                 "result": b64_json,
                 "revised_prompt": str(item.get("revised_prompt") or prompt).strip() or prompt,
-            })
+            }
+            size = str(item.get("size") or "").strip()
+            if size:
+                output_item["size"] = size
+            width = item.get("width")
+            height = item.get("height")
+            if isinstance(width, int) and width > 0:
+                output_item["width"] = width
+            if isinstance(height, int) and height > 0:
+                output_item["height"] = height
+            output.append(output_item)
     return output
 
 

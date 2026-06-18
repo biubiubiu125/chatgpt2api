@@ -72,6 +72,39 @@ def _attach_account_context(target: dict[str, Any], account_emails: list[str]) -
     target["_account_emails"] = list(account_emails)
 
 
+def _image_result_metadata(data: object) -> list[dict[str, Any]]:
+    if not isinstance(data, list):
+        return []
+    images: list[dict[str, Any]] = []
+    for index, item in enumerate(data, start=1):
+        if not isinstance(item, dict):
+            continue
+        image: dict[str, Any] = {"index": index}
+        for key in ("url", "revised_prompt", "size"):
+            value = item.get(key)
+            if isinstance(value, str) and value:
+                image[key] = value
+        width = item.get("width")
+        height = item.get("height")
+        if isinstance(width, int) and width > 0:
+            image["width"] = width
+        if isinstance(height, int) and height > 0:
+            image["height"] = height
+        if len(image) > 1:
+            images.append(image)
+    return images
+
+
+def _attach_image_metadata(target: dict[str, Any], images: list[dict[str, Any]]) -> None:
+    if not images:
+        return
+    target["images"] = images
+    target["data"] = images
+    first_size = images[0].get("size")
+    if isinstance(first_size, str) and first_size:
+        target["size"] = first_size
+
+
 def completion_chunk(model: str, delta: dict[str, Any], finish_reason: str | None = None, completion_id: str = "", created: int | None = None) -> dict[str, Any]:
     return {
         "id": completion_id or f"chatcmpl-{uuid.uuid4().hex}",
@@ -244,6 +277,15 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         images=encode_images(images) or None,
     )))
     response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
+    image_metadata = _image_result_metadata(result.get("data"))
+    if image_metadata:
+        message = ((response.get("choices") or [{}])[0].get("message") or {})
+        if isinstance(message, dict):
+            message["images"] = image_metadata
+            first_size = image_metadata[0].get("size")
+            if isinstance(first_size, str) and first_size:
+                message["size"] = first_size
+        _attach_image_metadata(response, image_metadata)
     usage = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
         input_image_tokens=count_image_inputs_tokens(images, model),
@@ -277,20 +319,28 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
     for output in image_outputs:
         _append_account_email(account_emails, output.account_email)
         content = ""
+        image_metadata: list[dict[str, Any]] = []
         if output.kind == "progress":
             content = output.text
             sent_text += content
         elif output.kind == "result":
             content = build_chat_image_markdown_content({"data": output.data})
+            image_metadata = _image_result_metadata(output.data)
         elif output.kind == "message":
             content = output.text[len(sent_text):] if output.text.startswith(sent_text) else output.text
+            image_metadata = []
         if not content:
             continue
         if not sent_role:
             sent_role = True
-            chunk = completion_chunk(model, {"role": "assistant", "content": content}, None, completion_id, created)
+            delta: dict[str, Any] = {"role": "assistant", "content": content}
         else:
-            chunk = completion_chunk(model, {"content": content}, None, completion_id, created)
+            delta = {"content": content}
+        if image_metadata:
+            _attach_image_metadata(delta, image_metadata)
+        chunk = completion_chunk(model, delta, None, completion_id, created)
+        if image_metadata:
+            _attach_image_metadata(chunk, image_metadata)
         _attach_account_context(chunk, account_emails)
         yield chunk
     if not sent_role:

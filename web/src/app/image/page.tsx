@@ -357,6 +357,9 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
       b64_json: first.b64_json,
       url: first.url,
       revised_prompt: first.revised_prompt,
+      size: first.size,
+      width: first.width,
+      height: first.height,
       error: undefined,
       durationMs: task.duration_ms,
     };

@@ -21,6 +21,9 @@ export type StoredImage = {
   b64_json?: string;
   url?: string;
   revised_prompt?: string;
+  size?: string;
+  width?: number;
+  height?: number;
   error?: string;
   startTime?: number;
   elapsedSecs?: number;
@@ -77,6 +80,9 @@ function normalizeStoredImage(image: StoredImage): StoredImage {
     taskStatus: image.taskStatus === "queued" || image.taskStatus === "running" ? image.taskStatus : undefined,
     url: typeof image.url === "string" && image.url ? image.url : undefined,
     revised_prompt: typeof image.revised_prompt === "string" ? image.revised_prompt : undefined,
+    size: typeof image.size === "string" && image.size ? image.size : undefined,
+    width: typeof image.width === "number" && Number.isFinite(image.width) && image.width > 0 ? image.width : undefined,
+    height: typeof image.height === "number" && Number.isFinite(image.height) && image.height > 0 ? image.height : undefined,
     startTime: typeof image.startTime === "number" ? image.startTime : undefined,
     elapsedSecs: typeof image.elapsedSecs === "number" ? image.elapsedSecs : undefined,
     elapsedUpdatedAt: typeof image.elapsedUpdatedAt === "number" ? image.elapsedUpdatedAt : undefined,
