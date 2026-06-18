@@ -1328,7 +1328,9 @@ def stream_codex_image_outputs(
         raise ImageGenerationError("No image result found in response")
     image_items = []
     for item in images:
-        image_data = ensure_image_canvas_size(base64.b64decode(item), request.size)
+        # Codex image generation supports native size parameters. Keep the upstream
+        # image bytes unchanged so 2K/4K results reflect the real upstream output.
+        image_data = base64.b64decode(item)
         image_items.append({
             "b64_json": base64.b64encode(image_data).decode("ascii"),
             "revised_prompt": request.prompt,

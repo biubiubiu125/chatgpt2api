@@ -13,7 +13,7 @@ from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 from services.account_service import account_service
-from utils.helper import parse_image_size
+from utils.helper import is_codex_image_model, parse_image_size
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -616,6 +616,9 @@ class ImageTaskService:
                 raise ValueError("task not found")
             if task.get("status") != TASK_STATUS_ERROR:
                 raise ValueError("task is not in error state")
+            model = task.get("model", "gpt-image-2")
+            if is_codex_image_model(model):
+                raise ValueError("codex image tasks do not support resume poll")
             error_msg = _clean(task.get("error"))
             if "超时" not in error_msg:
                 raise ValueError("task error is not a timeout error")
@@ -625,7 +628,6 @@ class ImageTaskService:
             account_id = _clean(task.get("account_id"))
             account_email = _clean(task.get("account_email"))
             mode = task.get("mode", "generate")
-            model = task.get("model", "gpt-image-2")
 
         access_token = _resolve_account_token(account_id, account_email)
         if not access_token:
