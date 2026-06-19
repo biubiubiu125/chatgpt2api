@@ -267,6 +267,10 @@ def build_image_prompt(prompt: str, size: str | None, quality: str = "auto") -> 
         )
     if quality:
         hints.append(f"Use image quality: {quality}. ")
+    hints.append(
+        "Render the image with high clarity, rich fine detail, sharp edges, clean textures, "
+        "and no low-resolution, blurry, compressed, pixelated, or artifact-heavy appearance. "
+    )
     return f"{prompt.strip()}\n\n{''.join(hints)}" if hints else prompt
 
 
