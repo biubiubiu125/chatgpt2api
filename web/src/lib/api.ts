@@ -345,11 +345,12 @@ export type RegisterConfig = {
     providers: Array<Record<string, unknown>>;
   };
   proxy: string;
-  proxy_input_mode?: "single" | "proxy_checker_dir";
+  proxy_input_mode?: "auto" | "single" | "proxy_checker_dir";
   proxy_checker_dir?: string;
   proxy_checker_pattern?: string;
   proxy_refresh_interval?: number;
   proxy_bind_proxy_checker?: boolean;
+  proxy_selection_strategy?: "round_robin" | "random";
   task_timeout_seconds?: number;
   task_stall_timeout_seconds?: number;
   total: number;
@@ -392,6 +393,13 @@ export type RegisterConfig = {
       usage_label?: string;
       using_cached?: boolean;
       wait_retriable?: boolean;
+      selection_strategy?: "round_robin" | "random" | string;
+      single_available?: boolean;
+      proxy_checker_cached?: boolean;
+      source_counts?: {
+        single?: number;
+        proxy_checker_dir?: number;
+      };
     };
     workers?: Array<Record<string, unknown>>;
   };

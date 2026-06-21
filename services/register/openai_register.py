@@ -36,11 +36,11 @@ config = {
         "providers": [],
     },
     "proxy": "",
-    "proxy_input_mode": "single",
-    "proxy_checker_dir": "/opt/proxy-checker/repo_data",
+    "proxy_checker_dir": "",
     "proxy_checker_pattern": "user_*.txt",
     "proxy_refresh_interval": 120,
     "proxy_bind_proxy_checker": True,
+    "proxy_selection_strategy": "round_robin",
     "task_timeout_seconds": 300,
     "task_stall_timeout_seconds": 60,
     "total": 10,
@@ -377,7 +377,7 @@ def _mail_config(register_proxy: str = "", deadline: float | None = None) -> dic
     mail = dict(config.get("mail") if isinstance(config.get("mail"), dict) else {})
     mail.pop("proxy", None)
     if mail.get("api_use_register_proxy", True):
-        proxy = str(register_proxy or config.get("proxy") or "").strip()
+        proxy = str(register_proxy or "").strip()
         if proxy:
             mail["proxy"] = proxy
     if deadline is not None:
@@ -1284,12 +1284,18 @@ def _wait_for_register_proxy(
         if now >= next_log_at:
             step(index, f"注册代理暂不可用：{selection.last_error}，等待代理来源恢复", "yellow")
             next_log_at = now + 10
-        _check_task_control(stop_event, deadline)
+        try:
+            _check_task_control(stop_event, deadline)
+        except RegisterTaskTimeout as exc:
+            raise RuntimeError(f"register_proxy_unavailable: {selection.last_error or '没有可用注册代理'}") from exc
         if stop_event is not None and stop_event.wait(1):
             raise RegisterStopped("register_task_stopped")
         if stop_event is None:
             time.sleep(1)
-        _check_task_control(stop_event, deadline)
+        try:
+            _check_task_control(stop_event, deadline)
+        except RegisterTaskTimeout as exc:
+            raise RuntimeError(f"register_proxy_unavailable: {selection.last_error or '没有可用注册代理'}") from exc
         selection = register_proxy_pool.next_proxy()
     return selection
 
@@ -1322,7 +1328,8 @@ def worker(
             proxy_count=selection.count,
             bind_account_proxy=selection.bind_to_account,
             selected_proxy_file=selection.selected_file,
-            last_error=selection.last_error,
+            last_error="",
+            failure_reason="",
         )
         step(index, f"注册代理来源={selection.source_label}，可用数量={selection.count}")
         if selection.last_error and not selection.proxy and selection.source != "direct":
@@ -1379,7 +1386,7 @@ def worker(
             stats["done"] += 1
             stats["success"] += 1
             avg = (time.time() - stats["start_time"]) / stats["success"] if stats.get("success") else 0
-        _set_worker_state(index, status="success", elapsed_seconds=round(cost, 1), email=result.get("email"))
+        _set_worker_state(index, status="success", elapsed_seconds=round(cost, 1), email=result.get("email"), last_error="", failure_reason="")
         log(f'{result["email"]} 注册成功，耗时 {cost:.1f}s，平均 {avg:.1f}s', "green")
         return {"ok": True, "index": index, "result": result}
     except RegisterStopped as e:

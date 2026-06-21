@@ -19,6 +19,7 @@ class RegisterConfigRequest(BaseModel):
     proxy_checker_pattern: str | None = None
     proxy_refresh_interval: int | None = None
     proxy_bind_proxy_checker: bool | None = None
+    proxy_selection_strategy: str | None = None
     task_timeout_seconds: int | None = None
     task_stall_timeout_seconds: int | None = None
     total: int | None = None

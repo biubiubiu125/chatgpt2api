@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import glob
 import json
+import random
 import re
 import threading
 import time
@@ -12,17 +13,19 @@ from typing import Any
 from services.proxy_service import normalize_proxy_url
 
 
-PROXY_INPUT_MODES = {"single", "proxy_checker_dir"}
-DEFAULT_PROXY_CHECKER_DIR = "/opt/proxy-checker/repo_data"
+PROXY_INPUT_MODES = {"auto", "single", "proxy_checker_dir"}
+PROXY_SELECTION_STRATEGIES = {"round_robin", "random"}
+DEFAULT_PROXY_CHECKER_DIR = ""
 DEFAULT_PROXY_CHECKER_PATTERN = "user_*.txt"
 DEFAULT_PROXY_REFRESH_INTERVAL = 120
+DEFAULT_PROXY_SELECTION_STRATEGY = "round_robin"
 
 
 @dataclass
 class RegisterProxySelection:
     proxy: str = ""
-    source: str = "direct"
-    source_label: str = "direct"
+    source: str = "auto"
+    source_label: str = "自动代理"
     count: int = 0
     proxy_index: int = -1
     bind_to_account: bool = False
@@ -31,9 +34,18 @@ class RegisterProxySelection:
     wait_retriable: bool = False
 
 
+@dataclass(frozen=True)
+class _ProxyEntry:
+    proxy: str
+    source: str
+    source_label: str
+    selected_file: str = ""
+    bind_to_account: bool = False
+
+
 def normalize_proxy_input_mode(value: object) -> str:
-    mode = str(value or "single").strip().lower()
-    return mode if mode in PROXY_INPUT_MODES else "single"
+    mode = str(value or "auto").strip().lower()
+    return mode if mode in PROXY_INPUT_MODES else "auto"
 
 
 def parse_proxy_lines(text: str) -> list[str]:
@@ -79,12 +91,12 @@ class RegisterProxyPool:
     def __init__(self, state_file: Path | None = None) -> None:
         self._state_file = state_file
         self._lock = threading.RLock()
-        self._mode = "single"
         self._single_proxy = ""
-        self._proxy_checker_dir = DEFAULT_PROXY_CHECKER_DIR
+        self._proxy_checker_dir = ""
         self._proxy_checker_pattern = DEFAULT_PROXY_CHECKER_PATTERN
         self._refresh_interval = DEFAULT_PROXY_REFRESH_INTERVAL
         self._bind_proxy_checker = True
+        self._selection_strategy = DEFAULT_PROXY_SELECTION_STRATEGY
         self._proxies: list[str] = []
         self._proxy_index = 0
         self._last_fetch = 0.0
@@ -94,22 +106,31 @@ class RegisterProxyPool:
 
     def configure(self, cfg: dict[str, Any]) -> None:
         with self._lock:
-            next_mode = normalize_proxy_input_mode(cfg.get("proxy_input_mode"))
             next_single_proxy = normalize_proxy_url(str(cfg.get("proxy") or ""))
-            next_proxy_checker_dir = str(cfg.get("proxy_checker_dir") or DEFAULT_PROXY_CHECKER_DIR).strip()
+            next_proxy_checker_dir = str(cfg.get("proxy_checker_dir") or "").strip()
             next_proxy_checker_pattern = str(cfg.get("proxy_checker_pattern") or DEFAULT_PROXY_CHECKER_PATTERN).strip()
-            current_source_key = self._source_key(self._mode, self._single_proxy, self._proxy_checker_dir, self._proxy_checker_pattern)
-            next_source_key = self._source_key(next_mode, next_single_proxy, next_proxy_checker_dir, next_proxy_checker_pattern)
+            next_selection_strategy = self._normalize_selection_strategy(cfg.get("proxy_selection_strategy"))
+            current_source_key = self._source_key(self._single_proxy, self._proxy_checker_dir, self._proxy_checker_pattern)
+            next_source_key = self._source_key(next_single_proxy, next_proxy_checker_dir, next_proxy_checker_pattern)
             source_changed = next_source_key != current_source_key
-            self._mode = next_mode
+            strategy_changed = next_selection_strategy != self._selection_strategy
+            checker_changed = (
+                next_proxy_checker_dir,
+                next_proxy_checker_pattern,
+            ) != (
+                self._proxy_checker_dir,
+                self._proxy_checker_pattern,
+            )
             self._single_proxy = next_single_proxy
             self._proxy_checker_dir = next_proxy_checker_dir
             self._proxy_checker_pattern = next_proxy_checker_pattern
             self._refresh_interval = self._positive_int(cfg.get("proxy_refresh_interval"), DEFAULT_PROXY_REFRESH_INTERVAL)
             self._bind_proxy_checker = bool(cfg.get("proxy_bind_proxy_checker", True))
-            if source_changed:
-                self._proxies = []
+            self._selection_strategy = next_selection_strategy
+            if source_changed or strategy_changed:
                 self._proxy_index = 0
+            if checker_changed or (not next_proxy_checker_dir and self._proxies):
+                self._proxies = []
                 self._selected_file = ""
                 self._save_state_locked()
             self._last_fetch = 0.0
@@ -121,42 +142,37 @@ class RegisterProxyPool:
 
     def next_proxy(self) -> RegisterProxySelection:
         with self._lock:
-            self._refresh_locked(force=self._mode == "proxy_checker_dir" and not self._proxies)
-            if self._mode == "single":
-                if not self._single_proxy:
-                    return RegisterProxySelection(source="direct", source_label="直连", count=0)
+            self._refresh_locked(force=False)
+            entries = self._build_entries_locked()
+            if not entries:
+                self._refresh_locked(force=True)
+                entries = self._build_entries_locked()
+            if not entries:
                 return RegisterProxySelection(
-                    proxy=self._single_proxy,
-                    source="single",
-                    source_label=self._source_label(),
-                    count=1,
-                    proxy_index=0,
-                    bind_to_account=False,
-                    last_error=self._last_error,
-                )
-
-            if not self._proxies:
-                return RegisterProxySelection(
-                    source=self._mode,
-                    source_label=self._source_label(),
+                    source=self._configured_source_locked(),
+                    source_label=self._configured_source_label_locked(),
                     count=0,
                     selected_file=self._selected_file,
                     last_error=self._last_error or "没有可用注册代理",
-                    wait_retriable=self._mode == "proxy_checker_dir",
+                    wait_retriable=True,
                 )
 
-            index = self._proxy_index % len(self._proxies)
-            proxy = self._proxies[index]
-            self._proxy_index = (index + 1) % len(self._proxies)
+            if self._selection_strategy == "random":
+                index = random.randrange(len(entries))
+            else:
+                index = self._proxy_index % len(entries)
+                self._proxy_index = (index + 1) % len(entries)
+            entry = entries[index]
             return RegisterProxySelection(
-                proxy=proxy,
-                source=self._mode,
-                source_label=self._source_label(),
-                count=len(self._proxies),
+                proxy=entry.proxy,
+                source=entry.source,
+                source_label=entry.source_label,
+                count=len(entries),
                 proxy_index=index,
-                bind_to_account=self._should_bind_account(),
-                selected_file=self._selected_file,
+                bind_to_account=entry.bind_to_account,
+                selected_file=entry.selected_file,
                 last_error=self._last_error,
+                wait_retriable=False,
             )
 
     def report(self, selection: RegisterProxySelection | None, ok: bool, reason: str = "", error: object = "") -> None:
@@ -164,24 +180,32 @@ class RegisterProxyPool:
 
     def state(self) -> dict[str, Any]:
         with self._lock:
-            count = len(self._proxies) if self._mode != "single" else (1 if self._single_proxy else 0)
-            using_cached = self._mode == "proxy_checker_dir" and count > 0 and bool(self._last_error)
-            wait_retriable = self._mode == "proxy_checker_dir" and count == 0
-            if wait_retriable:
+            entries = self._build_entries_locked()
+            count = len(entries)
+            has_single = any(entry.source == "single" for entry in entries)
+            has_checker = any(entry.source == "proxy_checker_dir" for entry in entries)
+            single_available = has_single
+            proxy_checker_cached = bool(self._proxies and self._last_error)
+            using_cached = proxy_checker_cached
+            strategy_label = "随机" if self._selection_strategy == "random" else "轮询"
+            if count <= 0:
                 status = "waiting"
-                usage_label = "等待代理"
+                usage_label = "等待代理恢复"
             elif using_cached:
                 status = "cached"
-                usage_label = "使用上一轮代理"
-            elif self._mode == "single":
-                status = "ready" if count else "direct"
-                usage_label = "单代理" if count else "直连"
+                usage_label = f"使用可用代理（{strategy_label}，含上轮 Proxy Checker 缓存）"
+            elif has_single and has_checker:
+                status = "ready"
+                usage_label = f"单代理 + Proxy Checker {strategy_label}"
+            elif has_single:
+                status = "ready"
+                usage_label = "单代理"
             else:
                 status = "ready"
-                usage_label = "直接轮询"
+                usage_label = f"Proxy Checker {strategy_label}"
             return {
-                "mode": self._mode,
-                "source_label": self._source_label(),
+                "mode": "auto",
+                "source_label": self._configured_source_label_locked(),
                 "count": count,
                 "last_error": self._last_error,
                 "last_fetch": int(self._last_fetch) if self._last_fetch else 0,
@@ -189,23 +213,30 @@ class RegisterProxyPool:
                 "status": status,
                 "usage_label": usage_label,
                 "using_cached": using_cached,
-                "wait_retriable": wait_retriable,
+                "wait_retriable": count <= 0,
+                "selection_strategy": self._selection_strategy,
+                "single_available": single_available,
+                "proxy_checker_cached": proxy_checker_cached,
+                "source_counts": {
+                    "single": 1 if has_single else 0,
+                    "proxy_checker_dir": sum(1 for entry in entries if entry.source == "proxy_checker_dir"),
+                },
             }
 
     def _refresh_locked(self, force: bool) -> None:
-        if self._mode == "single":
-            self._proxies = [self._single_proxy] if self._single_proxy else []
-            self._last_fetch = time.time()
-            self._selected_file = ""
-            self._last_error = ""
-            return
         if not force and self._last_fetch and time.time() - self._last_fetch < self._refresh_interval:
             return
-        if self._mode == "proxy_checker_dir":
-            self._refresh_proxy_checker_dir_locked()
+        self._refresh_proxy_checker_dir_locked()
 
     def _refresh_proxy_checker_dir_locked(self) -> None:
         self._last_fetch = time.time()
+        if not self._proxy_checker_dir:
+            if self._proxies:
+                self._proxies = []
+                self._save_state_locked()
+            self._selected_file = ""
+            self._last_error = ""
+            return
         base = Path(self._proxy_checker_dir)
         if not base.exists() or not base.is_dir():
             if self._proxies:
@@ -284,8 +315,14 @@ class RegisterProxyPool:
         proxies = parse_proxy_lines("\n".join(data.get("proxies") or []))
         if not proxies:
             return
-        self._mode = normalize_proxy_input_mode(data.get("mode"))
-        self._proxy_checker_dir = str(data.get("proxy_checker_dir") or DEFAULT_PROXY_CHECKER_DIR).strip()
+        proxy_checker_dir = str(data.get("proxy_checker_dir") or "").strip()
+        if not proxy_checker_dir:
+            try:
+                self._state_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
+        self._proxy_checker_dir = proxy_checker_dir
         self._proxy_checker_pattern = str(data.get("proxy_checker_pattern") or DEFAULT_PROXY_CHECKER_PATTERN).strip()
         self._proxies = proxies
         self._selected_file = str(data.get("selected_file") or "")
@@ -293,7 +330,7 @@ class RegisterProxyPool:
     def _save_state_locked(self) -> None:
         if self._state_file is None:
             return
-        if self._mode != "proxy_checker_dir" or not self._proxies:
+        if not self._proxies:
             try:
                 self._state_file.unlink(missing_ok=True)
             except Exception:
@@ -304,7 +341,7 @@ class RegisterProxyPool:
             self._state_file.write_text(
                 json.dumps(
                     {
-                        "mode": self._mode,
+                        "mode": "auto",
                         "proxy_checker_dir": self._proxy_checker_dir,
                         "proxy_checker_pattern": self._proxy_checker_pattern,
                         "selected_file": self._selected_file,
@@ -320,21 +357,50 @@ class RegisterProxyPool:
         except Exception:
             pass
 
-    def _source_label(self) -> str:
-        return {
-            "single": "单代理",
-            "proxy_checker_dir": "Proxy Checker 目录",
-        }.get(self._mode, self._mode)
+    def _build_entries_locked(self) -> list[_ProxyEntry]:
+        entries: list[_ProxyEntry] = []
+        seen: set[str] = set()
+        if self._single_proxy:
+            seen.add(self._single_proxy)
+            entries.append(_ProxyEntry(proxy=self._single_proxy, source="single", source_label="单代理"))
+        for proxy in self._proxies:
+            if proxy in seen:
+                continue
+            seen.add(proxy)
+            entries.append(
+                _ProxyEntry(
+                    proxy=proxy,
+                    source="proxy_checker_dir",
+                    source_label="Proxy Checker 目录",
+                    selected_file=self._selected_file,
+                    bind_to_account=self._bind_proxy_checker,
+                )
+            )
+        return entries
 
-    def _should_bind_account(self) -> bool:
-        return self._mode == "proxy_checker_dir" and self._bind_proxy_checker
+    def _configured_source_label_locked(self) -> str:
+        has_single = bool(self._single_proxy)
+        has_checker = bool(self._proxy_checker_dir)
+        if has_single and has_checker:
+            return "单代理 + Proxy Checker 目录"
+        if has_single:
+            return "单代理"
+        if has_checker:
+            return "Proxy Checker 目录"
+        return "自动代理"
+
+    def _configured_source_locked(self) -> str:
+        has_single = bool(self._single_proxy)
+        has_checker = bool(self._proxy_checker_dir)
+        if has_checker and not has_single:
+            return "proxy_checker_dir"
+        if has_single and not has_checker:
+            return "single"
+        return "auto"
 
     @staticmethod
-    def _source_key(mode: str, single_proxy: str, proxy_checker_dir: str, proxy_checker_pattern: str) -> tuple[str, ...]:
-        normalized_mode = normalize_proxy_input_mode(mode)
-        if normalized_mode == "single":
-            return (normalized_mode, single_proxy)
-        return (normalized_mode, proxy_checker_dir, proxy_checker_pattern)
+    def _source_key(single_proxy: str, proxy_checker_dir: str, proxy_checker_pattern: str) -> tuple[str, str, str]:
+        return (single_proxy, proxy_checker_dir, proxy_checker_pattern)
 
     @staticmethod
     def _positive_int(value: object, default: int) -> int:
@@ -342,6 +408,11 @@ class RegisterProxyPool:
             return max(1, int(value))
         except Exception:
             return default
+
+    @staticmethod
+    def _normalize_selection_strategy(value: object) -> str:
+        strategy = str(value or DEFAULT_PROXY_SELECTION_STRATEGY).strip().lower()
+        return strategy if strategy in PROXY_SELECTION_STRATEGIES else DEFAULT_PROXY_SELECTION_STRATEGY
 
 
 register_proxy_pool = RegisterProxyPool(Path(__file__).resolve().parents[2] / "data" / "register_proxy_state.json")
@@ -351,7 +422,9 @@ __all__ = [
     "DEFAULT_PROXY_CHECKER_DIR",
     "DEFAULT_PROXY_CHECKER_PATTERN",
     "DEFAULT_PROXY_REFRESH_INTERVAL",
+    "DEFAULT_PROXY_SELECTION_STRATEGY",
     "PROXY_INPUT_MODES",
+    "PROXY_SELECTION_STRATEGIES",
     "RegisterProxySelection",
     "classify_register_failure",
     "normalize_proxy_input_mode",

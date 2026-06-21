@@ -17,6 +17,7 @@ from services.register.proxy_pool import register_proxy_pool
 
 REGISTER_FILE = DATA_DIR / "register.json"
 REGISTER_FATAL_FAILURE_REASONS = {
+    "register_proxy_unavailable",
     "unsupported_email",
     "account_create_failed",
 }
@@ -105,6 +106,7 @@ def _default_config() -> dict:
 def _normalize(raw: dict) -> dict:
     cfg = _default_config()
     cfg.update({k: v for k, v in raw.items() if k not in {"stats", "logs"}})
+    raw_proxy_input_mode = str(raw.get("proxy_input_mode") or "").strip().lower()
     cfg["total"] = max(1, int(cfg.get("total") or 1))
     cfg["threads"] = max(1, int(cfg.get("threads") or 1))
     cfg["mode"] = str(cfg.get("mode") or "total").strip() if str(cfg.get("mode") or "total").strip() in {"total", "quota", "available"} else "total"
@@ -112,13 +114,16 @@ def _normalize(raw: dict) -> dict:
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
-    cfg["proxy_input_mode"] = str(cfg.get("proxy_input_mode") or "single").strip()
-    if cfg["proxy_input_mode"] not in {"single", "proxy_checker_dir"}:
-        cfg["proxy_input_mode"] = "single"
-    cfg["proxy_checker_dir"] = str(cfg.get("proxy_checker_dir") or "/opt/proxy-checker/repo_data").strip()
+    cfg["proxy_input_mode"] = "auto"
+    proxy_checker_dir = str(cfg.get("proxy_checker_dir") or "").strip()
+    if raw_proxy_input_mode in {"single", "url", "text"}:
+        proxy_checker_dir = ""
+    cfg["proxy_checker_dir"] = proxy_checker_dir
     cfg["proxy_checker_pattern"] = str(cfg.get("proxy_checker_pattern") or "user_*.txt").strip()
     cfg["proxy_refresh_interval"] = max(10, _int_or_default(cfg.get("proxy_refresh_interval"), 120))
     cfg["proxy_bind_proxy_checker"] = bool(cfg.get("proxy_bind_proxy_checker", True))
+    proxy_selection_strategy = str(cfg.get("proxy_selection_strategy") or "round_robin").strip().lower()
+    cfg["proxy_selection_strategy"] = proxy_selection_strategy if proxy_selection_strategy in {"round_robin", "random"} else "round_robin"
     cfg.pop("proxy_url", None)
     cfg.pop("proxy_list_text", None)
     cfg.pop("proxy_bind_url", None)
@@ -160,6 +165,7 @@ class RegisterService:
         self._logs: list[dict] = []
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
+        self._sync_proxy_pool_state_locked(force=True)
         if self._config["enabled"]:
             self.start()
 
@@ -175,6 +181,7 @@ class RegisterService:
 
     def get(self) -> dict:
         with self._lock:
+            self._refresh_proxy_pool_state_locked(force=False)
             snapshot = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
         self._redact_outlook_pools(snapshot)
         return snapshot
@@ -266,26 +273,23 @@ class RegisterService:
                 provider.pop(key, None)
         return total_removed
 
-    @staticmethod
-    def _inject_proxy_to_run_config(run_config: dict) -> dict:
-        next_config = dict(run_config)
-        proxy = str(next_config.get("proxy") or "").strip()
-        mail = next_config.get("mail") if isinstance(next_config.get("mail"), dict) else {}
-        if proxy and bool(mail.get("api_use_register_proxy", True)):
-            next_config["mail"] = {**next_config["mail"], "proxy": proxy}
-        elif isinstance(next_config.get("mail"), dict):
-            next_config["mail"] = dict(next_config["mail"])
-            next_config["mail"].pop("proxy", None)
-        return next_config
-
     def update(self, updates: dict) -> dict:
         with self._lock:
             self._merge_outlook_pools(updates)
             self._config = _normalize({**self._config, **updates})
             self._drop_mail_proxy()
             self._sync_openai_register_config(self._config)
+            self._sync_proxy_pool_state_locked(force=True)
             self._save()
             return self.get()
+
+    def _sync_proxy_pool_state_locked(self, force: bool = False) -> None:
+        register_proxy_pool.configure(self._config)
+        self._refresh_proxy_pool_state_locked(force=force)
+
+    def _refresh_proxy_pool_state_locked(self, force: bool = False) -> None:
+        register_proxy_pool.prepare(force=force)
+        self._config.setdefault("stats", {})["proxy_pool"] = register_proxy_pool.state()
 
     @staticmethod
     def _sync_openai_register_config(cfg: dict) -> None:
@@ -317,7 +321,7 @@ class RegisterService:
                         message=trigger_log or "",
                     )
                 return self.get()
-            run_config = self._inject_proxy_to_run_config(_normalize({**self._config, **(run_overrides or {})}))
+            run_config = _normalize({**self._config, **(run_overrides or {})})
             self._config["enabled"] = True
             self._drop_mail_proxy()
             self._logs = []
