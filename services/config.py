@@ -77,7 +77,6 @@ DEFAULT_PROXY_RUNTIME = {
 }
 
 DEFAULT_PROXY_POOL_MODE = "sticky"
-DEFAULT_PROXY_POOL_FAILOVER_THRESHOLD = 2
 
 DEFAULT_THIRD_PARTY_APPS = {
     "infinite_canvas": {
@@ -585,7 +584,6 @@ class ConfigStore:
         data["proxy"] = ""
         data["proxy_pool"] = self.get_proxy_pool()
         data["proxy_pool_mode"] = self.get_proxy_pool_mode()
-        data["proxy_pool_failover_threshold"] = self.get_proxy_pool_failover_threshold()
         data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
         data["third_party_apps"] = self.get_third_party_apps_settings()
         data.pop("auth-key", None)
@@ -600,13 +598,6 @@ class ConfigStore:
 
     def get_proxy_pool_mode(self) -> str:
         return _normalize_proxy_pool_mode(self.data.get("proxy_pool_mode"))
-
-    def get_proxy_pool_failover_threshold(self) -> int:
-        return _normalize_positive_int(
-            self.data.get("proxy_pool_failover_threshold"),
-            DEFAULT_PROXY_POOL_FAILOVER_THRESHOLD,
-            1,
-        )
 
     def get_proxy_runtime_settings(self) -> dict[str, object]:
         return _normalize_proxy_runtime_settings(self.data.get("proxy_runtime"))
@@ -653,12 +644,7 @@ class ConfigStore:
         next_data["proxy"] = ""
         if "proxy_pool_mode" in next_data:
             next_data["proxy_pool_mode"] = _normalize_proxy_pool_mode(next_data.get("proxy_pool_mode"))
-        if "proxy_pool_failover_threshold" in next_data:
-            next_data["proxy_pool_failover_threshold"] = _normalize_positive_int(
-                next_data.get("proxy_pool_failover_threshold"),
-                DEFAULT_PROXY_POOL_FAILOVER_THRESHOLD,
-                1,
-            )
+        next_data.pop("proxy_pool_failover_threshold", None)
         if "proxy_runtime" in next_data:
             incoming_runtime = next_data.get("proxy_runtime")
             if isinstance(incoming_runtime, dict):

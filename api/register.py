@@ -15,18 +15,10 @@ class RegisterConfigRequest(BaseModel):
     mail: dict | None = None
     proxy: str | None = None
     proxy_input_mode: str | None = None
-    proxy_url: str | None = None
-    proxy_list_text: str | None = None
     proxy_checker_dir: str | None = None
     proxy_checker_pattern: str | None = None
     proxy_refresh_interval: int | None = None
-    proxy_lease_seconds: int | None = None
-    proxy_bind_url: bool | None = None
-    proxy_bind_text: bool | None = None
     proxy_bind_proxy_checker: bool | None = None
-    proxy_failure_threshold: int | None = None
-    proxy_blacklist_seconds: int | None = None
-    proxy_success_clear_failures: bool | None = None
     task_timeout_seconds: int | None = None
     task_stall_timeout_seconds: int | None = None
     total: int | None = None
@@ -74,11 +66,6 @@ def create_router() -> APIRouter:
     async def reset_outlook_pool(body: OutlookPoolResetRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"register": register_service.reset_outlook_pool(body.scope or "all")}
-
-    @router.post("/api/register/proxy-blacklist/reset")
-    async def reset_proxy_blacklist(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {"register": register_service.reset_proxy_blacklist()}
 
     @router.get("/api/register/events")
     async def register_events(token: str = ""):

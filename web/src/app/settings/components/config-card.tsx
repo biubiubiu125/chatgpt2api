@@ -33,7 +33,6 @@ export function ConfigCard() {
   const setLogLevel = useSettingsStore((state) => state.setLogLevel);
   const setProxyPoolText = useSettingsStore((state) => state.setProxyPoolText);
   const setProxyPoolMode = useSettingsStore((state) => state.setProxyPoolMode);
-  const setProxyPoolFailoverThreshold = useSettingsStore((state) => state.setProxyPoolFailoverThreshold);
   const setBaseUrl = useSettingsStore((state) => state.setBaseUrl);
   const setGlobalSystemPrompt = useSettingsStore((state) => state.setGlobalSystemPrompt);
   const setSensitiveWordsText = useSettingsStore((state) => state.setSensitiveWordsText);
@@ -127,15 +126,6 @@ export function ConfigCard() {
                     <SelectItem value="round_robin">每次轮询</SelectItem>
                   </SelectContent>
                 </Select>
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm text-stone-700">失败跳过次数</label>
-                <Input
-                  value={String(config?.proxy_pool_failover_threshold || "")}
-                  onChange={(event) => setProxyPoolFailoverThreshold(event.target.value)}
-                  placeholder="2"
-                  className="h-10 rounded-xl border-stone-200 bg-white"
-                />
               </div>
               <div className="flex items-end justify-end">
                 <Button

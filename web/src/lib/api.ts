@@ -138,9 +138,6 @@ export type ProxyRuntimeStatus = {
   has_proxy: boolean;
   proxy_pool_count?: number;
   proxy_pool_mode?: "sticky" | "round_robin" | string;
-  proxy_pool_failures?: Record<string, number>;
-  account_proxy_failure_count?: number;
-  account_proxy_failures?: Record<string, number>;
   clearance_enabled: boolean;
   clearance_mode: ProxyRuntimeClearanceMode | string;
   has_clearance_bundle: boolean;
@@ -163,7 +160,6 @@ export type SettingsConfig = {
   proxy: string;
   proxy_pool?: string[];
   proxy_pool_mode?: "sticky" | "round_robin" | string;
-  proxy_pool_failover_threshold?: number | string;
   base_url?: string;
   global_system_prompt?: string;
   sensitive_words?: string[];
@@ -349,19 +345,11 @@ export type RegisterConfig = {
     providers: Array<Record<string, unknown>>;
   };
   proxy: string;
-  proxy_input_mode?: "single" | "url" | "text" | "proxy_checker_dir";
-  proxy_url?: string;
-  proxy_list_text?: string;
+  proxy_input_mode?: "single" | "proxy_checker_dir";
   proxy_checker_dir?: string;
   proxy_checker_pattern?: string;
   proxy_refresh_interval?: number;
-  proxy_lease_seconds?: number;
-  proxy_bind_url?: boolean;
-  proxy_bind_text?: boolean;
   proxy_bind_proxy_checker?: boolean;
-  proxy_failure_threshold?: number;
-  proxy_blacklist_seconds?: number;
-  proxy_success_clear_failures?: boolean;
   task_timeout_seconds?: number;
   task_stall_timeout_seconds?: number;
   total: number;
@@ -400,9 +388,10 @@ export type RegisterConfig = {
       count?: number;
       selected_file?: string;
       last_error?: string;
-      leased_count?: number;
-      blacklist_count?: number;
-      blacklist_until?: number;
+      status?: string;
+      usage_label?: string;
+      using_cached?: boolean;
+      wait_retriable?: boolean;
     };
     workers?: Array<Record<string, unknown>>;
   };
@@ -839,12 +828,6 @@ export async function resetOutlookPool(scope: "all" | "failed" | "unused" = "all
   });
 }
 
-export async function resetRegisterProxyBlacklist() {
-  return httpRequest<{ register: RegisterConfig }>("/api/register/proxy-blacklist/reset", {
-    method: "POST",
-  });
-}
-
 // ── CPA (CLIProxyAPI) ──────────────────────────────────────────────
 
 export type CPAPool = {
@@ -1060,12 +1043,6 @@ export async function updateProxyRuntime(runtime: ProxyRuntimeSettings) {
   return httpRequest<ProxyRuntimeResponse>("/api/proxy/runtime", {
     method: "POST",
     body: runtime,
-  });
-}
-
-export async function resetProxyRuntimeFailures() {
-  return httpRequest<{ cleared: number; status: ProxyRuntimeStatus }>("/api/proxy/runtime/failures/reset", {
-    method: "POST",
   });
 }
 

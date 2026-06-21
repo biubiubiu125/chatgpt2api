@@ -12,7 +12,6 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Textarea } from "@/components/ui/textarea";
 import {
   fetchProxyRuntime,
-  resetProxyRuntimeFailures,
   testProxy,
   testProxyClearance,
   type ClearanceTestResult,
@@ -27,7 +26,6 @@ import { useSettingsStore } from "../store";
 export function ProxyRuntimeCard() {
   const [isTestingProxy, setIsTestingProxy] = useState(false);
   const [isTestingClearance, setIsTestingClearance] = useState(false);
-  const [isResettingFailures, setIsResettingFailures] = useState(false);
   const [proxyResult, setProxyResult] = useState<ProxyTestResult | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<ProxyRuntimeStatus | null>(null);
   const [clearanceResult, setClearanceResult] = useState<ClearanceTestResult | null>(null);
@@ -55,7 +53,7 @@ export function ProxyRuntimeCard() {
   const runtimeEnabled = Boolean(runtime.enabled);
   const clearanceMode = clearance.mode;
   const hasStoredClearance = Boolean(clearance.has_cf_cookies || clearance.has_cf_clearance);
-  const accountProxyFailureCount = Number(runtimeStatus?.account_proxy_failure_count || 0);
+  const statusEnabled = runtimeStatus?.enabled ?? runtimeEnabled;
 
   const refreshRuntimeStatus = async () => {
     const data = await fetchProxyRuntime();
@@ -111,19 +109,6 @@ export function ProxyRuntimeCard() {
     }
   };
 
-  const handleResetProxyFailures = async () => {
-    setIsResettingFailures(true);
-    try {
-      const data = await resetProxyRuntimeFailures();
-      setRuntimeStatus(data.status);
-      toast.success(`已清理 ${data.cleared} 条代理失败记录`);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "清理代理失败记录失败");
-    } finally {
-      setIsResettingFailures(false);
-    }
-  };
-
   return (
     <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
       <CardContent className="space-y-5 p-6">
@@ -147,9 +132,24 @@ export function ProxyRuntimeCard() {
         </div>
 
         <div className="flex flex-col gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-xs leading-6 text-stone-600 sm:flex-row sm:items-center sm:justify-between">
-          <span>
-            账号绑定代理失败记录：{accountProxyFailureCount} 个
-          </span>
+          <div className="grid flex-1 gap-2 sm:grid-cols-4">
+            <div>
+              <div className="text-stone-400">运行</div>
+              <div className="font-medium text-stone-800">{statusEnabled ? "已启用" : "未启用"}</div>
+            </div>
+            <div>
+              <div className="text-stone-400">当前出口</div>
+              <div className="font-medium text-stone-800">{runtimeStatus?.proxy_source || "direct"}</div>
+            </div>
+            <div>
+              <div className="text-stone-400">代理池</div>
+              <div className="font-medium text-stone-800">{runtimeStatus?.proxy_pool_count ?? 0}</div>
+            </div>
+            <div>
+              <div className="text-stone-400">清障缓存</div>
+              <div className="font-medium text-stone-800">{runtimeStatus?.cached_clearance_hosts?.length ?? 0}</div>
+            </div>
+          </div>
           <div className="flex gap-2">
             <Button
               type="button"
@@ -158,16 +158,6 @@ export function ProxyRuntimeCard() {
               onClick={() => void refreshRuntimeStatus()}
             >
               刷新状态
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              className="h-8 rounded-xl border-stone-200 bg-white px-3 text-stone-700"
-              onClick={() => void handleResetProxyFailures()}
-              disabled={isResettingFailures}
-            >
-              {isResettingFailures ? <LoaderCircle className="size-4 animate-spin" /> : null}
-              清理失败记录
             </Button>
           </div>
         </div>

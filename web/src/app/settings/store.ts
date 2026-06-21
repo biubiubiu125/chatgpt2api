@@ -13,7 +13,6 @@ import {
   fetchRegisterConfig,
   resetRegister as resetRegisterApi,
   resetOutlookPool as resetOutlookPoolApi,
-  resetRegisterProxyBlacklist as resetRegisterProxyBlacklistApi,
   fetchSettingsConfig,
   runBackupNow,
   syncImageStorage,
@@ -60,18 +59,10 @@ function buildRegisterPayload(registerConfig: RegisterConfig): Partial<RegisterC
     },
     proxy: String(registerConfig.proxy || "").trim(),
     proxy_input_mode: registerConfig.proxy_input_mode || "single",
-    proxy_url: String(registerConfig.proxy_url || "").trim(),
-    proxy_list_text: String(registerConfig.proxy_list_text || ""),
     proxy_checker_dir: String(registerConfig.proxy_checker_dir || "/opt/proxy-checker/repo_data").trim(),
     proxy_checker_pattern: String(registerConfig.proxy_checker_pattern || "user_*.txt").trim(),
     proxy_refresh_interval: Math.max(10, numberOrDefault(registerConfig.proxy_refresh_interval, 120)),
-    proxy_lease_seconds: Math.max(10, numberOrDefault(registerConfig.proxy_lease_seconds, 120)),
-    proxy_bind_url: Boolean(registerConfig.proxy_bind_url),
-    proxy_bind_text: Boolean(registerConfig.proxy_bind_text),
     proxy_bind_proxy_checker: Boolean(registerConfig.proxy_bind_proxy_checker ?? true),
-    proxy_failure_threshold: Math.max(1, numberOrDefault(registerConfig.proxy_failure_threshold, 2)),
-    proxy_blacklist_seconds: Math.max(30, numberOrDefault(registerConfig.proxy_blacklist_seconds, 900)),
-    proxy_success_clear_failures: Boolean(registerConfig.proxy_success_clear_failures ?? true),
     task_timeout_seconds: Math.max(30, Number(registerConfig.task_timeout_seconds) || 300),
     task_stall_timeout_seconds: Math.max(0, Number(registerConfig.task_stall_timeout_seconds) || 60),
     total: Math.max(1, Number(registerConfig.total) || 1),
@@ -245,7 +236,6 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     proxy_pool_mode: ["sticky", "round_robin"].includes(String(config.proxy_pool_mode))
       ? String(config.proxy_pool_mode)
       : "sticky",
-    proxy_pool_failover_threshold: Number(config.proxy_pool_failover_threshold || 2),
     base_url: typeof config.base_url === "string" ? config.base_url : "",
     global_system_prompt: String(config.global_system_prompt || ""),
     sensitive_words: Array.isArray(config.sensitive_words) ? config.sensitive_words : [],
@@ -371,7 +361,6 @@ type SettingsStore = {
   setLogLevel: (level: string, enabled: boolean) => void;
   setProxyPoolText: (value: string) => void;
   setProxyPoolMode: (value: "sticky" | "round_robin") => void;
-  setProxyPoolFailoverThreshold: (value: string) => void;
   setBaseUrl: (value: string) => void;
   setGlobalSystemPrompt: (value: string) => void;
   setSensitiveWordsText: (value: string) => void;
@@ -408,7 +397,6 @@ type SettingsStore = {
   toggleRegister: () => Promise<void>;
   resetRegister: () => Promise<void>;
   resetOutlookPool: (scope: "all" | "failed" | "unused") => Promise<void>;
-  resetRegisterProxyBlacklist: () => Promise<void>;
 
   loadPools: (silent?: boolean) => Promise<void>;
   openAddDialog: () => void;
@@ -527,7 +515,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         proxy_pool_mode: ["sticky", "round_robin"].includes(String(config.proxy_pool_mode))
           ? config.proxy_pool_mode
           : "sticky",
-        proxy_pool_failover_threshold: Math.max(1, Number(config.proxy_pool_failover_threshold) || 2),
         base_url: String(config.base_url || "").trim(),
         global_system_prompt: String(config.global_system_prompt || "").trim(),
         sensitive_words: (config.sensitive_words || []).map((item) => String(item).trim()).filter(Boolean),
@@ -686,15 +673,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       config: {
         ...state.config,
         proxy_pool_mode: value,
-      },
-    } : {});
-  },
-
-  setProxyPoolFailoverThreshold: (value) => {
-    set((state) => state.config ? {
-      config: {
-        ...state.config,
-        proxy_pool_failover_threshold: value,
       },
     } : {});
   },
@@ -1141,19 +1119,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       toast.success(scope === "unused" ? "已清空未使用邮箱" : scope === "failed" ? "已清除失败/占用的邮箱状态" : "Outlook 邮箱池状态已全部重置");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "重置邮箱池状态失败");
-    } finally {
-      set({ isSavingRegister: false });
-    }
-  },
-
-  resetRegisterProxyBlacklist: async () => {
-    set({ isSavingRegister: true });
-    try {
-      const data = await resetRegisterProxyBlacklistApi();
-      set({ registerConfig: data.register });
-      toast.success("已重置注册代理黑名单/租约状态");
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "重置注册代理状态失败");
     } finally {
       set({ isSavingRegister: false });
     }

@@ -37,18 +37,10 @@ config = {
     },
     "proxy": "",
     "proxy_input_mode": "single",
-    "proxy_url": "",
-    "proxy_list_text": "",
     "proxy_checker_dir": "/opt/proxy-checker/repo_data",
     "proxy_checker_pattern": "user_*.txt",
     "proxy_refresh_interval": 120,
-    "proxy_lease_seconds": 120,
-    "proxy_bind_url": False,
-    "proxy_bind_text": False,
     "proxy_bind_proxy_checker": True,
-    "proxy_failure_threshold": 2,
-    "proxy_blacklist_seconds": 900,
-    "proxy_success_clear_failures": True,
     "task_timeout_seconds": 300,
     "task_stall_timeout_seconds": 60,
     "total": 10,
@@ -279,13 +271,7 @@ def heartbeat(index: int) -> None:
     _set_worker_state(index)
 
 
-def renew_register_proxy(selection: RegisterProxySelection | None) -> None:
-    if selection is not None and selection.proxy and selection.lease_id:
-        register_proxy_pool.renew(selection.proxy, selection.lease_id)
-
-
 def heartbeat_with_proxy(index: int, selection: RegisterProxySelection | None) -> None:
-    renew_register_proxy(selection)
     heartbeat(index)
 
 
@@ -481,15 +467,8 @@ def _remaining_timeout(deadline: float | None, fallback: float = default_timeout
     return max(0.5, min(timeout, remaining))
 
 
-def _request_timeout_with_lease(deadline: float | None, lease_seconds: object = None, fallback: float = default_timeout) -> float:
-    timeout = _remaining_timeout(deadline, fallback)
-    try:
-        lease_timeout = max(1.0, float(lease_seconds or 0) / 2)
-    except (TypeError, ValueError):
-        lease_timeout = 0
-    if lease_timeout:
-        timeout = min(timeout, lease_timeout)
-    return max(0.5, timeout)
+def _request_timeout(deadline: float | None, fallback: float = default_timeout) -> float:
+    return _remaining_timeout(deadline, fallback)
 
 
 def _apply_clearance_to_session(session: requests.Session, bundle: ClearanceBundle | None) -> None:
@@ -540,29 +519,21 @@ def request_with_local_retry(
     retry_attempts: int = 3,
     stop_event: threading.Event | None = None,
     deadline: float | None = None,
-    lease_seconds: object = None,
-    renew_lease=None,
     **kwargs,
 ):
     last_error = ""
     for _ in range(max(1, retry_attempts)):
-        if renew_lease is not None:
-            renew_lease()
         _check_task_control(stop_event, deadline)
         try:
             resp = session.request(
                 method.upper(),
                 url,
-                timeout=_request_timeout_with_lease(deadline, lease_seconds),
+                timeout=_request_timeout(deadline),
                 **kwargs,
             )
-            if renew_lease is not None:
-                renew_lease()
             return resp, ""
         except Exception as error:
             last_error = str(error)
-            if renew_lease is not None:
-                renew_lease()
             if stop_event is not None and stop_event.wait(1):
                 raise RegisterStopped("register_task_stopped")
             _check_task_control(stop_event, deadline)
@@ -575,8 +546,6 @@ def validate_otp(
     code: str,
     stop_event: threading.Event | None = None,
     deadline: float | None = None,
-    lease_seconds: object = None,
-    renew_lease=None,
 ):
     headers = dict(common_headers)
     headers["referer"] = f"{auth_base}/email-verification"
@@ -591,8 +560,6 @@ def validate_otp(
         verify=False,
         stop_event=stop_event,
         deadline=deadline,
-        lease_seconds=lease_seconds,
-        renew_lease=renew_lease,
     )
     if resp is not None and resp.status_code == 200:
         return resp, ""
@@ -606,8 +573,6 @@ def validate_otp(
         verify=False,
         stop_event=stop_event,
         deadline=deadline,
-        lease_seconds=lease_seconds,
-        renew_lease=renew_lease,
     )
     return resp, error
 
@@ -638,8 +603,6 @@ def extract_oauth_callback_params_from_consent_session(
     device_id: str,
     stop_event: threading.Event | None = None,
     deadline: float | None = None,
-    lease_seconds: object = None,
-    renew_lease=None,
 ) -> dict[str, str] | None:
     current_url = _absolute_auth_url(consent_url)
     if not current_url:
@@ -648,8 +611,6 @@ def extract_oauth_callback_params_from_consent_session(
     headers["referer"] = auth_base
     headers["oai-device-id"] = device_id
     for _ in range(10):
-        if renew_lease is not None:
-            renew_lease()
         _check_task_control(stop_event, deadline)
         try:
             resp = session.get(
@@ -657,12 +618,10 @@ def extract_oauth_callback_params_from_consent_session(
                 headers=headers,
                 allow_redirects=False,
                 verify=False,
-                timeout=_request_timeout_with_lease(deadline, lease_seconds),
+                timeout=_request_timeout(deadline),
             )
         except Exception:
             break
-        if renew_lease is not None:
-            renew_lease()
         callback_params = extract_oauth_callback_params_from_url(str(getattr(resp, "url", "") or ""))
         if callback_params:
             return callback_params
@@ -697,8 +656,6 @@ def extract_oauth_callback_params_from_consent_session(
     headers["oai-device-id"] = device_id
     headers.update(_make_trace_headers())
     try:
-        if renew_lease is not None:
-            renew_lease()
         _check_task_control(stop_event, deadline)
         resp = session.post(
             f"{auth_base}/api/accounts/workspace/select",
@@ -706,12 +663,10 @@ def extract_oauth_callback_params_from_consent_session(
             headers=headers,
             allow_redirects=False,
             verify=False,
-            timeout=_request_timeout_with_lease(deadline, lease_seconds),
+            timeout=_request_timeout(deadline),
         )
     except Exception:
         return None
-    if renew_lease is not None:
-        renew_lease()
     location = str(getattr(resp, "headers", {}).get("location") or getattr(resp, "headers", {}).get("Location") or "").strip()
     callback_params = extract_oauth_callback_params_from_url(location)
     if callback_params:
@@ -733,8 +688,6 @@ def extract_oauth_callback_params_from_consent_session(
     if project_id:
         body["project_id"] = project_id
     try:
-        if renew_lease is not None:
-            renew_lease()
         _check_task_control(stop_event, deadline)
         resp = session.post(
             f"{auth_base}/api/accounts/organization/select",
@@ -742,12 +695,10 @@ def extract_oauth_callback_params_from_consent_session(
             headers=org_headers,
             allow_redirects=False,
             verify=False,
-            timeout=_request_timeout_with_lease(deadline, lease_seconds),
+            timeout=_request_timeout(deadline),
         )
     except Exception:
         return None
-    if renew_lease is not None:
-        renew_lease()
     location = str(getattr(resp, "headers", {}).get("location") or getattr(resp, "headers", {}).get("Location") or "").strip()
     return extract_oauth_callback_params_from_url(location)
 
@@ -758,8 +709,6 @@ def request_platform_oauth_token(
     code_verifier: str,
     stop_event: threading.Event | None = None,
     deadline: float | None = None,
-    lease_seconds: object = None,
-    renew_lease=None,
 ) -> dict | None:
     headers = {
         "accept": "*/*",
@@ -779,8 +728,6 @@ def request_platform_oauth_token(
         "sec-fetch-site": "same-site",
         "user-agent": user_agent,
     }
-    if renew_lease is not None:
-        renew_lease()
     _check_task_control(stop_event, deadline)
     resp = session.post(
         f"{auth_base}/api/accounts/oauth/token",
@@ -793,10 +740,8 @@ def request_platform_oauth_token(
             "redirect_uri": platform_oauth_redirect_uri,
         },
         verify=False,
-        timeout=_request_timeout_with_lease(deadline, lease_seconds, 60),
+        timeout=_request_timeout(deadline, 60),
     )
-    if renew_lease is not None:
-        renew_lease()
     if resp.status_code != 200:
         print(resp.text)
         return None
@@ -810,8 +755,6 @@ def exchange_platform_tokens(
     consent_url: str,
     stop_event: threading.Event | None = None,
     deadline: float | None = None,
-    lease_seconds: object = None,
-    renew_lease=None,
 ) -> dict | None:
     callback_params = extract_oauth_callback_params_from_consent_session(
         session,
@@ -819,23 +762,17 @@ def exchange_platform_tokens(
         device_id,
         stop_event,
         deadline,
-        lease_seconds,
-        renew_lease,
     )
     if not callback_params:
         try:
-            if renew_lease is not None:
-                renew_lease()
             _check_task_control(stop_event, deadline)
             resp = session.get(
                 _absolute_auth_url(consent_url),
                 headers=navigate_headers,
                 allow_redirects=True,
                 verify=False,
-                timeout=_request_timeout_with_lease(deadline, lease_seconds),
+                timeout=_request_timeout(deadline),
             )
-            if renew_lease is not None:
-                renew_lease()
             callback_params = extract_oauth_callback_params_from_url(str(getattr(resp, "url", "") or ""))
             for history_resp in getattr(resp, "history", []) or []:
                 if callback_params:
@@ -847,7 +784,7 @@ def exchange_platform_tokens(
     code = str((callback_params or {}).get("code") or "").strip()
     if not code:
         return None
-    tokens = request_platform_oauth_token(session, code, code_verifier, stop_event, deadline, lease_seconds, renew_lease)
+    tokens = request_platform_oauth_token(session, code, code_verifier, stop_event, deadline)
     if not tokens:
         return None
     payload = _decode_jwt_payload(str(tokens.get("id_token") or "")) or _decode_jwt_payload(str(tokens.get("access_token") or ""))
@@ -863,13 +800,11 @@ class PlatformRegistrar:
         proxy: str = "",
         stop_event: threading.Event | None = None,
         deadline: float | None = None,
-        proxy_lease_id: str = "",
     ) -> None:
         self.proxy = str(proxy or "").strip()
         self.session = create_session(self.proxy)
         self.stop_event = stop_event
         self.deadline = deadline
-        self.proxy_lease_id = str(proxy_lease_id or "")
         self.clearance_user_agent = ""
         self.clearance_failure_reason = ""
         self.device_id = str(uuid.uuid4())
@@ -879,29 +814,19 @@ class PlatformRegistrar:
     def close(self) -> None:
         self.session.close()
 
-    def _renew_proxy_lease(self) -> None:
-        proxy_lease_id = str(getattr(self, "proxy_lease_id", "") or "")
-        if self.proxy and proxy_lease_id:
-            register_proxy_pool.renew(self.proxy, proxy_lease_id)
-
     def _request(self, session: requests.Session, method: str, url: str, **kwargs) -> tuple[object | None, str]:
         kwargs.pop("stop_event", None)
         kwargs.pop("deadline", None)
-        kwargs.pop("lease_seconds", None)
-        kwargs.pop("renew_lease", None)
         return request_with_local_retry(
             session,
             method,
             url,
             stop_event=self.stop_event,
             deadline=self.deadline,
-            lease_seconds=config.get("proxy_lease_seconds"),
-            renew_lease=self._renew_proxy_lease,
             **kwargs,
         )
 
     def _check_task_control(self) -> None:
-        self._renew_proxy_lease()
         _check_task_control(self.stop_event, self.deadline)
 
     def _navigate_headers(self, referer: str = "") -> dict[str, str]:
@@ -1039,8 +964,6 @@ class PlatformRegistrar:
             code,
             self.stop_event,
             self.deadline,
-            config.get("proxy_lease_seconds"),
-            self._renew_proxy_lease,
         )
         if resp is None or resp.status_code != 200:
             body = ""
@@ -1089,8 +1012,6 @@ class PlatformRegistrar:
             self.code_verifier,
             self.stop_event,
             self.deadline,
-            config.get("proxy_lease_seconds"),
-            self._renew_proxy_lease,
         )
         if not tokens:
             raise RuntimeError("token 交换失败")
@@ -1239,8 +1160,6 @@ class PlatformRegistrar:
                     code,
                     self.stop_event,
                     self.deadline,
-                    config.get("proxy_lease_seconds"),
-                    self._renew_proxy_lease,
                 )
                 if resp is None or resp.status_code != 200:
                     data = _response_json(resp) if resp is not None else {}
@@ -1261,8 +1180,6 @@ class PlatformRegistrar:
                     code_verifier,
                     self.stop_event,
                     self.deadline,
-                    config.get("proxy_lease_seconds"),
-                    self._renew_proxy_lease,
                 )
             else:
                 tokens = exchange_platform_tokens(
@@ -1272,8 +1189,6 @@ class PlatformRegistrar:
                     continue_url,
                     self.stop_event,
                     self.deadline,
-                    config.get("proxy_lease_seconds"),
-                    self._renew_proxy_lease,
                 )
             if not tokens:
                 raise RuntimeError("token 交换失败")
@@ -1352,10 +1267,8 @@ def _wait_for_register_proxy(
         selection.last_error
         and not selection.proxy
         and selection.source != "direct"
-        and selection.count > 0
         and selection.wait_retriable
     ):
-        renew_register_proxy(selection)
         _set_worker_state(
             index,
             status="waiting_proxy",
@@ -1364,13 +1277,12 @@ def _wait_for_register_proxy(
             proxy_count=selection.count,
             bind_account_proxy=selection.bind_to_account,
             selected_proxy_file=selection.selected_file,
-            proxy_lease_id=selection.lease_id,
             last_error=selection.last_error,
         )
         heartbeat_with_proxy(index, selection)
         now = time.monotonic()
         if now >= next_log_at:
-            step(index, f"注册代理暂不可用：{selection.last_error}，等待租约释放或更换可用代理", "yellow")
+            step(index, f"注册代理暂不可用：{selection.last_error}，等待代理来源恢复", "yellow")
             next_log_at = now + 10
         _check_task_control(stop_event, deadline)
         if stop_event is not None and stop_event.wait(1):
@@ -1410,19 +1322,15 @@ def worker(
             proxy_count=selection.count,
             bind_account_proxy=selection.bind_to_account,
             selected_proxy_file=selection.selected_file,
-            proxy_lease_id=selection.lease_id,
             last_error=selection.last_error,
         )
         step(index, f"注册代理来源={selection.source_label}，可用数量={selection.count}")
         if selection.last_error and not selection.proxy and selection.source != "direct":
             raise RuntimeError(f"register_proxy_unavailable: {selection.last_error}")
-        renew_register_proxy(selection)
         _check_task_control(stop_event, deadline)
         _check_run_active(run_id)
-        registrar = PlatformRegistrar(selection.proxy, stop_event=stop_event, deadline=deadline, proxy_lease_id=selection.lease_id)
-        renew_register_proxy(selection)
+        registrar = PlatformRegistrar(selection.proxy, stop_event=stop_event, deadline=deadline)
         result = registrar.register(index)
-        renew_register_proxy(selection)
         _check_task_control(stop_event, deadline)
         _check_run_active(run_id)
         if selection.bind_to_account and selection.proxy:
@@ -1430,13 +1338,11 @@ def worker(
         result["image_quota_unknown"] = True
         cost = time.time() - start
         access_token = str(result["access_token"])
-        renew_register_proxy(selection)
         _check_task_control(stop_event, deadline)
         _check_run_active(run_id)
         account_service.add_account_items([result])
         saved_access_token = access_token
         try:
-            renew_register_proxy(selection)
             _check_task_control(stop_event, deadline)
             _check_run_active(run_id)
         except RegisterStopped:
@@ -1444,9 +1350,7 @@ def worker(
             saved_access_token = ""
             raise
         try:
-            renew_register_proxy(selection)
             refresh_result = account_service.refresh_accounts([access_token], defer_invalid_removal=False)
-            renew_register_proxy(selection)
             _check_run_active(run_id)
         except RegisterStopped:
             account_service.delete_accounts([access_token])

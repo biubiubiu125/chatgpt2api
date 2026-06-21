@@ -167,15 +167,6 @@ def create_router(app_version: str) -> APIRouter:
             "status": proxy_settings.get_runtime_status(),
         }
 
-    @router.post("/api/proxy/runtime/failures/reset")
-    async def reset_proxy_runtime_failures_endpoint(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        cleared = proxy_settings.reset_proxy_failures()
-        return {
-            "cleared": cleared,
-            "status": proxy_settings.get_runtime_status(),
-        }
-
     @router.post("/api/proxy/clearance/test")
     async def test_proxy_clearance_endpoint(body: ClearanceTestRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)

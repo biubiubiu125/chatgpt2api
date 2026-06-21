@@ -9,21 +9,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from curl_cffi import requests
-
-from services.config import DATA_DIR
-from services.proxy_service import normalize_proxy_url, test_proxy
+from services.proxy_service import normalize_proxy_url
 
 
-PROXY_INPUT_MODES = {"single", "url", "text", "proxy_checker_dir"}
+PROXY_INPUT_MODES = {"single", "proxy_checker_dir"}
 DEFAULT_PROXY_CHECKER_DIR = "/opt/proxy-checker/repo_data"
 DEFAULT_PROXY_CHECKER_PATTERN = "user_*.txt"
 DEFAULT_PROXY_REFRESH_INTERVAL = 120
-DEFAULT_PROXY_LEASE_SECONDS = 120
-DEFAULT_PROXY_FAILURE_THRESHOLD = 2
-DEFAULT_PROXY_BLACKLIST_SECONDS = 900
-REGISTER_PROXY_CONNECT_TIMEOUT_SECONDS = 2.0
-REGISTER_PROXY_MAX_LATENCY_MS = 2000
+
+
 @dataclass
 class RegisterProxySelection:
     proxy: str = ""
@@ -31,7 +25,6 @@ class RegisterProxySelection:
     source_label: str = "direct"
     count: int = 0
     proxy_index: int = -1
-    lease_id: str = ""
     bind_to_account: bool = False
     selected_file: str = ""
     last_error: str = ""
@@ -84,64 +77,41 @@ def classify_register_failure(error: object) -> str:
 
 class RegisterProxyPool:
     def __init__(self, state_file: Path | None = None) -> None:
+        self._state_file = state_file
         self._lock = threading.RLock()
-        self._state_file = state_file or DATA_DIR / "register_proxy_state.json"
         self._mode = "single"
         self._single_proxy = ""
-        self._proxy_url = ""
-        self._proxy_list_text = ""
         self._proxy_checker_dir = DEFAULT_PROXY_CHECKER_DIR
         self._proxy_checker_pattern = DEFAULT_PROXY_CHECKER_PATTERN
         self._refresh_interval = DEFAULT_PROXY_REFRESH_INTERVAL
-        self._lease_seconds = DEFAULT_PROXY_LEASE_SECONDS
-        self._bind_url = False
-        self._bind_text = False
         self._bind_proxy_checker = True
-        self._failure_threshold = DEFAULT_PROXY_FAILURE_THRESHOLD
-        self._blacklist_seconds = DEFAULT_PROXY_BLACKLIST_SECONDS
-        self._success_clear_failures = True
         self._proxies: list[str] = []
         self._proxy_index = 0
         self._last_fetch = 0.0
         self._last_error = ""
         self._selected_file = ""
-        self._proxy_state = self._load_state()
-        self._lease_seq = 0
+        self._load_state()
 
     def configure(self, cfg: dict[str, Any]) -> None:
         with self._lock:
             next_mode = normalize_proxy_input_mode(cfg.get("proxy_input_mode"))
             next_single_proxy = normalize_proxy_url(str(cfg.get("proxy") or ""))
-            next_proxy_url = str(cfg.get("proxy_url") or "").strip()
-            next_proxy_list_text = str(cfg.get("proxy_list_text") or "")
             next_proxy_checker_dir = str(cfg.get("proxy_checker_dir") or DEFAULT_PROXY_CHECKER_DIR).strip()
             next_proxy_checker_pattern = str(cfg.get("proxy_checker_pattern") or DEFAULT_PROXY_CHECKER_PATTERN).strip()
-            source_changed = (
-                next_mode != self._mode
-                or next_single_proxy != self._single_proxy
-                or next_proxy_url != self._proxy_url
-                or next_proxy_list_text != self._proxy_list_text
-                or next_proxy_checker_dir != self._proxy_checker_dir
-                or next_proxy_checker_pattern != self._proxy_checker_pattern
-            )
+            current_source_key = self._source_key(self._mode, self._single_proxy, self._proxy_checker_dir, self._proxy_checker_pattern)
+            next_source_key = self._source_key(next_mode, next_single_proxy, next_proxy_checker_dir, next_proxy_checker_pattern)
+            source_changed = next_source_key != current_source_key
             self._mode = next_mode
             self._single_proxy = next_single_proxy
-            self._proxy_url = next_proxy_url
-            self._proxy_list_text = next_proxy_list_text
             self._proxy_checker_dir = next_proxy_checker_dir
             self._proxy_checker_pattern = next_proxy_checker_pattern
             self._refresh_interval = self._positive_int(cfg.get("proxy_refresh_interval"), DEFAULT_PROXY_REFRESH_INTERVAL)
-            self._lease_seconds = self._positive_int(cfg.get("proxy_lease_seconds"), DEFAULT_PROXY_LEASE_SECONDS)
-            self._bind_url = bool(cfg.get("proxy_bind_url"))
-            self._bind_text = bool(cfg.get("proxy_bind_text"))
             self._bind_proxy_checker = bool(cfg.get("proxy_bind_proxy_checker", True))
-            self._failure_threshold = self._positive_int(cfg.get("proxy_failure_threshold"), DEFAULT_PROXY_FAILURE_THRESHOLD)
-            self._blacklist_seconds = self._positive_int(cfg.get("proxy_blacklist_seconds"), DEFAULT_PROXY_BLACKLIST_SECONDS)
-            self._success_clear_failures = bool(cfg.get("proxy_success_clear_failures", True))
             if source_changed:
                 self._proxies = []
                 self._proxy_index = 0
                 self._selected_file = ""
+                self._save_state_locked()
             self._last_fetch = 0.0
             self._last_error = ""
 
@@ -151,242 +121,105 @@ class RegisterProxyPool:
 
     def next_proxy(self) -> RegisterProxySelection:
         with self._lock:
-            self._refresh_locked(force=False)
-            if self._mode == "single" and not self._single_proxy:
+            self._refresh_locked(force=self._mode == "proxy_checker_dir" and not self._proxies)
+            if self._mode == "single":
+                if not self._single_proxy:
+                    return RegisterProxySelection(source="direct", source_label="直连", count=0)
                 return RegisterProxySelection(
-                    source="direct",
-                    source_label="直连",
-                    count=0,
+                    proxy=self._single_proxy,
+                    source="single",
+                    source_label=self._source_label(),
+                    count=1,
+                    proxy_index=0,
                     bind_to_account=False,
+                    last_error=self._last_error,
                 )
-            proxy, index = self._next_available_proxy_locked()
-            if not proxy:
+
+            if not self._proxies:
                 return RegisterProxySelection(
                     source=self._mode,
                     source_label=self._source_label(),
-                    count=len(self._proxies),
+                    count=0,
                     selected_file=self._selected_file,
-                    wait_retriable=self._has_active_retry_window_locked(),
                     last_error=self._last_error or "没有可用注册代理",
+                    wait_retriable=self._mode == "proxy_checker_dir",
                 )
-            self._lease_seq += 1
-            lease_id = f"{int(time.time())}-{self._lease_seq}"
-            item = self._state_for(proxy)
-            item["lease_until"] = time.time() + self._lease_seconds
-            item["lease_id"] = lease_id
-            self._save_state_locked()
+
+            index = self._proxy_index % len(self._proxies)
+            proxy = self._proxies[index]
+            self._proxy_index = (index + 1) % len(self._proxies)
             return RegisterProxySelection(
                 proxy=proxy,
                 source=self._mode,
                 source_label=self._source_label(),
                 count=len(self._proxies),
                 proxy_index=index,
-                lease_id=lease_id,
                 bind_to_account=self._should_bind_account(),
                 selected_file=self._selected_file,
                 last_error=self._last_error,
             )
 
     def report(self, selection: RegisterProxySelection | None, ok: bool, reason: str = "", error: object = "") -> None:
-        if selection is None or not selection.proxy:
-            return
-        original_reason = str(reason or "") or classify_register_failure(error)
-        proxy = selection.proxy
-        with self._lock:
-            item = self._state_for(proxy)
-            if original_reason == "stopped":
-                self._release_selection_locked(item, selection)
-                self._save_state_locked()
-                return
-            if ok:
-                self._release_selection_locked(item, selection)
-                item["last_success_at"] = time.time()
-                if self._success_clear_failures:
-                    item["failure_count"] = 0
-                    item.pop("cooldown_until", None)
-                    item.pop("blacklist_until", None)
-                    item.pop("blacklisted", None)
-                self._save_state_locked()
-                return
-
-        probe = self._probe_proxy_connectivity(proxy)
-
-        with self._lock:
-            item = self._state_for(proxy)
-            self._release_selection_locked(item, selection)
-            item["last_proxy_probe_at"] = time.time()
-            item["last_proxy_probe_ok"] = bool(probe.get("ok"))
-            item["last_proxy_probe_latency_ms"] = int(probe.get("latency_ms") or 0)
-            item["last_proxy_probe_error"] = str(probe.get("error") or "")[:500]
-            if probe.get("ok"):
-                item["last_non_proxy_failure_at"] = time.time()
-                item["last_non_proxy_failure_reason"] = original_reason
-                item["last_error"] = str(error or "")[:500]
-                item.pop("failure_count", None)
-                item.pop("cooldown_until", None)
-                item.pop("blacklist_until", None)
-                item.pop("blacklisted", None)
-                self._save_state_locked()
-                return
-            failure_reason = "proxy_connect_failed"
-            failure_count = int(item.get("failure_count") or 0) + 1
-            item["failure_count"] = failure_count
-            item["last_failure_at"] = time.time()
-            item["last_failure_reason"] = failure_reason
-            item["last_error"] = str(error or "")[:500]
-            item.pop("cooldown_until", None)
-            if failure_count >= self._failure_threshold:
-                item.pop("blacklisted", None)
-                item["blacklist_until"] = time.time() + self._blacklist_seconds
-            self._save_state_locked()
-
-    def release(self, proxy: object, lease_id: object = "") -> bool:
-        proxy_url = normalize_proxy_url(str(proxy or "").strip())
-        if not proxy_url:
-            return False
-        with self._lock:
-            item = self._proxy_state.get(proxy_url)
-            if not isinstance(item, dict):
-                return False
-            current_lease_id = str(item.get("lease_id") or "")
-            expected_lease_id = str(lease_id or "")
-            if expected_lease_id and current_lease_id and current_lease_id != expected_lease_id:
-                return False
-            had_lease = "lease_until" in item or "lease_id" in item
-            item.pop("lease_until", None)
-            item.pop("lease_id", None)
-            if had_lease:
-                self._save_state_locked()
-            return had_lease
-
-    def renew(self, proxy: object, lease_id: object = "") -> bool:
-        proxy_url = normalize_proxy_url(str(proxy or "").strip())
-        if not proxy_url:
-            return False
-        expected_lease_id = str(lease_id or "")
-        if not expected_lease_id:
-            return False
-        with self._lock:
-            item = self._proxy_state.get(proxy_url)
-            if not item:
-                return False
-            if str(item.get("lease_id") or "") != expected_lease_id:
-                return False
-            item["lease_until"] = time.time() + self._lease_seconds
-            self._save_state_locked()
-            return True
-
-    def reset_blacklist(self) -> int:
-        with self._lock:
-            count = 0
-            for item in self._proxy_state.values():
-                reset_keys = (
-                    "failure_count",
-                    "cooldown_until",
-                    "blacklist_until",
-                    "blacklisted",
-                    "lease_until",
-                    "lease_id",
-                    "last_error",
-                    "last_failure_reason",
-                    "last_non_proxy_failure_reason",
-                )
-                if any(key in item for key in reset_keys):
-                    count += 1
-                for key in (
-                    "failure_count",
-                    "cooldown_until",
-                    "blacklist_until",
-                    "blacklisted",
-                    "lease_until",
-                    "lease_id",
-                    "last_error",
-                    "last_failure_reason",
-                    "last_non_proxy_failure_at",
-                    "last_non_proxy_failure_reason",
-                ):
-                    item.pop(key, None)
-            self._save_state_locked()
-            return count
+        return None
 
     def state(self) -> dict[str, Any]:
         with self._lock:
-            now = time.time()
-            leased = 0
-            blacklisted = 0
-            blacklist_until = 0
-            changed = False
-            for proxy in self._proxies:
-                item = self._proxy_state.get(proxy) or {}
-                if float(item.get("lease_until") or 0) > now:
-                    leased += 1
-                item_blacklist_until, item_changed = self._effective_blacklist_until_locked(item, now)
-                changed = changed or item_changed
-                if item_blacklist_until > now:
-                    blacklisted += 1
-                    blacklist_until = max(blacklist_until, item_blacklist_until)
-            if changed:
-                self._save_state_locked()
+            count = len(self._proxies) if self._mode != "single" else (1 if self._single_proxy else 0)
+            using_cached = self._mode == "proxy_checker_dir" and count > 0 and bool(self._last_error)
+            wait_retriable = self._mode == "proxy_checker_dir" and count == 0
+            if wait_retriable:
+                status = "waiting"
+                usage_label = "等待代理"
+            elif using_cached:
+                status = "cached"
+                usage_label = "使用上一轮代理"
+            elif self._mode == "single":
+                status = "ready" if count else "direct"
+                usage_label = "单代理" if count else "直连"
+            else:
+                status = "ready"
+                usage_label = "直接轮询"
             return {
                 "mode": self._mode,
                 "source_label": self._source_label(),
-                "count": len(self._proxies) if self._mode != "single" else (1 if self._single_proxy else 0),
+                "count": count,
                 "last_error": self._last_error,
                 "last_fetch": int(self._last_fetch) if self._last_fetch else 0,
                 "selected_file": self._selected_file,
-                "leased_count": leased,
-                "blacklist_count": blacklisted,
-                "blacklist_until": int(blacklist_until) if blacklist_until else 0,
+                "status": status,
+                "usage_label": usage_label,
+                "using_cached": using_cached,
+                "wait_retriable": wait_retriable,
             }
 
     def _refresh_locked(self, force: bool) -> None:
         if self._mode == "single":
             self._proxies = [self._single_proxy] if self._single_proxy else []
             self._last_fetch = time.time()
+            self._selected_file = ""
             self._last_error = ""
-            return
-        if self._mode == "text":
-            self._proxies = parse_proxy_lines(self._proxy_list_text)
-            self._last_fetch = time.time()
-            self._last_error = "" if self._proxies else "手动代理列表为空"
             return
         if not force and self._last_fetch and time.time() - self._last_fetch < self._refresh_interval:
             return
-        if self._mode == "url":
-            self._refresh_url_locked()
-        elif self._mode == "proxy_checker_dir":
+        if self._mode == "proxy_checker_dir":
             self._refresh_proxy_checker_dir_locked()
-
-    def _refresh_url_locked(self) -> None:
-        self._last_fetch = time.time()
-        if not self._proxy_url:
-            self._proxies = []
-            self._last_error = "代理列表 URL 为空"
-            return
-        try:
-            resp = requests.get(self._proxy_url, timeout=15, verify=False, impersonate="chrome")
-            if resp.status_code != 200:
-                raise RuntimeError(f"HTTP {resp.status_code}")
-            proxies = parse_proxy_lines(resp.text)
-            if not proxies:
-                raise RuntimeError("代理列表为空")
-            self._proxies = proxies
-            self._last_error = ""
-        except Exception as exc:
-            self._last_error = f"拉取代理列表失败: {exc}"
 
     def _refresh_proxy_checker_dir_locked(self) -> None:
         self._last_fetch = time.time()
         base = Path(self._proxy_checker_dir)
         if not base.exists() or not base.is_dir():
-            self._proxies = []
-            self._selected_file = ""
+            if self._proxies:
+                self._last_error = f"Proxy Checker 目录不存在，继续使用上一轮代理: {base}"
+                return
             self._last_error = f"Proxy Checker 目录不存在: {base}"
             return
         pattern = self._proxy_checker_pattern or DEFAULT_PROXY_CHECKER_PATTERN
         try:
             raw_candidates = [Path(path) for path in glob.glob(str(base / pattern))]
         except Exception as exc:
+            if self._proxies:
+                self._last_error = f"读取 Proxy Checker 目录失败，继续使用上一轮代理: {exc}"
+                return
             self._last_error = f"读取 Proxy Checker 目录失败: {exc}"
             return
 
@@ -437,140 +270,71 @@ class RegisterProxyPool:
         self._proxies = proxies
         self._selected_file = str(selected)
         self._last_error = ""
+        self._save_state_locked()
 
-    def _next_available_proxy_locked(self) -> tuple[str, int]:
-        if not self._proxies:
-            return "", -1
-        now = time.time()
-        count = len(self._proxies)
-        leased = 0
-        blacklisted = 0
-        for offset in range(count):
-            index = (self._proxy_index + offset) % count
-            proxy = self._proxies[index]
-            item = self._proxy_state.get(proxy) or {}
-            if float(item.get("lease_until") or 0) > now:
-                leased += 1
-                continue
-            item_blacklist_until, item_changed = self._effective_blacklist_until_locked(item, now)
-            if item_changed:
-                self._save_state_locked()
-            if item_blacklist_until > now:
-                blacklisted += 1
-                continue
-            self._proxy_index = (index + 1) % count
-            return proxy, index
-        if leased and not blacklisted:
-            self._last_error = "all register proxies are leased"
-        elif leased:
-            self._last_error = "all register proxies are leased or blacklisted"
-        else:
-            self._last_error = "all register proxies are blacklisted"
-        return "", -1
+    def _load_state(self) -> None:
+        if self._state_file is None:
+            return
+        try:
+            data = json.loads(self._state_file.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        proxies = parse_proxy_lines("\n".join(data.get("proxies") or []))
+        if not proxies:
+            return
+        self._mode = normalize_proxy_input_mode(data.get("mode"))
+        self._proxy_checker_dir = str(data.get("proxy_checker_dir") or DEFAULT_PROXY_CHECKER_DIR).strip()
+        self._proxy_checker_pattern = str(data.get("proxy_checker_pattern") or DEFAULT_PROXY_CHECKER_PATTERN).strip()
+        self._proxies = proxies
+        self._selected_file = str(data.get("selected_file") or "")
 
-    def _has_active_retry_window_locked(self) -> bool:
-        now = time.time()
-        changed = False
-        for proxy in self._proxies:
-            item = self._proxy_state.get(proxy) or {}
-            if float(item.get("lease_until") or 0) > now:
-                return True
-            blacklist_until, item_changed = self._effective_blacklist_until_locked(item, now)
-            changed = changed or item_changed
-            if blacklist_until > now:
-                if changed:
-                    self._save_state_locked()
-                return True
-        if changed:
-            self._save_state_locked()
-        return False
+    def _save_state_locked(self) -> None:
+        if self._state_file is None:
+            return
+        if self._mode != "proxy_checker_dir" or not self._proxies:
+            try:
+                self._state_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
+        try:
+            self._state_file.parent.mkdir(parents=True, exist_ok=True)
+            self._state_file.write_text(
+                json.dumps(
+                    {
+                        "mode": self._mode,
+                        "proxy_checker_dir": self._proxy_checker_dir,
+                        "proxy_checker_pattern": self._proxy_checker_pattern,
+                        "selected_file": self._selected_file,
+                        "proxies": self._proxies,
+                        "saved_at": int(time.time()),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
     def _source_label(self) -> str:
         return {
             "single": "单代理",
-            "url": "代理列表 URL",
-            "text": "手动代理列表",
             "proxy_checker_dir": "Proxy Checker 目录",
         }.get(self._mode, self._mode)
 
     def _should_bind_account(self) -> bool:
-        if self._mode == "url":
-            return self._bind_url
-        if self._mode == "text":
-            return self._bind_text
-        if self._mode == "proxy_checker_dir":
-            return self._bind_proxy_checker
-        return False
+        return self._mode == "proxy_checker_dir" and self._bind_proxy_checker
 
     @staticmethod
-    def _effective_blacklist_until_locked(item: dict[str, Any], now: float) -> tuple[float, bool]:
-        blacklist_until = float(item.get("blacklist_until") or 0)
-        if blacklist_until > now:
-            return blacklist_until, False
-        changed = False
-        if blacklist_until:
-            item.pop("blacklist_until", None)
-            item.pop("failure_count", None)
-            item.pop("last_error", None)
-            changed = True
-        if bool(item.get("blacklisted")):
-            item.pop("blacklisted", None)
-            item.pop("failure_count", None)
-            item.pop("last_error", None)
-            changed = True
-        return 0.0, changed
-
-    @staticmethod
-    def _probe_proxy_connectivity(proxy: str) -> dict[str, Any]:
-        result = test_proxy(proxy, timeout=REGISTER_PROXY_CONNECT_TIMEOUT_SECONDS)
-        latency_ms = int(result.get("latency_ms") or 0)
-        result = dict(result)
-        try:
-            status = int(result.get("status") or 0)
-        except (TypeError, ValueError):
-            status = 0
-        connected = status != 407 and (bool(result.get("ok")) or (status > 0 and status < 600))
-        ok = connected and latency_ms <= REGISTER_PROXY_MAX_LATENCY_MS
-        if connected and not ok:
-            result["error"] = f"proxy latency {latency_ms}ms exceeds {REGISTER_PROXY_MAX_LATENCY_MS}ms"
-        elif status == 407:
-            result["error"] = result.get("error") or "HTTP 407"
-        result["ok"] = ok
-        return result
-
-    def _state_for(self, proxy: str) -> dict[str, Any]:
-        item = self._proxy_state.get(proxy)
-        if not isinstance(item, dict):
-            item = {}
-            self._proxy_state[proxy] = item
-        return item
-
-    @staticmethod
-    def _release_selection_locked(item: dict[str, Any], selection: RegisterProxySelection) -> bool:
-        current_lease_id = str(item.get("lease_id") or "")
-        expected_lease_id = str(selection.lease_id or "")
-        if expected_lease_id:
-            if current_lease_id != expected_lease_id:
-                return False
-        elif current_lease_id:
-            return False
-        had_lease = "lease_until" in item or "lease_id" in item
-        item.pop("lease_until", None)
-        item.pop("lease_id", None)
-        return had_lease
-
-    def _load_state(self) -> dict[str, dict[str, Any]]:
-        try:
-            data = json.loads(self._state_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return {str(key): value for key, value in data.items() if isinstance(value, dict)}
-        except Exception:
-            pass
-        return {}
-
-    def _save_state_locked(self) -> None:
-        self._state_file.parent.mkdir(parents=True, exist_ok=True)
-        self._state_file.write_text(json.dumps(self._proxy_state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    def _source_key(mode: str, single_proxy: str, proxy_checker_dir: str, proxy_checker_pattern: str) -> tuple[str, ...]:
+        normalized_mode = normalize_proxy_input_mode(mode)
+        if normalized_mode == "single":
+            return (normalized_mode, single_proxy)
+        return (normalized_mode, proxy_checker_dir, proxy_checker_pattern)
 
     @staticmethod
     def _positive_int(value: object, default: int) -> int:
@@ -579,13 +343,13 @@ class RegisterProxyPool:
         except Exception:
             return default
 
-register_proxy_pool = RegisterProxyPool()
+
+register_proxy_pool = RegisterProxyPool(Path(__file__).resolve().parents[2] / "data" / "register_proxy_state.json")
 
 
 __all__ = [
     "DEFAULT_PROXY_CHECKER_DIR",
     "DEFAULT_PROXY_CHECKER_PATTERN",
-    "DEFAULT_PROXY_LEASE_SECONDS",
     "DEFAULT_PROXY_REFRESH_INTERVAL",
     "PROXY_INPUT_MODES",
     "RegisterProxySelection",

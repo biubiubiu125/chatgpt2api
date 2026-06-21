@@ -1,7 +1,6 @@
 "use client";
 
 import { AlertTriangle, LoaderCircle, Plus, Play, RotateCcw, Save, Square, Trash2, UserPlus } from "lucide-react";
-import { useEffect, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -14,34 +13,8 @@ import type { RegisterConfig } from "@/lib/api";
 import { useSettingsStore } from "../../settings/store";
 
 type RegisterProxyPoolStats = NonNullable<RegisterConfig["stats"]["proxy_pool"]>;
-type RegisterWorkerState = {
-  index?: number | string;
-  status?: string;
-  step?: string;
-  last_error?: string;
-  failure_reason?: string;
-  proxy?: string;
-  proxy_source?: string;
-  started_at?: string;
-};
-
-function maskProxy(value: unknown) {
-  const text = String(value || "");
-  if (!text) return "";
-  return text.replace(/:\/\/([^:@/]+):([^@/]+)@/, "://$1:***@");
-}
-
-function workerMessage(worker: RegisterWorkerState) {
-  const status = String(worker.status || "");
-  const errorFirst = ["failed", "stopped", "waiting_proxy"].includes(status);
-  if (errorFirst) {
-    return String(worker.last_error || worker.failure_reason || worker.step || "");
-  }
-  return String(worker.step || worker.last_error || worker.failure_reason || "");
-}
 
 export function RegisterCard() {
-  const [nowMs, setNowMs] = useState(() => Date.now());
   const config = useSettingsStore((state) => state.registerConfig);
   const isLoading = useSettingsStore((state) => state.isLoadingRegister);
   const isSaving = useSettingsStore((state) => state.isSavingRegister);
@@ -62,15 +35,6 @@ export function RegisterCard() {
   const toggle = useSettingsStore((state) => state.toggleRegister);
   const reset = useSettingsStore((state) => state.resetRegister);
   const resetOutlookPool = useSettingsStore((state) => state.resetOutlookPool);
-  const resetRegisterProxyBlacklist = useSettingsStore((state) => state.resetRegisterProxyBlacklist);
-  const blacklistUntil = Number(config?.stats?.proxy_pool?.blacklist_until || 0);
-
-  useEffect(() => {
-    if (!blacklistUntil || blacklistUntil * 1000 <= Date.now()) return;
-    setNowMs(Date.now());
-    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [blacklistUntil]);
 
   if (isLoading) {
     return (
@@ -87,10 +51,8 @@ export function RegisterCard() {
   const logs = config.logs || [];
   const proxyMode = config.proxy_input_mode || "single";
   const proxyPool: RegisterProxyPoolStats = stats.proxy_pool || {};
-  const blacklistRemainingSeconds = blacklistUntil
-    ? Math.max(0, Math.ceil((blacklistUntil * 1000 - nowMs) / 1000))
-    : 0;
-  const workers: RegisterWorkerState[] = (stats.workers || []) as RegisterWorkerState[];
+  const proxyPoolUsageLabel =
+    proxyPool.usage_label || (proxyMode === "single" ? ((proxyPool.count || 0) > 0 ? "单代理" : "直连") : "直接轮询");
   const fieldValue = (value: unknown, fallback: number | string) => value ?? fallback;
   const setRegisterTextField = (key: keyof RegisterConfig, value: string) => {
     setRegisterField(key, value as RegisterConfig[keyof RegisterConfig]);
@@ -173,8 +135,6 @@ export function RegisterCard() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="single">单代理</SelectItem>
-                  <SelectItem value="url">代理列表 URL</SelectItem>
-                  <SelectItem value="text">手动代理列表</SelectItem>
                   <SelectItem value="proxy_checker_dir">Proxy Checker 目录</SelectItem>
                 </SelectContent>
               </Select>
@@ -201,18 +161,6 @@ export function RegisterCard() {
 
           <div className="space-y-3 rounded-xl border border-stone-200 bg-white/60 p-3">
             <div className="grid gap-4 md:grid-cols-2">
-              {proxyMode === "url" ? (
-                <div className="space-y-2 md:col-span-2">
-                  <label className="text-sm text-stone-700">代理列表 URL</label>
-                  <Input value={String(config.proxy_url || "")} onChange={(event) => setRegisterTextField("proxy_url", event.target.value)} placeholder="https://example.com/proxies.txt" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
-                </div>
-              ) : null}
-              {proxyMode === "text" ? (
-                <div className="space-y-2 md:col-span-2">
-                  <label className="text-sm text-stone-700">手动代理列表</label>
-                  <Textarea value={String(config.proxy_list_text || "")} onChange={(event) => setRegisterTextField("proxy_list_text", event.target.value)} placeholder="每行一个代理" className="min-h-24 rounded-xl border-stone-200 bg-white font-mono text-xs" disabled={config.enabled} />
-                </div>
-              ) : null}
               {proxyMode === "proxy_checker_dir" ? (
                 <>
                   <div className="space-y-2">
@@ -237,40 +185,12 @@ export function RegisterCard() {
                 <label className="text-sm text-stone-700">代理刷新间隔（秒）</label>
                 <Input value={String(fieldValue(config.proxy_refresh_interval, 120))} onChange={(event) => setRegisterNumberField("proxy_refresh_interval", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
               </div>
-              <div className="space-y-2">
-                <label className="text-sm text-stone-700">代理租约（秒）</label>
-                <Input value={String(fieldValue(config.proxy_lease_seconds, 120))} onChange={(event) => setRegisterNumberField("proxy_lease_seconds", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm text-stone-700">连续失败拉黑次数</label>
-                <Input value={String(fieldValue(config.proxy_failure_threshold, 2))} onChange={(event) => setRegisterNumberField("proxy_failure_threshold", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm text-stone-700">拉黑冷却（秒）</label>
-                <Input value={String(fieldValue(config.proxy_blacklist_seconds, 900))} onChange={(event) => setRegisterNumberField("proxy_blacklist_seconds", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
-              </div>
             </div>
             <div className="grid gap-2 md:grid-cols-2">
               <label className="flex items-center gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2 text-sm text-stone-700">
                 <Checkbox checked={Boolean(config.mail?.api_use_register_proxy ?? true)} onCheckedChange={(checked) => setRegisterField("mail", { ...config.mail, api_use_register_proxy: Boolean(checked) })} disabled={config.enabled} />
                 邮箱 API 使用注册代理
               </label>
-              <label className="flex items-center gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2 text-sm text-stone-700">
-                <Checkbox checked={Boolean(config.proxy_success_clear_failures ?? true)} onCheckedChange={(checked) => setRegisterBooleanField("proxy_success_clear_failures", Boolean(checked))} disabled={config.enabled} />
-                成功后清除代理失败计数
-              </label>
-              {proxyMode === "url" ? (
-                <label className="flex items-center gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2 text-sm text-stone-700">
-                  <Checkbox checked={Boolean(config.proxy_bind_url)} onCheckedChange={(checked) => setRegisterBooleanField("proxy_bind_url", Boolean(checked))} disabled={config.enabled} />
-                  URL 代理注册成功后绑定账号
-                </label>
-              ) : null}
-              {proxyMode === "text" ? (
-                <label className="flex items-center gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2 text-sm text-stone-700">
-                  <Checkbox checked={Boolean(config.proxy_bind_text)} onCheckedChange={(checked) => setRegisterBooleanField("proxy_bind_text", Boolean(checked))} disabled={config.enabled} />
-                  手动代理注册成功后绑定账号
-                </label>
-              ) : null}
               {proxyMode === "proxy_checker_dir" ? (
                 <label className="flex items-center gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2 text-sm text-stone-700">
                   <Checkbox checked={Boolean(config.proxy_bind_proxy_checker ?? true)} onCheckedChange={(checked) => setRegisterBooleanField("proxy_bind_proxy_checker", Boolean(checked))} disabled={config.enabled} />
@@ -583,11 +503,8 @@ export function RegisterCard() {
                 <div className="mt-1 font-medium text-stone-800">{proxyPool.count || 0}</div>
               </div>
               <div>
-                <div className="text-stone-400">租约 / 黑名单</div>
-                <div className="mt-1 font-medium text-stone-800">
-                  {proxyPool.leased_count || 0} / {proxyPool.blacklist_count || 0}
-                  {blacklistRemainingSeconds ? `，${blacklistRemainingSeconds} 秒后恢复` : ""}
-                </div>
+                <div className="text-stone-400">取用方式</div>
+                <div className="mt-1 font-medium text-stone-800">{proxyPoolUsageLabel}</div>
               </div>
               <div>
                 <div className="text-stone-400">当前文件</div>
@@ -609,23 +526,6 @@ export function RegisterCard() {
                 保存
               </Button>
             </div>
-            <Button variant="outline" className="h-9 rounded-xl border-stone-200 bg-white px-3 text-stone-700" onClick={() => void resetRegisterProxyBlacklist()} disabled={isSaving || config.enabled}>
-              <RotateCcw className="size-4" />
-              重置注册代理黑名单/租约状态
-            </Button>
-            {workers.length ? (
-              <div className="max-h-36 overflow-y-auto border border-stone-200 bg-white/70 p-3 text-xs text-stone-600">
-                {workers.map((worker, index) => (
-                  <div key={`${String(worker.started_at || "")}-${index}`} className="flex gap-2 border-b border-stone-100 py-1 last:border-b-0">
-                    <span className="w-12 text-stone-400">#{String(worker.index || index + 1)}</span>
-                    <span className="w-16">{String(worker.status || "running")}</span>
-                    <span className="min-w-0 flex-1 truncate">{workerMessage(worker)}</span>
-                    <span className="w-24 truncate text-right">{String(worker.proxy_source || "")}</span>
-                    <span className="w-44 truncate text-right">{maskProxy(worker.proxy)}</span>
-                  </div>
-                ))}
-              </div>
-            ) : null}
             <div className="flex items-center gap-2 border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
               <AlertTriangle className="size-4 shrink-0" />
               启动之前注意先保存配置。

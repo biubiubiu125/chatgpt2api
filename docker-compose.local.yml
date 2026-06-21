@@ -10,6 +10,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json
+      - /opt/proxy-checker/repo_data:/opt/proxy-checker/repo_data:ro
     environment:
       STORAGE_BACKEND: sqlite
       DATABASE_URL: sqlite:////app/data/accounts.db
