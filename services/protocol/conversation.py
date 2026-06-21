@@ -17,6 +17,7 @@ from services.account_service import account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
+from services.proxy_service import is_proxy_transport_error, record_backend_proxy_result
 from utils.helper import (
     IMAGE_MODELS,
     extract_image_from_message_content,
@@ -104,6 +105,14 @@ def is_connection_timeout_error(message: str) -> bool:
         or "read timed out" in text
         or "connect timeout" in text
     )
+
+
+def is_proxy_failure_error(message: str) -> bool:
+    return is_proxy_transport_error(message)
+
+
+def _record_backend_proxy_result(backend: object, ok: bool) -> None:
+    record_backend_proxy_result(backend, ok)
 
 
 def image_stream_error_message(message: str) -> str:
@@ -815,6 +824,7 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             raise RuntimeError("no available text account")
         if token:
             attempted_tokens.add(token)
+        active_backend: OpenAIBackendAPI | None = None
         try:
             active_backend = OpenAIBackendAPI(access_token=token)
             for event in conversation_events(active_backend, messages=request.messages, model=request.model, prompt=request.prompt):
@@ -824,10 +834,13 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 if delta:
                     emitted = True
                     yield delta
+            _record_backend_proxy_result(active_backend, True)
             account_service.mark_text_used(token)
             return
         except Exception as exc:
             error_message = str(exc)
+            if active_backend is not None:
+                _record_backend_proxy_result(active_backend, not is_proxy_failure_error(error_message))
             if token and not emitted and is_token_invalid_error(error_message):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
                 if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
@@ -1363,12 +1376,10 @@ def _generate_single_image(
     MAX_TEXT_REPLY_RETRIES = 3
     MAX_TLS_RETRIES = 3
     MAX_CONN_TIMEOUT_RETRIES = 3
-    MAX_POLL_TIMEOUT_RETRIES = 4
 
     text_reply_retry_count = 0
     tls_retry_count = 0
     conn_timeout_retry_count = 0
-    poll_timeout_retry_count = 0
     account_email = ""
     current_token = str(access_token or "").strip()
     attempted_tokens: set[str] = {current_token} if current_token else set()
@@ -1435,6 +1446,7 @@ def _generate_single_image(
         account = account_service.get_account(token) or {}
         account_email = str(account.get("email") or "").strip()
         account_id = str(account.get("account_id") or account.get("user_id") or "").strip()
+        backend: object | None = None
 
         def attach_account_context(exc: Exception) -> None:
             if account_email and not getattr(exc, "account_email", ""):
@@ -1476,9 +1488,11 @@ def _generate_single_image(
                 returned_result = returned_result or output.kind == "result"
                 outputs.append(output)
             if returned_message:
+                _record_backend_proxy_result(backend, True)
                 release_current_token(False)
                 return outputs
             if not returned_result:
+                _record_backend_proxy_result(backend, True)
                 release_current_token(False)
                 if emitted_for_token:
                     conv_id = outputs[-1].conversation_id if outputs else ""
@@ -1492,35 +1506,30 @@ def _generate_single_image(
                         conversation_id=conv_id,
                     )
                 return outputs
+            _record_backend_proxy_result(backend, True)
             release_current_token(True)
             return outputs
         except ImagePollTimeoutError as exc:
             attach_account_context(exc)
-            if not emitted_for_token:
-                poll_timeout_retry_count += 1
-                if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
-                    if switch_token(False):
-                        logger.warning({
-                            "event": "image_poll_timeout_retry",
-                            "request_token": token,
-                            "account_email": account_email,
-                            "retry_count": poll_timeout_retry_count,
-                            "index": index,
-                            "error": str(exc)[:200],
-                        })
-                        continue
-                    release_current_token(False)
-                    raise
-                logger.warning({
-                    "event": "image_poll_timeout_exhausted_retries",
-                    "request_token": token,
-                    "account_email": account_email,
-                    "retry_count": poll_timeout_retry_count,
-                    "index": index,
-                })
-            release_current_token(False)
+            account_service.remove_abnormal_image_timeout_account(
+                token,
+                "image_poll_timeout",
+                str(exc),
+            )
+            if token_pool is not None:
+                token_pool.release(token)
+            current_token = ""
+            logger.warning({
+                "event": "image_poll_timeout_account_removed",
+                "request_token": token,
+                "account_email": account_email,
+                "index": index,
+                "emitted_for_token": emitted_for_token,
+                "error": str(exc)[:200],
+            })
             raise
         except ImageContentPolicyError as exc:
+            _record_backend_proxy_result(backend, True)
             release_current_token(False)
             logger.warning({
                 "event": "image_stream_content_policy_error",
@@ -1541,6 +1550,7 @@ def _generate_single_image(
         except ImageGenerationError as exc:
             attach_account_context(exc)
             error_text = str(exc)
+            _record_backend_proxy_result(backend, not is_proxy_failure_error(error_text))
             if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
                 text_reply_retry_count += 1
                 if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
@@ -1585,6 +1595,7 @@ def _generate_single_image(
             raise
         except Exception as exc:
             last_error = str(exc)
+            _record_backend_proxy_result(backend, not is_proxy_failure_error(last_error))
             logger.warning({
                 "event": "image_stream_fail",
                 "request_token": token,

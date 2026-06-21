@@ -12,13 +12,19 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 from curl_cffi import requests
 
 from services.account_service import account_service
 from services.proxy_service import ClearanceBundle, proxy_settings
 from services.register import mail_provider
+from services.register.proxy_pool import RegisterProxySelection, classify_register_failure, register_proxy_pool
+
+
+class RegisteredAccountValidationError(RuntimeError):
+    pass
+
 
 base_dir = Path(__file__).resolve().parent
 config = {
@@ -26,16 +32,32 @@ config = {
         "request_timeout": 30,
         "wait_timeout": 30,
         "wait_interval": 2,
+        "api_use_register_proxy": True,
         "providers": [],
     },
     "proxy": "",
+    "proxy_input_mode": "single",
+    "proxy_url": "",
+    "proxy_list_text": "",
+    "proxy_checker_dir": "/opt/proxy-checker/repo_data",
+    "proxy_checker_pattern": "user_*.txt",
+    "proxy_refresh_interval": 120,
+    "proxy_lease_seconds": 120,
+    "proxy_bind_url": False,
+    "proxy_bind_text": False,
+    "proxy_bind_proxy_checker": True,
+    "proxy_failure_threshold": 2,
+    "proxy_blacklist_seconds": 900,
+    "proxy_success_clear_failures": True,
+    "task_timeout_seconds": 300,
+    "task_stall_timeout_seconds": 60,
     "total": 10,
     "threads": 3,
 }
 register_config_file = base_dir.parents[1] / "data" / "register.json"
 try:
     saved_config = json.loads(register_config_file.read_text(encoding="utf-8"))
-    config.update({key: saved_config[key] for key in ("mail", "proxy", "total", "threads") if key in saved_config})
+    config.update({key: saved_config[key] for key in config if key in saved_config})
 except Exception:
     pass
 
@@ -57,6 +79,133 @@ print_lock = threading.Lock()
 stats_lock = threading.Lock()
 stats = {"done": 0, "success": 0, "fail": 0, "start_time": 0.0}
 register_log_sink = None
+worker_state_lock = threading.Lock()
+worker_states: dict[str, dict[str, Any]] = {}
+WORKER_STATE_ACTIVE_STATUSES = {"running", "waiting_proxy"}
+WORKER_STATE_HISTORY_LIMIT = 100
+active_run_id = ""
+active_run_lock = threading.Lock()
+worker_run_context = threading.local()
+
+
+class RegisterStopped(RuntimeError):
+    pass
+
+
+class RegisterTaskTimeout(RuntimeError):
+    pass
+
+
+class RegisterRunInvalidated(RegisterStopped):
+    pass
+
+
+def set_active_run_id(run_id: str) -> None:
+    global active_run_id
+    with active_run_lock:
+        active_run_id = str(run_id or "")
+
+
+def clear_active_run_id(run_id: str = "") -> None:
+    global active_run_id
+    with active_run_lock:
+        if not run_id or active_run_id == str(run_id):
+            active_run_id = ""
+
+
+def _check_run_active(run_id: str = "") -> None:
+    if not run_id:
+        return
+    with active_run_lock:
+        current = active_run_id
+    if current != str(run_id):
+        raise RegisterRunInvalidated("register_run_invalidated")
+
+
+def _current_worker_run_id() -> str:
+    return str(getattr(worker_run_context, "run_id", "") or "")
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _set_worker_state(index: int, **updates: Any) -> None:
+    key = str(index)
+    terminal = bool(updates.pop("_terminal", False))
+    force = bool(updates.pop("_force", False))
+    update_run_id = str(updates.pop("run_id", "") or _current_worker_run_id())
+    with worker_state_lock:
+        current = dict(worker_states.get(key) or {})
+        current_run_id = str(current.get("run_id") or "")
+        if update_run_id:
+            with active_run_lock:
+                active = active_run_id
+            if active and update_run_id != active and not force:
+                return
+            if current_run_id and current_run_id != update_run_id and not force:
+                return
+        if current.get("terminal") and not force:
+            return
+        if current.get("failure_reason") == "register_task_stalled" and updates.get("failure_reason") != "register_task_stalled":
+            return
+        current["index"] = index
+        if update_run_id:
+            current["run_id"] = update_run_id
+        current.update(updates)
+        if terminal:
+            current["terminal"] = True
+        current["updated_at"] = _utc_now()
+        worker_states[key] = current
+        _prune_worker_states_locked()
+
+
+def _worker_state_sort_key(key: str) -> tuple[int, str]:
+    return (int(key), key) if key.isdigit() else (-1, key)
+
+
+def _prune_worker_states_locked() -> None:
+    completed = [
+        key
+        for key, value in worker_states.items()
+        if str(value.get("status") or "") not in WORKER_STATE_ACTIVE_STATUSES
+    ]
+    overflow = len(completed) - WORKER_STATE_HISTORY_LIMIT
+    if overflow <= 0:
+        return
+    for key in sorted(completed, key=_worker_state_sort_key)[:overflow]:
+        worker_states.pop(key, None)
+
+
+def get_worker_states() -> list[dict[str, Any]]:
+    with worker_state_lock:
+        _prune_worker_states_locked()
+        return [dict(value) for _, value in sorted(worker_states.items(), key=lambda item: _worker_state_sort_key(item[0]))]
+
+
+def clear_worker_states() -> None:
+    with worker_state_lock:
+        worker_states.clear()
+
+
+def mark_worker_states_failed(indexes: list[int], reason: str, error: str) -> None:
+    for index in indexes:
+        _set_worker_state(index, status="failed", failure_reason=reason, last_error=error, _terminal=True)
+
+
+def mark_worker_states_stopped(indexes: list[int], error: str) -> None:
+    for index in indexes:
+        _set_worker_state(index, status="stopped", last_error=error, _terminal=True)
+
+
+def mark_worker_states_failed_for_run(indexes: list[int], run_id: str, reason: str, error: str) -> None:
+    for index in indexes:
+        _set_worker_state(index, status="failed", failure_reason=reason, last_error=error, run_id=run_id, _terminal=True)
+
+
+def mark_worker_states_stopped_for_run(indexes: list[int], run_id: str, error: str) -> None:
+    for index in indexes:
+        _set_worker_state(index, status="stopped", last_error=error, run_id=run_id, _terminal=True)
 
 common_headers = {
     "accept": "application/json",
@@ -122,7 +271,22 @@ def log(text: str, color: str = "") -> None:
 
 
 def step(index: int, text: str, color: str = "") -> None:
+    _set_worker_state(index, step=text, level=color or "info")
     log(f"[任务{index}] {text}", color)
+
+
+def heartbeat(index: int) -> None:
+    _set_worker_state(index)
+
+
+def renew_register_proxy(selection: RegisterProxySelection | None) -> None:
+    if selection is not None and selection.proxy and selection.lease_id:
+        register_proxy_pool.renew(selection.proxy, selection.lease_id)
+
+
+def heartbeat_with_proxy(index: int, selection: RegisterProxySelection | None) -> None:
+    renew_register_proxy(selection)
+    heartbeat(index)
 
 
 def _make_trace_headers() -> dict[str, str]:
@@ -172,6 +336,16 @@ def _response_json(resp) -> dict:
         return {}
 
 
+def _decode_jwt_payload(token: str) -> dict:
+    try:
+        payload = str(token or "").split(".")[1]
+        payload += "=" * ((4 - len(payload) % 4) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def _response_debug_detail(resp, limit: int = 800) -> str:
     if resp is None:
         return ""
@@ -203,23 +377,31 @@ def _is_cloudflare_challenge(resp) -> bool:
     text = str(getattr(resp, "text", "") or "").lower()
     return (
         "<title>just a moment" in text
+        or "just a moment" in text
         or "<title>attention required! | cloudflare" in text
+        or "attention required! | cloudflare" in text
+        or "cloudflare" in str(getattr(resp, "headers", {}).get("server") or "").lower()
         or "cf-chl-" in text
         or "__cf_chl_" in text
         or "cf-browser-verification" in text
     )
 
 
-def _mail_config() -> dict:
-    return {**config["mail"], "proxy": config["proxy"]}
+def _mail_config(register_proxy: str = "", deadline: float | None = None) -> dict:
+    mail = dict(config.get("mail") if isinstance(config.get("mail"), dict) else {})
+    mail.pop("proxy", None)
+    if mail.get("api_use_register_proxy", True):
+        proxy = str(register_proxy or config.get("proxy") or "").strip()
+        if proxy:
+            mail["proxy"] = proxy
+    if deadline is not None:
+        mail["_deadline"] = deadline
+    return mail
 
 
 def _authorize_landed_page(resp) -> str:
-    """诊断用：粗判 authorize 之后落在哪个页面。返回 signup / login / "" 仅供日志。
+    """Return a rough authorize landing page label for logs only."""
 
-    注意：email-verification / email_otp_verification 在注册和登录流程里都会出现，
-    无法据此可靠区分，所以这里只用于打日志，绝不据此中断注册流程。
-    """
     if resp is None:
         return ""
     final_url = str(getattr(resp, "url", "") or "").lower()
@@ -235,19 +417,35 @@ def _authorize_landed_page(resp) -> str:
     return ""
 
 
-def create_mailbox(username: str | None = None) -> dict:
-    return mail_provider.create_mailbox(_mail_config(), username)
+def create_mailbox(
+    username: str | None = None,
+    register_proxy: str = "",
+    deadline: float | None = None,
+) -> dict:
+    return mail_provider.create_mailbox(_mail_config(register_proxy, deadline), username)
 
 
-def wait_for_code(mailbox: dict) -> str | None:
-    return mail_provider.wait_for_code(_mail_config(), mailbox)
+def wait_for_code(
+    mailbox: dict,
+    register_proxy: str = "",
+    check_control=None,
+    deadline: float | None = None,
+    heartbeat_fn=None,
+) -> str | None:
+    def wrapped_check_control() -> None:
+        if heartbeat_fn is not None:
+            heartbeat_fn()
+        if check_control is not None:
+            check_control()
+
+    return mail_provider.wait_for_code(_mail_config(register_proxy, deadline), mailbox, wrapped_check_control)
 
 
 from utils.sentinel import SentinelTokenGenerator, build_sentinel_token as _build_sentinel_token_tuple  # noqa: F401
 
 
 def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> str:
-    """请求 sentinel token，返回 sentinel header 字符串（兼容旧接口）。"""
+    """Return sentinel token header value."""
     sentinel_val, _oai_sc_val = _build_sentinel_token_tuple(session, device_id, flow, user_agent=user_agent, sec_ch_ua=sec_ch_ua)
     return sentinel_val
 
@@ -256,10 +454,42 @@ def create_session(proxy: str = "") -> Any:
     kwargs = proxy_settings.build_session_kwargs(
         proxy=proxy,
         upstream=True,
+        select_pool=False,
         impersonate="chrome",
         verify=False,
     )
     return requests.Session(**kwargs)
+
+
+def _check_task_control(stop_event: threading.Event | None = None, deadline: float | None = None) -> None:
+    if stop_event is not None and stop_event.is_set():
+        raise RegisterStopped("register_task_stopped")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise RegisterTaskTimeout("register_task_timeout")
+
+
+def _remaining_timeout(deadline: float | None, fallback: float = default_timeout) -> float:
+    timeout = max(0.5, float(fallback or default_timeout))
+    if deadline is None:
+        return timeout
+    try:
+        remaining = float(deadline) - time.monotonic()
+    except (TypeError, ValueError):
+        return timeout
+    if remaining <= 0:
+        return 0.5
+    return max(0.5, min(timeout, remaining))
+
+
+def _request_timeout_with_lease(deadline: float | None, lease_seconds: object = None, fallback: float = default_timeout) -> float:
+    timeout = _remaining_timeout(deadline, fallback)
+    try:
+        lease_timeout = max(1.0, float(lease_seconds or 0) / 2)
+    except (TypeError, ValueError):
+        lease_timeout = 0
+    if lease_timeout:
+        timeout = min(timeout, lease_timeout)
+    return max(0.5, timeout)
 
 
 def _apply_clearance_to_session(session: requests.Session, bundle: ClearanceBundle | None) -> None:
@@ -287,6 +517,7 @@ def _headers_with_clearance(
         target_url=target_url,
         proxy=proxy,
         upstream=True,
+        select_pool=False,
     )
     normalized = {str(key): str(value) for key, value in merged.items()}
     if user_agent_override:
@@ -295,34 +526,89 @@ def _headers_with_clearance(
     return normalized
 
 
-def _cloudflare_block_message(resp, prefix: str = "被 Cloudflare 拦截", reason: str = "") -> str:
+def _cloudflare_block_message(resp, prefix: str = "遇到 Cloudflare 拦截", reason: str = "") -> str:
     status = getattr(resp, "status_code", "unknown")
     debug = _response_debug_detail(resp)
-    reason = reason or "clearance 刷新失败或重试后仍失败，请更换 IP/代理重试"
-    return f"{prefix}，{reason}: status={status}, {debug}"
+    reason = reason or "clearance 未生效，可能是清障失败或代理 IP/环境被拦截"
+    return f"{prefix}: {reason}: status={status}, {debug}"
 
 
-def request_with_local_retry(session: requests.Session, method: str, url: str, retry_attempts: int = 3, **kwargs):
+def request_with_local_retry(
+    session: requests.Session,
+    method: str,
+    url: str,
+    retry_attempts: int = 3,
+    stop_event: threading.Event | None = None,
+    deadline: float | None = None,
+    lease_seconds: object = None,
+    renew_lease=None,
+    **kwargs,
+):
     last_error = ""
     for _ in range(max(1, retry_attempts)):
+        if renew_lease is not None:
+            renew_lease()
+        _check_task_control(stop_event, deadline)
         try:
-            return session.request(method.upper(), url, timeout=default_timeout, **kwargs), ""
+            resp = session.request(
+                method.upper(),
+                url,
+                timeout=_request_timeout_with_lease(deadline, lease_seconds),
+                **kwargs,
+            )
+            if renew_lease is not None:
+                renew_lease()
+            return resp, ""
         except Exception as error:
             last_error = str(error)
-            time.sleep(1)
+            if renew_lease is not None:
+                renew_lease()
+            if stop_event is not None and stop_event.wait(1):
+                raise RegisterStopped("register_task_stopped")
+            _check_task_control(stop_event, deadline)
     return None, last_error
 
 
-def validate_otp(session: requests.Session, device_id: str, code: str):
+def validate_otp(
+    session: requests.Session,
+    device_id: str,
+    code: str,
+    stop_event: threading.Event | None = None,
+    deadline: float | None = None,
+    lease_seconds: object = None,
+    renew_lease=None,
+):
     headers = dict(common_headers)
     headers["referer"] = f"{auth_base}/email-verification"
     headers["oai-device-id"] = device_id
     headers.update(_make_trace_headers())
-    resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
+    resp, error = request_with_local_retry(
+        session,
+        "post",
+        f"{auth_base}/api/accounts/email-otp/validate",
+        json={"code": code},
+        headers=headers,
+        verify=False,
+        stop_event=stop_event,
+        deadline=deadline,
+        lease_seconds=lease_seconds,
+        renew_lease=renew_lease,
+    )
     if resp is not None and resp.status_code == 200:
         return resp, ""
     headers["openai-sentinel-token"] = build_sentinel_token(session, device_id, "authorize_continue")
-    resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
+    resp, error = request_with_local_retry(
+        session,
+        "post",
+        f"{auth_base}/api/accounts/email-otp/validate",
+        json={"code": code},
+        headers=headers,
+        verify=False,
+        stop_event=stop_event,
+        deadline=deadline,
+        lease_seconds=lease_seconds,
+        renew_lease=renew_lease,
+    )
     return resp, error
 
 
@@ -339,7 +625,142 @@ def extract_oauth_callback_params_from_url(url: str) -> dict[str, str] | None:
     return {"code": code, "state": str((params.get("state") or [""])[0]).strip(), "scope": str((params.get("scope") or [""])[0]).strip()}
 
 
-def request_platform_oauth_token(session: requests.Session, code: str, code_verifier: str) -> dict | None:
+def _absolute_auth_url(url: str) -> str:
+    url = str(url or "").strip()
+    if not url:
+        return ""
+    return urljoin(f"{auth_base}/", url)
+
+
+def extract_oauth_callback_params_from_consent_session(
+    session: requests.Session,
+    consent_url: str,
+    device_id: str,
+    stop_event: threading.Event | None = None,
+    deadline: float | None = None,
+    lease_seconds: object = None,
+    renew_lease=None,
+) -> dict[str, str] | None:
+    current_url = _absolute_auth_url(consent_url)
+    if not current_url:
+        return None
+    headers = dict(navigate_headers)
+    headers["referer"] = auth_base
+    headers["oai-device-id"] = device_id
+    for _ in range(10):
+        if renew_lease is not None:
+            renew_lease()
+        _check_task_control(stop_event, deadline)
+        try:
+            resp = session.get(
+                current_url,
+                headers=headers,
+                allow_redirects=False,
+                verify=False,
+                timeout=_request_timeout_with_lease(deadline, lease_seconds),
+            )
+        except Exception:
+            break
+        if renew_lease is not None:
+            renew_lease()
+        callback_params = extract_oauth_callback_params_from_url(str(getattr(resp, "url", "") or ""))
+        if callback_params:
+            return callback_params
+        location = str(getattr(resp, "headers", {}).get("location") or getattr(resp, "headers", {}).get("Location") or "").strip()
+        callback_params = extract_oauth_callback_params_from_url(location)
+        if callback_params:
+            return callback_params
+        if getattr(resp, "status_code", 0) not in (301, 302, 303, 307, 308) or not location:
+            break
+        current_url = _absolute_auth_url(location)
+
+    raw_session = (
+        session.cookies.get("oai-client-auth-session", domain=".auth.openai.com")
+        or session.cookies.get("oai-client-auth-session", domain="auth.openai.com")
+        or session.cookies.get("oai-client-auth-session")
+    )
+    if not raw_session:
+        return None
+    try:
+        first_part = str(raw_session).split(".")[0]
+        first_part += "=" * ((4 - len(first_part) % 4) % 4)
+        session_payload = json.loads(base64.urlsafe_b64decode(first_part.encode("ascii")))
+        workspaces = session_payload.get("workspaces") if isinstance(session_payload, dict) else []
+        workspace_id = str(((workspaces or [{}])[0] or {}).get("id") or "").strip()
+    except Exception:
+        workspace_id = ""
+    if not workspace_id:
+        return None
+
+    headers = dict(common_headers)
+    headers["referer"] = current_url
+    headers["oai-device-id"] = device_id
+    headers.update(_make_trace_headers())
+    try:
+        if renew_lease is not None:
+            renew_lease()
+        _check_task_control(stop_event, deadline)
+        resp = session.post(
+            f"{auth_base}/api/accounts/workspace/select",
+            json={"workspace_id": workspace_id},
+            headers=headers,
+            allow_redirects=False,
+            verify=False,
+            timeout=_request_timeout_with_lease(deadline, lease_seconds),
+        )
+    except Exception:
+        return None
+    if renew_lease is not None:
+        renew_lease()
+    location = str(getattr(resp, "headers", {}).get("location") or getattr(resp, "headers", {}).get("Location") or "").strip()
+    callback_params = extract_oauth_callback_params_from_url(location)
+    if callback_params:
+        return callback_params
+
+    data = _response_json(resp)
+    orgs = ((data.get("data") or {}).get("orgs") or []) if isinstance(data, dict) else []
+    org = (orgs or [{}])[0] or {}
+    org_id = str(org.get("id") or "").strip()
+    projects = org.get("projects") or []
+    project_id = str(((projects or [{}])[0] or {}).get("id") or "").strip()
+    if not org_id:
+        return None
+    org_headers = dict(common_headers)
+    org_headers["referer"] = str(data.get("continue_url") or current_url)
+    org_headers["oai-device-id"] = device_id
+    org_headers.update(_make_trace_headers())
+    body = {"org_id": org_id}
+    if project_id:
+        body["project_id"] = project_id
+    try:
+        if renew_lease is not None:
+            renew_lease()
+        _check_task_control(stop_event, deadline)
+        resp = session.post(
+            f"{auth_base}/api/accounts/organization/select",
+            json=body,
+            headers=org_headers,
+            allow_redirects=False,
+            verify=False,
+            timeout=_request_timeout_with_lease(deadline, lease_seconds),
+        )
+    except Exception:
+        return None
+    if renew_lease is not None:
+        renew_lease()
+    location = str(getattr(resp, "headers", {}).get("location") or getattr(resp, "headers", {}).get("Location") or "").strip()
+    return extract_oauth_callback_params_from_url(location)
+
+
+def request_platform_oauth_token(
+    session: requests.Session,
+    code: str,
+    code_verifier: str,
+    stop_event: threading.Event | None = None,
+    deadline: float | None = None,
+    lease_seconds: object = None,
+    renew_lease=None,
+) -> dict | None:
     headers = {
         "accept": "*/*",
         "accept-language": "zh-CN,zh;q=0.9",
@@ -358,6 +779,9 @@ def request_platform_oauth_token(session: requests.Session, code: str, code_veri
         "sec-fetch-site": "same-site",
         "user-agent": user_agent,
     }
+    if renew_lease is not None:
+        renew_lease()
+    _check_task_control(stop_event, deadline)
     resp = session.post(
         f"{auth_base}/api/accounts/oauth/token",
         headers=headers,
@@ -369,18 +793,83 @@ def request_platform_oauth_token(session: requests.Session, code: str, code_veri
             "redirect_uri": platform_oauth_redirect_uri,
         },
         verify=False,
-        timeout=60,
+        timeout=_request_timeout_with_lease(deadline, lease_seconds, 60),
     )
+    if renew_lease is not None:
+        renew_lease()
     if resp.status_code != 200:
         print(resp.text)
         return None
     return _response_json(resp)
 
 
+def exchange_platform_tokens(
+    session: requests.Session,
+    device_id: str,
+    code_verifier: str,
+    consent_url: str,
+    stop_event: threading.Event | None = None,
+    deadline: float | None = None,
+    lease_seconds: object = None,
+    renew_lease=None,
+) -> dict | None:
+    callback_params = extract_oauth_callback_params_from_consent_session(
+        session,
+        consent_url,
+        device_id,
+        stop_event,
+        deadline,
+        lease_seconds,
+        renew_lease,
+    )
+    if not callback_params:
+        try:
+            if renew_lease is not None:
+                renew_lease()
+            _check_task_control(stop_event, deadline)
+            resp = session.get(
+                _absolute_auth_url(consent_url),
+                headers=navigate_headers,
+                allow_redirects=True,
+                verify=False,
+                timeout=_request_timeout_with_lease(deadline, lease_seconds),
+            )
+            if renew_lease is not None:
+                renew_lease()
+            callback_params = extract_oauth_callback_params_from_url(str(getattr(resp, "url", "") or ""))
+            for history_resp in getattr(resp, "history", []) or []:
+                if callback_params:
+                    break
+                location = str(getattr(history_resp, "headers", {}).get("location") or getattr(history_resp, "headers", {}).get("Location") or "").strip()
+                callback_params = extract_oauth_callback_params_from_url(location)
+        except Exception:
+            callback_params = None
+    code = str((callback_params or {}).get("code") or "").strip()
+    if not code:
+        return None
+    tokens = request_platform_oauth_token(session, code, code_verifier, stop_event, deadline, lease_seconds, renew_lease)
+    if not tokens:
+        return None
+    payload = _decode_jwt_payload(str(tokens.get("id_token") or "")) or _decode_jwt_payload(str(tokens.get("access_token") or ""))
+    email = str(payload.get("email") or "").strip()
+    if email and not tokens.get("email"):
+        tokens["email"] = email
+    return tokens
+
+
 class PlatformRegistrar:
-    def __init__(self, proxy: str = "") -> None:
+    def __init__(
+        self,
+        proxy: str = "",
+        stop_event: threading.Event | None = None,
+        deadline: float | None = None,
+        proxy_lease_id: str = "",
+    ) -> None:
         self.proxy = str(proxy or "").strip()
         self.session = create_session(self.proxy)
+        self.stop_event = stop_event
+        self.deadline = deadline
+        self.proxy_lease_id = str(proxy_lease_id or "")
         self.clearance_user_agent = ""
         self.clearance_failure_reason = ""
         self.device_id = str(uuid.uuid4())
@@ -389,6 +878,31 @@ class PlatformRegistrar:
 
     def close(self) -> None:
         self.session.close()
+
+    def _renew_proxy_lease(self) -> None:
+        proxy_lease_id = str(getattr(self, "proxy_lease_id", "") or "")
+        if self.proxy and proxy_lease_id:
+            register_proxy_pool.renew(self.proxy, proxy_lease_id)
+
+    def _request(self, session: requests.Session, method: str, url: str, **kwargs) -> tuple[object | None, str]:
+        kwargs.pop("stop_event", None)
+        kwargs.pop("deadline", None)
+        kwargs.pop("lease_seconds", None)
+        kwargs.pop("renew_lease", None)
+        return request_with_local_retry(
+            session,
+            method,
+            url,
+            stop_event=self.stop_event,
+            deadline=self.deadline,
+            lease_seconds=config.get("proxy_lease_seconds"),
+            renew_lease=self._renew_proxy_lease,
+            **kwargs,
+        )
+
+    def _check_task_control(self) -> None:
+        self._renew_proxy_lease()
+        _check_task_control(self.stop_event, self.deadline)
 
     def _navigate_headers(self, referer: str = "") -> dict[str, str]:
         headers = dict(navigate_headers)
@@ -404,31 +918,32 @@ class PlatformRegistrar:
         return headers
 
     def _refresh_cloudflare_clearance(self, target_url: str, index: int) -> ClearanceBundle | None:
+        self._check_task_control()
         self.clearance_failure_reason = ""
-        profile = proxy_settings.get_profile(proxy=self.proxy, upstream=True)
+        profile = proxy_settings.get_profile(proxy=self.proxy, upstream=True, select_pool=False)
         if not profile.clearance_enabled:
-            self.clearance_failure_reason = (
-                "可尝试使用 FlareSolverr 清障方式，注意需要 Docker 部署 flaresolverr、privoxy、warp-proxy 等相关容器"
-            )
-            step(index, f"检测到 Cloudflare 拦截，{self.clearance_failure_reason}", "yellow")
+            self.clearance_failure_reason = "未启用 FlareSolverr 清障，请先启动 flaresolverr/privoxy/warp-proxy 容器"
+            step(index, f"跳过 Cloudflare 清障：{self.clearance_failure_reason}", "yellow")
             return None
-        step(index, "检测到 Cloudflare 拦截，尝试刷新 clearance", "yellow")
+        step(index, "遇到 Cloudflare 拦截，刷新 clearance", "yellow")
         bundle = proxy_settings.refresh_clearance(
             target_url=target_url,
             proxy=self.proxy,
             force=True,
             upstream=True,
+            select_pool=False,
         )
         if bundle is not None:
             _apply_clearance_to_session(self.session, bundle)
             self.clearance_user_agent = bundle.user_agent or self.clearance_user_agent
-            step(index, "Cloudflare clearance 刷新完成，重试当前请求", "yellow")
+            step(index, "Cloudflare clearance 刷新成功，继续注册", "yellow")
         else:
-            self.clearance_failure_reason = "clearance 刷新未返回可用 Cookie，请检查 FlareSolverr URL、代理和出口 IP"
-            step(index, f"Cloudflare clearance 刷新失败：{self.clearance_failure_reason}", "yellow")
+            self.clearance_failure_reason = "clearance 刷新失败，请检查 Cookie、FlareSolverr URL 或代理 IP"
+            step(index, f"Cloudflare clearance 失败：{self.clearance_failure_reason}", "yellow")
         return bundle
 
     def _platform_authorize(self, email: str, index: int) -> None:
+        self._check_task_control()
         step(index, "开始 platform authorize")
         self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
         self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
@@ -439,9 +954,6 @@ class PlatformRegistrar:
             "audience": platform_oauth_audience,
             "redirect_uri": platform_oauth_redirect_uri,
             "device_id": self.device_id,
-            # 注册流程显式声明 signup：throwaway 域名 OpenAI 会自动当新账号走注册，
-            # 但 @outlook.com/@hotmail.com 这类真实消费邮箱会被 login_or_signup 路由到登录分支，
-            # 后续 user/register 落在错误的 auth step 上报 invalid_auth_step。
             "screen_hint": "signup",
             "max_age": "0",
             "login_hint": email,
@@ -455,17 +967,16 @@ class PlatformRegistrar:
             "auth0Client": platform_auth0_client,
         }
         target_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
-        headers = self._navigate_headers(f"{platform_base}/")
-        headers = _headers_with_clearance(headers, target_url, self.proxy, self.clearance_user_agent)
-        resp, error = request_with_local_retry(self.session, "get", target_url, headers=headers, allow_redirects=True, verify=False)
+        headers = _headers_with_clearance(self._navigate_headers(f"{platform_base}/"), target_url, self.proxy, self.clearance_user_agent)
+        resp, error = self._request(self.session, "get", target_url, headers=headers, allow_redirects=True, verify=False, stop_event=self.stop_event, deadline=self.deadline)
         if _is_cloudflare_challenge(resp):
             bundle = self._refresh_cloudflare_clearance(auth_base, index)
             if bundle is None:
                 raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
-            retry_headers = _headers_with_clearance(self._navigate_headers(f"{platform_base}/"), target_url, self.proxy, self.clearance_user_agent)
-            resp, error = request_with_local_retry(self.session, "get", target_url, headers=retry_headers, allow_redirects=True, verify=False)
+            headers = _headers_with_clearance(self._navigate_headers(f"{platform_base}/"), target_url, self.proxy, self.clearance_user_agent)
+            resp, error = self._request(self.session, "get", target_url, headers=headers, allow_redirects=True, verify=False, stop_event=self.stop_event, deadline=self.deadline)
             if _is_cloudflare_challenge(resp):
-                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
+                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 仍未通过"))
         if resp is None or resp.status_code != 200:
             err = _response_json(resp).get("error", {}) if resp is not None else {}
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
@@ -473,17 +984,16 @@ class PlatformRegistrar:
             status = getattr(resp, "status_code", "unknown")
             raise RuntimeError(error or f"platform_authorize_http_{status}{detail}, {debug}")
         landed = _authorize_landed_page(resp)
-        # 仅打日志，不据此中断：authorize 落地页无法可靠区分注册/登录，
-        # 真正的判定交给 user/register（失败会 dump 完整响应）。
         step(index, f"platform authorize 完成[{landed or '?'}] url={str(getattr(resp, 'url', '') or '')[:160]}")
 
     def _register_user(self, email: str, password: str, index: int) -> None:
-        step(index, "开始提交注册密码")
+        self._check_task_control()
+        step(index, "提交注册账号")
         url = f"{auth_base}/api/accounts/user/register"
         headers = self._json_headers(f"{auth_base}/create-account/password")
         headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create")
         headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
-        resp, error = request_with_local_retry(self.session, "post", url, json={"username": email, "password": password}, headers=headers, verify=False)
+        resp, error = self._request(self.session, "post", url, json={"username": email, "password": password}, headers=headers, verify=False, stop_event=self.stop_event, deadline=self.deadline)
         if _is_cloudflare_challenge(resp):
             bundle = self._refresh_cloudflare_clearance(auth_base, index)
             if bundle is None:
@@ -491,37 +1001,47 @@ class PlatformRegistrar:
             headers = self._json_headers(f"{auth_base}/create-account/password")
             headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create")
             headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
-            resp, error = request_with_local_retry(self.session, "post", url, json={"username": email, "password": password}, headers=headers, verify=False)
+            resp, error = self._request(self.session, "post", url, json={"username": email, "password": password}, headers=headers, verify=False, stop_event=self.stop_event, deadline=self.deadline)
             if _is_cloudflare_challenge(resp):
-                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
+                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 仍未通过"))
         if resp is None or resp.status_code != 200:
             data = _response_json(resp) if resp is not None else {}
             if data.get("message") == "Failed to create account. Please try again.":
-                step(index, "注册失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
+                step(index, "OpenAI 返回创建失败，通常是账号/代理/风控问题", "yellow")
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
             raise RuntimeError(error or f"user_register_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
-        step(index, "提交注册密码完成")
+        step(index, "注册账号成功")
 
     def _send_otp(self, index: int) -> None:
-        step(index, "开始发送验证码")
+        self._check_task_control()
+        step(index, "发送邮箱验证码")
         url = f"{auth_base}/api/accounts/email-otp/send"
         headers = _headers_with_clearance(self._navigate_headers(f"{auth_base}/create-account/password"), url, self.proxy, self.clearance_user_agent)
-        resp, error = request_with_local_retry(self.session, "get", url, headers=headers, allow_redirects=True, verify=False)
+        resp, error = self._request(self.session, "get", url, headers=headers, allow_redirects=True, verify=False, stop_event=self.stop_event, deadline=self.deadline)
         if _is_cloudflare_challenge(resp):
             bundle = self._refresh_cloudflare_clearance(auth_base, index)
             if bundle is None:
                 raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
             headers = _headers_with_clearance(self._navigate_headers(f"{auth_base}/create-account/password"), url, self.proxy, self.clearance_user_agent)
-            resp, error = request_with_local_retry(self.session, "get", url, headers=headers, allow_redirects=True, verify=False)
+            resp, error = self._request(self.session, "get", url, headers=headers, allow_redirects=True, verify=False, stop_event=self.stop_event, deadline=self.deadline)
             if _is_cloudflare_challenge(resp):
-                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
+                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 仍未通过"))
         if resp is None or resp.status_code not in (200, 302):
             raise RuntimeError(error or f"send_otp_http_{getattr(resp, 'status_code', 'unknown')}")
-        step(index, "发送验证码完成")
+        step(index, "邮箱验证码已发送")
 
     def _validate_otp(self, code: str, index: int) -> None:
-        step(index, f"开始校验验证码 {code}")
-        resp, error = validate_otp(self.session, self.device_id, code)
+        self._check_task_control()
+        step(index, f"验证邮箱验证码 {code}")
+        resp, error = validate_otp(
+            self.session,
+            self.device_id,
+            code,
+            self.stop_event,
+            self.deadline,
+            config.get("proxy_lease_seconds"),
+            self._renew_proxy_lease,
+        )
         if resp is None or resp.status_code != 200:
             body = ""
             try:
@@ -529,15 +1049,16 @@ class PlatformRegistrar:
             except Exception:
                 pass
             raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}_body={body}")
-        step(index, "验证码校验完成")
+        step(index, "邮箱验证码验证成功")
 
     def _create_account(self, name: str, birthdate: str, index: int) -> None:
-        step(index, "开始创建账号资料")
+        self._check_task_control()
+        step(index, "创建账号资料")
         url = f"{auth_base}/api/accounts/create_account"
         headers = self._json_headers(f"{auth_base}/about-you")
         headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
         headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
-        resp, error = request_with_local_retry(self.session, "post", url, json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
+        resp, error = self._request(self.session, "post", url, json={"name": name, "birthdate": birthdate}, headers=headers, verify=False, stop_event=self.stop_event, deadline=self.deadline)
         if _is_cloudflare_challenge(resp):
             bundle = self._refresh_cloudflare_clearance(auth_base, index)
             if bundle is None:
@@ -545,51 +1066,259 @@ class PlatformRegistrar:
             headers = self._json_headers(f"{auth_base}/about-you")
             headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
             headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
-            resp, error = request_with_local_retry(self.session, "post", url, json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
+            resp, error = self._request(self.session, "post", url, json={"name": name, "birthdate": birthdate}, headers=headers, verify=False, stop_event=self.stop_event, deadline=self.deadline)
             if _is_cloudflare_challenge(resp):
-                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
+                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 仍未通过"))
         if resp is None or resp.status_code not in (200, 302):
             data = _response_json(resp) if resp is not None else {}
             if data.get("message") == "Failed to create account. Please try again.":
-                step(index, "创建账号失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
+                step(index, "OpenAI 返回创建资料失败，通常是账号/代理/风控问题", "yellow")
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
             raise RuntimeError(error or f"create_account_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
         data = _response_json(resp)
         callback_params = extract_oauth_callback_params_from_url(str(data.get("continue_url") or "").strip())
         self.platform_auth_code = str((callback_params or {}).get("code") or "").strip()
-        step(index, "创建账号资料完成")
+        step(index, "账号资料创建成功")
 
     def _exchange_registered_tokens(self, index: int) -> dict:
-        step(index, "开始换 token")
-        tokens = request_platform_oauth_token(self.session, self.platform_auth_code, self.code_verifier)
+        self._check_task_control()
+        step(index, "交换 token")
+        tokens = request_platform_oauth_token(
+            self.session,
+            self.platform_auth_code,
+            self.code_verifier,
+            self.stop_event,
+            self.deadline,
+            config.get("proxy_lease_seconds"),
+            self._renew_proxy_lease,
+        )
         if not tokens:
-            raise RuntimeError("token换取失败")
-        step(index, "token 换取完成")
+            raise RuntimeError("token 交换失败")
+        step(index, "token 交换成功")
         return tokens
 
+    def _login_and_exchange_tokens(self, email: str, password: str, mailbox: dict, index: int) -> dict:
+        self._check_task_control()
+        step(index, "登录账号并重新交换 token")
+        login_session = create_session(self.proxy)
+        login_device_id = str(uuid.uuid4())
+        login_session.cookies.set("oai-did", login_device_id, domain=".auth.openai.com")
+        login_session.cookies.set("oai-did", login_device_id, domain="auth.openai.com")
+        code_verifier, code_challenge = _generate_pkce()
+        params = {
+            "issuer": auth_base,
+            "client_id": platform_oauth_client_id,
+            "audience": platform_oauth_audience,
+            "redirect_uri": platform_oauth_redirect_uri,
+            "device_id": login_device_id,
+            "screen_hint": "login_or_signup",
+            "max_age": "0",
+            "login_hint": email,
+            "scope": "openid profile email offline_access",
+            "response_type": "code",
+            "response_mode": "query",
+            "state": secrets.token_urlsafe(32),
+            "nonce": secrets.token_urlsafe(32),
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "auth0Client": platform_auth0_client,
+        }
+
+        def _login_nav_headers(referer: str = "") -> dict[str, str]:
+            headers = dict(navigate_headers)
+            if referer:
+                headers["referer"] = referer
+            return headers
+
+        def _login_json_headers(referer: str) -> dict[str, str]:
+            headers = dict(common_headers)
+            headers["referer"] = referer
+            headers["oai-device-id"] = login_device_id
+            headers.update(_make_trace_headers())
+            return headers
+
+        def _clear_login_auth_cookies() -> None:
+            for cookie in list(login_session.cookies):
+                if "auth.openai.com" in str(cookie.domain):
+                    login_session.cookies.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
+            login_session.cookies.set("oai-did", login_device_id, domain=".auth.openai.com")
+            login_session.cookies.set("oai-did", login_device_id, domain="auth.openai.com")
+
+        def _do_login_authorize(label: str) -> tuple[object | None, str]:
+            target_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
+            headers = _headers_with_clearance(_login_nav_headers(f"{platform_base}/"), target_url, self.proxy, self.clearance_user_agent)
+            resp, error = self._request(login_session, "get", target_url, headers=headers, allow_redirects=True, verify=False, stop_event=self.stop_event, deadline=self.deadline)
+            if resp is None:
+                raise RuntimeError(error or f"platform_login_authorize_{label}_failed")
+            if _is_cloudflare_challenge(resp):
+                bundle = self._refresh_cloudflare_clearance(auth_base, index)
+                if bundle is None:
+                    raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
+                headers = _headers_with_clearance(_login_nav_headers(f"{platform_base}/"), target_url, self.proxy, self.clearance_user_agent)
+                resp, error = self._request(login_session, "get", target_url, headers=headers, allow_redirects=True, verify=False, stop_event=self.stop_event, deadline=self.deadline)
+            if resp is None or getattr(resp, "status_code", 0) not in (200, 302):
+                raise RuntimeError(error or f"platform_login_authorize_{label}_http_{getattr(resp, 'status_code', 'unknown')}")
+            step(index, "登录 authorize 完成" if label == "initial" else f"登录 authorize 完成[{label}]")
+            return resp, error
+
+        def _do_authorize_continue() -> tuple[object | None, str]:
+            url = f"{auth_base}/api/accounts/authorize/continue"
+            headers = _login_json_headers(f"{auth_base}/log-in?usernameKind=email")
+            headers["openai-sentinel-token"] = build_sentinel_token(login_session, login_device_id, "authorize_continue")
+            headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
+            return self._request(login_session, "post", url, json={"username": {"kind": "email", "value": email}}, headers=headers, allow_redirects=False, verify=False, stop_event=self.stop_event, deadline=self.deadline)
+
+        def _submit_email_with_reauth() -> None:
+            nonlocal resp, error
+            step(index, "提交登录邮箱")
+            for attempt in range(3):
+                if attempt:
+                    step(index, f"登录邮箱 409/会话失效，清理 cookie 后重试 authorize ({attempt + 1}/3)", "yellow")
+                    _clear_login_auth_cookies()
+                    resp, error = _do_login_authorize(f"email-{attempt + 1}")
+                resp, error = _do_authorize_continue()
+                if resp is not None and getattr(resp, "status_code", 0) == 409:
+                    continue
+                break
+            if resp is None or getattr(resp, "status_code", 0) != 200:
+                data = _response_json(resp) if resp is not None else {}
+                detail = json.dumps(data, ensure_ascii=False) if data else ""
+                raise RuntimeError(error or f"email_submit_http_{getattr(resp, 'status_code', 'unknown')}" + (f": {detail}" if detail else ""))
+            step(index, "登录邮箱提交成功")
+
+        def _verify_password_once() -> tuple[object | None, str]:
+            url = f"{auth_base}/api/accounts/password/verify"
+            headers = _login_json_headers(f"{auth_base}/log-in/password")
+            headers["openai-sentinel-token"] = build_sentinel_token(login_session, login_device_id, "password_verify")
+            headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
+            return self._request(login_session, "post", url, json={"password": password}, headers=headers, allow_redirects=False, verify=False, stop_event=self.stop_event, deadline=self.deadline)
+
+        def _verify_password_with_reauth() -> None:
+            nonlocal resp, error
+            step(index, "验证登录密码")
+            for attempt in range(3):
+                if attempt:
+                    step(index, f"登录密码 HTTP 409，重新 authorize 后重试 ({attempt + 1}/3)", "yellow")
+                    _clear_login_auth_cookies()
+                    resp, error = _do_login_authorize(f"password-{attempt + 1}")
+                    _submit_email_with_reauth()
+                resp, error = _verify_password_once()
+                if resp is not None and getattr(resp, "status_code", 0) == 409:
+                    continue
+                break
+            if resp is None or getattr(resp, "status_code", 0) != 200:
+                body = ""
+                try:
+                    body = (resp.text or "")[:500] if resp is not None else ""
+                except Exception:
+                    pass
+                raise RuntimeError(error or f"password_verify_http_{getattr(resp, 'status_code', '')}_body={body}")
+            step(index, "登录密码验证成功")
+
+        try:
+            resp = None
+            error = ""
+            resp, error = _do_login_authorize("initial")
+            _submit_email_with_reauth()
+            _verify_password_with_reauth()
+
+            payload = _response_json(resp)
+            continue_url = str(payload.get("continue_url") or "").strip()
+            page_type = str(((payload.get("page") or {}).get("type")) or "")
+
+            if page_type == "email_otp_verification" or "email-verification" in continue_url or "email-otp" in continue_url:
+                step(index, "登录触发邮箱验证码")
+                self._check_task_control()
+                code = wait_for_code(mailbox, self.proxy, self._check_task_control, self.deadline, lambda: heartbeat(index))
+                if not code:
+                    raise RuntimeError("等待登录验证码超时")
+                step(index, f"收到登录验证码 {code}")
+                resp, reason = validate_otp(
+                    login_session,
+                    login_device_id,
+                    code,
+                    self.stop_event,
+                    self.deadline,
+                    config.get("proxy_lease_seconds"),
+                    self._renew_proxy_lease,
+                )
+                if resp is None or resp.status_code != 200:
+                    data = _response_json(resp) if resp is not None else {}
+                    message = str((data.get("error") or {}).get("message") or data.get("message") or "").strip()
+                    raise RuntimeError(reason or f"登录验证码验证失败{': ' + message if message else ''}")
+                otp_payload = _response_json(resp)
+                continue_url = str(otp_payload.get("continue_url") or continue_url).strip()
+                step(index, "登录验证码验证成功")
+
+            if not continue_url:
+                continue_url = f"{auth_base}/sign-in-with-chatgpt/codex/consent"
+            callback_params = extract_oauth_callback_params_from_url(continue_url)
+            code = str((callback_params or {}).get("code") or "").strip()
+            if code:
+                tokens = request_platform_oauth_token(
+                    login_session,
+                    code,
+                    code_verifier,
+                    self.stop_event,
+                    self.deadline,
+                    config.get("proxy_lease_seconds"),
+                    self._renew_proxy_lease,
+                )
+            else:
+                tokens = exchange_platform_tokens(
+                    login_session,
+                    login_device_id,
+                    code_verifier,
+                    continue_url,
+                    self.stop_event,
+                    self.deadline,
+                    config.get("proxy_lease_seconds"),
+                    self._renew_proxy_lease,
+                )
+            if not tokens:
+                raise RuntimeError("token 交换失败")
+            step(index, "登录 token 交换成功")
+            return tokens
+        finally:
+            login_session.close()
+
     def register(self, index: int) -> dict:
-        step(index, "开始创建邮箱")
-        mailbox = create_mailbox()
+        self._check_task_control()
+        step(index, "创建邮箱")
+        mailbox = create_mailbox(register_proxy=self.proxy, deadline=self.deadline)
         email = str(mailbox.get("address") or "").strip()
         if not email:
             mail_provider.release_mailbox(mailbox)
             raise RuntimeError("邮箱服务未返回 address")
         label = str(mailbox.get("label") or "")
-        step(index, f"邮箱创建完成[{label}]: {email}")
+        step(index, f"创建邮箱[{label}]: {email}")
+        code_consumed = False
         try:
             password = _random_password()
             first_name, last_name = _random_name()
             self._platform_authorize(email, index)
             self._register_user(email, password, index)
             self._send_otp(index)
-            step(index, "开始等待注册验证码")
-            code = wait_for_code(mailbox)
+            step(index, "等待邮箱验证码")
+            self._check_task_control()
+            code = wait_for_code(mailbox, self.proxy, self._check_task_control, self.deadline, lambda: heartbeat(index))
             if not code:
-                raise RuntimeError("等待注册验证码超时")
-            step(index, f"收到注册验证码: {code}")
+                raise RuntimeError("等待邮箱验证码超时")
+            code_consumed = True
+            step(index, f"收到邮箱验证码 {code}")
             self._validate_otp(code, index)
             self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
-            tokens = self._exchange_registered_tokens(index)
+            try:
+                tokens = self._exchange_registered_tokens(index)
+            except Exception as error:
+                step(index, f"注册后 token 交换失败，尝试登录补取：{error}", "yellow")
+                tokens = self._login_and_exchange_tokens(email, password, mailbox, index)
+        except (RegisterStopped, RegisterRunInvalidated) as error:
+            if code_consumed:
+                mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
+            else:
+                mail_provider.release_mailbox(mailbox)
+            raise
         except Exception as error:
             mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
             raise
@@ -604,31 +1333,174 @@ class PlatformRegistrar:
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
-
-def worker(index: int) -> dict:
-    start = time.time()
-    registrar = PlatformRegistrar(config["proxy"])
+def _task_timeout_seconds(value: object = None) -> int:
     try:
-        step(index, "任务启动")
+        return max(30, int(value if value is not None else config.get("task_timeout_seconds") or 300))
+    except Exception:
+        return 300
+
+
+def _wait_for_register_proxy(
+    index: int,
+    stop_event: threading.Event | None,
+    deadline: float,
+    proxy_selection: RegisterProxySelection | None = None,
+) -> RegisterProxySelection:
+    selection = proxy_selection or register_proxy_pool.next_proxy()
+    next_log_at = 0.0
+    while (
+        selection.last_error
+        and not selection.proxy
+        and selection.source != "direct"
+        and selection.count > 0
+        and selection.wait_retriable
+    ):
+        renew_register_proxy(selection)
+        _set_worker_state(
+            index,
+            status="waiting_proxy",
+            proxy=selection.proxy,
+            proxy_source=selection.source_label,
+            proxy_count=selection.count,
+            bind_account_proxy=selection.bind_to_account,
+            selected_proxy_file=selection.selected_file,
+            proxy_lease_id=selection.lease_id,
+            last_error=selection.last_error,
+        )
+        heartbeat_with_proxy(index, selection)
+        now = time.monotonic()
+        if now >= next_log_at:
+            step(index, f"注册代理暂不可用：{selection.last_error}，等待租约释放或更换可用代理", "yellow")
+            next_log_at = now + 10
+        _check_task_control(stop_event, deadline)
+        if stop_event is not None and stop_event.wait(1):
+            raise RegisterStopped("register_task_stopped")
+        if stop_event is None:
+            time.sleep(1)
+        _check_task_control(stop_event, deadline)
+        selection = register_proxy_pool.next_proxy()
+    return selection
+
+
+def worker(
+    index: int,
+    stop_event: threading.Event | None = None,
+    proxy_selection: RegisterProxySelection | None = None,
+    task_timeout_seconds: int | None = None,
+    run_id: str = "",
+) -> dict:
+    previous_run_id = _current_worker_run_id()
+    worker_run_context.run_id = str(run_id or "")
+    start = time.time()
+    deadline = time.monotonic() + _task_timeout_seconds(task_timeout_seconds)
+    selection: RegisterProxySelection | None = None
+    registrar: PlatformRegistrar | None = None
+    proxy_reported = False
+    saved_access_token = ""
+    try:
+        _check_run_active(run_id)
+        selection = _wait_for_register_proxy(index, stop_event, deadline, proxy_selection)
+        _check_run_active(run_id)
+        _set_worker_state(
+            index,
+            status="running",
+            started_at=_utc_now(),
+            proxy=selection.proxy,
+            proxy_source=selection.source_label,
+            proxy_count=selection.count,
+            bind_account_proxy=selection.bind_to_account,
+            selected_proxy_file=selection.selected_file,
+            proxy_lease_id=selection.lease_id,
+            last_error=selection.last_error,
+        )
+        step(index, f"注册代理来源={selection.source_label}，可用数量={selection.count}")
+        if selection.last_error and not selection.proxy and selection.source != "direct":
+            raise RuntimeError(f"register_proxy_unavailable: {selection.last_error}")
+        renew_register_proxy(selection)
+        _check_task_control(stop_event, deadline)
+        _check_run_active(run_id)
+        registrar = PlatformRegistrar(selection.proxy, stop_event=stop_event, deadline=deadline, proxy_lease_id=selection.lease_id)
+        renew_register_proxy(selection)
         result = registrar.register(index)
+        renew_register_proxy(selection)
+        _check_task_control(stop_event, deadline)
+        _check_run_active(run_id)
+        if selection.bind_to_account and selection.proxy:
+            result["proxy"] = selection.proxy
+        result["image_quota_unknown"] = True
         cost = time.time() - start
         access_token = str(result["access_token"])
+        renew_register_proxy(selection)
+        _check_task_control(stop_event, deadline)
+        _check_run_active(run_id)
         account_service.add_account_items([result])
-        refresh_result = account_service.refresh_accounts([access_token])
+        saved_access_token = access_token
+        try:
+            renew_register_proxy(selection)
+            _check_task_control(stop_event, deadline)
+            _check_run_active(run_id)
+        except RegisterStopped:
+            account_service.delete_accounts([access_token])
+            saved_access_token = ""
+            raise
+        try:
+            renew_register_proxy(selection)
+            refresh_result = account_service.refresh_accounts([access_token], defer_invalid_removal=False)
+            renew_register_proxy(selection)
+            _check_run_active(run_id)
+        except RegisterStopped:
+            account_service.delete_accounts([access_token])
+            saved_access_token = ""
+            raise
         if refresh_result.get("errors"):
-            step(index, f"账号已保存，刷新状态暂未成功，稍后可重试: {refresh_result['errors']}", "yellow")
+            refresh_error = str(refresh_result["errors"])
+            refresh_reason = classify_register_failure(refresh_error)
+            step(index, f"账号保存成功，但刷新账号信息失败：{refresh_result['errors']}", "yellow")
+            removed = account_service.delete_accounts([access_token]).get("removed", 0)
+            saved_access_token = ""
+            if removed:
+                step(index, "刷新失败，已删除刚保存的账号，避免额度 0 账号残留", "yellow")
+            register_proxy_pool.report(selection, ok=False, reason=refresh_reason, error=refresh_error)
+            proxy_reported = True
+            raise RegisteredAccountValidationError(f"registered_account_refresh_failed: {refresh_result['errors']}")
+        if account_service.get_account(access_token) is None:
+            step(index, "账号保存后已被刷新流程自动移除，不计入成功", "yellow")
+            register_proxy_pool.report(selection, ok=True)
+            proxy_reported = True
+            raise RegisteredAccountValidationError("registered_account_removed_after_refresh")
+        _check_run_active(run_id)
+        register_proxy_pool.report(selection, ok=True)
+        proxy_reported = True
         with stats_lock:
             stats["done"] += 1
             stats["success"] += 1
-            avg = (time.time() - stats["start_time"]) / stats["success"]
-        log(f'{result["email"]} 注册成功，本次耗时{cost:.1f}s，全局平均每个号注册耗时{avg:.1f}s', "green")
+            avg = (time.time() - stats["start_time"]) / stats["success"] if stats.get("success") else 0
+        _set_worker_state(index, status="success", elapsed_seconds=round(cost, 1), email=result.get("email"))
+        log(f'{result["email"]} 注册成功，耗时 {cost:.1f}s，平均 {avg:.1f}s', "green")
         return {"ok": True, "index": index, "result": result}
+    except RegisterStopped as e:
+        cost = time.time() - start
+        if saved_access_token:
+            account_service.delete_accounts([saved_access_token])
+        if not proxy_reported:
+            register_proxy_pool.report(selection, ok=False, reason="stopped", error=e)
+        with stats_lock:
+            stats["done"] += 1
+        _set_worker_state(index, status="stopped", elapsed_seconds=round(cost, 1), last_error=str(e))
+        log(f"任务{index} 已停止，耗时 {cost:.1f}s", "yellow")
+        return {"ok": False, "index": index, "stopped": True, "error": str(e)}
     except Exception as e:
         cost = time.time() - start
+        reason = classify_register_failure(e)
+        if not proxy_reported:
+            register_proxy_pool.report(selection, ok=False, reason=reason, error=e)
         with stats_lock:
             stats["done"] += 1
             stats["fail"] += 1
-        log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {e}", "red")
-        return {"ok": False, "index": index, "error": str(e)}
+        _set_worker_state(index, status="failed", elapsed_seconds=round(cost, 1), last_error=str(e), failure_reason=reason)
+        log(f"任务{index} 注册失败，耗时 {cost:.1f}s，原因={reason}，错误：{e}", "red")
+        return {"ok": False, "index": index, "error": str(e), "reason": reason}
     finally:
-        registrar.close()
+        worker_run_context.run_id = previous_run_id
+        if registrar is not None:
+            registrar.close()

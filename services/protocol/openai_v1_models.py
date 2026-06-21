@@ -4,11 +4,18 @@ from typing import Any
 
 from services.account_service import account_service
 from services.openai_backend_api import OpenAIBackendAPI
+from services.proxy_service import is_proxy_transport_error, record_backend_proxy_result
 from utils.helper import CODEX_IMAGE_MODEL
 
 
 def list_models() -> dict[str, Any]:
-    result = OpenAIBackendAPI().list_models()
+    backend = OpenAIBackendAPI()
+    try:
+        result = backend.list_models()
+        record_backend_proxy_result(backend, True)
+    except Exception as exc:
+        record_backend_proxy_result(backend, not is_proxy_transport_error(exc))
+        raise
     data = result.get("data")
     if not isinstance(data, list):
         return result

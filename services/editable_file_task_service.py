@@ -13,6 +13,7 @@ from services.config import DATA_DIR
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.openai_backend_api import EDITABLE_FILE_MODEL, OpenAIBackendAPI
+from services.proxy_service import is_proxy_transport_error, record_backend_proxy_result
 from utils.helper import new_uuid
 
 TASK_STATUS_QUEUED = "queued"
@@ -130,6 +131,7 @@ class EditableFileTaskService:
         started = time.time()
         token = ""
         account_email = ""
+        backend: OpenAIBackendAPI | None = None
         self._update_task(key, status=TASK_STATUS_RUNNING, error="", started_ts=started)
         try:
             if kind == "psd" and not base64_images:
@@ -140,12 +142,15 @@ class EditableFileTaskService:
             backend = OpenAIBackendAPI(token)
             output_dir = EDITABLE_FILE_ROOT / kind / key.rsplit(":", 1)[-1]
             result = backend.export_psd_zip(base64_images, prompt, output_dir) if kind == "psd" else backend.export_ppt_zip(base64_images, prompt, output_dir)
+            record_backend_proxy_result(backend, True)
             account_service.mark_text_used(token)
             data = {"conversation_id": result.conversation_id, "primary_url": _file_url(result.primary_path, base_url), "zip_url": _file_url(result.zip_path, base_url)}
             self._update_task(key, status=TASK_STATUS_SUCCESS, result=data, account_email=account_email, error="", ended_ts=time.time())
             self._log_call(identity, kind, started, request_text(prompt), account_email=account_email, result=data)
         except Exception as exc:
             error = str(exc) or "editable file task failed"
+            if backend is not None:
+                record_backend_proxy_result(backend, not is_proxy_transport_error(error))
             self._update_task(key, status=TASK_STATUS_ERROR, error=error, account_email=account_email, ended_ts=time.time())
             self._log_call(identity, kind, started, request_text(prompt), status="failed", error=error, account_email=account_email)
 

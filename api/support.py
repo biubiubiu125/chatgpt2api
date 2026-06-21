@@ -115,6 +115,8 @@ def _add_account_log(summary: str, detail: dict[str, Any]) -> None:
 
 
 def run_account_refresh_cycle() -> dict[str, Any]:
+    start_cleanup = account_service.cleanup_abnormal_accounts("account_auto_refresh:start")
+    removed_abnormal_before = int(start_cleanup.get("removed") or 0)
     limited_tokens = account_service.list_limited_tokens()
     normal_tokens = account_service.list_normal_tokens()
     expiring_tokens = account_service.list_expiring_access_tokens()
@@ -126,9 +128,10 @@ def run_account_refresh_cycle() -> dict[str, Any]:
         "limited": len(limited_tokens),
         "normal": len(normal_tokens),
         "expiring_access_tokens": len(expiring_tokens),
+        "removed_abnormal_before": removed_abnormal_before,
         "interval_minute": interval_minute,
         "full_refresh": True,
-        "defer_invalid_removal": True,
+        "defer_invalid_removal": False,
     }
     _add_account_log("自动刷新账号开始", start_detail)
 
@@ -140,10 +143,16 @@ def run_account_refresh_cycle() -> dict[str, Any]:
                 f"{len(normal_tokens)} normal accounts, "
                 f"{len(expiring_tokens)} expiring access tokens"
             )
-            refresh_result = account_service.refresh_accounts(tokens, defer_invalid_removal=True)
+            refresh_result = account_service.refresh_accounts(tokens, defer_invalid_removal=False)
         else:
             print("[account-watcher] no accounts to refresh")
-            refresh_result = {"refreshed": 0, "errors": [], "items": [], "relogined": 0}
+            refresh_result = {
+                "refreshed": 0,
+                "errors": [],
+                "items": start_cleanup.get("items") or account_service.list_accounts(),
+                "relogined": 0,
+                "removed_unusable": 0,
+            }
 
         _add_account_log(
             "自动刷新账号完成",
@@ -153,6 +162,7 @@ def run_account_refresh_cycle() -> dict[str, Any]:
                 "refreshed": int(refresh_result.get("refreshed") or 0),
                 "error_count": _count_refresh_errors(refresh_result),
                 "relogined": int(refresh_result.get("relogined") or 0),
+                "removed_unusable_after": int(refresh_result.get("removed_unusable") or 0),
                 "status_counts": _status_counts(refresh_result.get("items")),
             },
         )

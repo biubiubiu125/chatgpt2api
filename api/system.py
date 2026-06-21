@@ -24,7 +24,7 @@ from services.image_service import (
 from services.image_storage_service import ImageStorageError, image_storage_service
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
 from services.log_service import log_service
-from services.proxy_service import proxy_settings, test_clearance, test_proxy
+from services.proxy_service import proxy_settings, test_clearance, test_proxy, test_proxy_pool
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -142,6 +142,11 @@ def create_router(app_version: str) -> APIRouter:
         require_admin(authorization)
         return {"result": await run_in_threadpool(test_proxy, (body.url or "").strip())}
 
+    @router.post("/api/proxy/pool/test")
+    async def test_proxy_pool_endpoint(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {"result": await run_in_threadpool(test_proxy_pool)}
+
     @router.get("/api/proxy/runtime")
     async def get_proxy_runtime_endpoint(authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -159,6 +164,15 @@ def create_router(app_version: str) -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         return {
             "runtime": config.get_public_proxy_runtime_settings(),
+            "status": proxy_settings.get_runtime_status(),
+        }
+
+    @router.post("/api/proxy/runtime/failures/reset")
+    async def reset_proxy_runtime_failures_endpoint(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        cleared = proxy_settings.reset_proxy_failures()
+        return {
+            "cleared": cleared,
             "status": proxy_settings.get_runtime_status(),
         }
 

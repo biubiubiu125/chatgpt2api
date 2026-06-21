@@ -5,6 +5,7 @@ from typing import Any
 
 from services.account_service import account_service
 from services.openai_backend_api import OpenAIBackendAPI
+from services.proxy_service import is_proxy_transport_error, record_backend_proxy_result
 
 WEB_SEARCH_TOOL_TYPES = {"web_search", "web_search_preview", "web_search_preview_2025_03_11"}
 SEARCH_CHAT_MODEL_PREFIXES = (
@@ -155,6 +156,12 @@ def text_with_url_citations(result: dict[str, Any]) -> tuple[str, list[dict[str,
 
 def run_web_search(query: str) -> dict[str, Any]:
     token = account_service.get_text_access_token()
-    result = OpenAIBackendAPI(token).search(query)
-    account_service.mark_text_used(token)
-    return result
+    backend = OpenAIBackendAPI(token)
+    try:
+        result = backend.search(query)
+        record_backend_proxy_result(backend, True)
+        account_service.mark_text_used(token)
+        return result
+    except Exception as exc:
+        record_backend_proxy_result(backend, not is_proxy_transport_error(exc))
+        raise

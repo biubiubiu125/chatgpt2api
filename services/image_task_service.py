@@ -13,6 +13,7 @@ from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 from services.account_service import account_service
+from services.proxy_service import is_proxy_transport_error, record_backend_proxy_result
 from utils.helper import is_codex_image_model, parse_image_size
 
 TASK_STATUS_QUEUED = "queued"
@@ -98,6 +99,10 @@ def _account_ref_from_token(access_token: str) -> dict[str, str]:
     if account_email:
         ref["account_email"] = account_email
     return ref
+
+
+def _record_backend_proxy_result(backend: object, ok: bool) -> None:
+    record_backend_proxy_result(backend, ok)
 
 
 def _resolve_account_token(account_id: str = "", account_email: str = "") -> str:
@@ -665,6 +670,7 @@ class ImageTaskService:
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
+        backend = None
         try:
             from services.openai_backend_api import OpenAIBackendAPI
             from services.protocol.conversation import ensure_image_canvas_size, format_image_result
@@ -701,6 +707,7 @@ class ImageTaskService:
                 int(time.time()),
             )["data"]
             self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
+            _record_backend_proxy_result(backend, True)
             self._log_call(
                 identity,
                 mode,
@@ -714,6 +721,8 @@ class ImageTaskService:
             )
         except Exception as exc:
             error_message = str(exc) or "resume poll failed"
+            if backend is not None:
+                _record_backend_proxy_result(backend, not is_proxy_transport_error(error_message))
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[], duration_ms=duration_ms)
             self._log_call(

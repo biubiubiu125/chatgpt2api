@@ -228,13 +228,17 @@ def create_router() -> APIRouter:
                 extra_result = account_service.add_accounts(extra_tokens)
                 result["added"] = int(result.get("added") or 0) + int(extra_result.get("added") or 0)
                 result["skipped"] = int(result.get("skipped") or 0) + int(extra_result.get("skipped") or 0)
+                result["removed_unusable"] = int(result.get("removed_unusable") or 0) + int(extra_result.get("removed_unusable") or 0)
+                result["items"] = extra_result.get("items", result.get("items", []))
         else:
             result = account_service.add_accounts(tokens)
-        refresh_result = account_service.refresh_accounts(tokens)
+        refresh_tokens = [token for token in tokens if account_service.get_account(token) is not None]
+        refresh_result = account_service.refresh_accounts(refresh_tokens)
         return {
             **result,
             "refreshed": refresh_result.get("refreshed", 0),
             "errors": refresh_result.get("errors", []),
+            "removed_unusable": int(result.get("removed_unusable") or 0) + int(refresh_result.get("removed_unusable") or 0),
             "items": refresh_result.get("items", result.get("items", [])),
         }
 

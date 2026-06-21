@@ -6,8 +6,6 @@ import random
 import re
 import time
 
-import urllib.error
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
@@ -167,8 +165,10 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
+        self.proxy_profile = proxy_settings.get_profile(account=self.account, upstream=True)
         self.session = requests.Session(**proxy_settings.build_session_kwargs(
             account=self.account,
+            profile=self.proxy_profile,
             impersonate=self.fp["impersonate"],
             verify=True,
         ))
@@ -250,6 +250,9 @@ class OpenAIBackendAPI:
         if response.status_code == 401:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
         raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
+
+    def record_proxy_result(self, ok: bool) -> None:
+        proxy_settings.record_proxy_result(self.proxy_profile.proxy_url, ok=ok, source=self.proxy_profile.proxy_source)
 
     def _get_me(self) -> Dict[str, Any]:
         path = "/backend-api/me"
@@ -657,9 +660,10 @@ class OpenAIBackendAPI:
 
     @staticmethod
     def _iter_codex_response_events(raw: Any) -> Iterator[Dict[str, Any]]:
-        content_type = str(raw.headers.get("content-type") or "").lower()
-        text = raw.read().decode("utf-8", "replace")
-        status_code = getattr(raw, "status", None)
+        headers = getattr(raw, "headers", {}) or {}
+        content_type = str(headers.get("content-type") or "").lower()
+        text = raw.text if isinstance(getattr(raw, "text", None), str) else raw.read().decode("utf-8", "replace")
+        status_code = getattr(raw, "status_code", getattr(raw, "status", None))
         parse_errors: list[str] = []
         events: list[Dict[str, Any]] = []
         if "application/json" in content_type:
@@ -740,12 +744,6 @@ class OpenAIBackendAPI:
             "tool_choice": {"type": "image_generation"},
             "stream": True,
         }
-        request = urllib.request.Request(
-            self.base_url + path,
-            json.dumps(payload).encode(),
-            self._codex_responses_headers(),
-            method="POST",
-        )
         account = account_service.get_account(self.access_token) or {}
         token_payload = account_service._decode_jwt_payload(self.access_token)
         auth_claim = token_payload.get("https://api.openai.com/auth")
@@ -754,8 +752,10 @@ class OpenAIBackendAPI:
         logger.info({
             "event": "codex_responses_request_debug",
             "url": self.base_url + path,
-            "transport": "urllib.request",
+            "transport": "curl_cffi.session",
             "timeout_secs": 1200,
+            "proxy_source": self.proxy_profile.proxy_source,
+            "has_proxy": bool(self.proxy_profile.proxy_url),
             "account_email": str(account.get("email") or "").strip(),
             "source_type": str(account.get("source_type") or "").strip(),
             "account_type": str(account.get("type") or "").strip(),
@@ -788,19 +788,27 @@ class OpenAIBackendAPI:
             },
         })
         try:
-            with urllib.request.urlopen(request, timeout=1200) as raw:
-                yield from self._iter_codex_response_events(raw)
-        except urllib.error.HTTPError as error:
-            body_text = error.read().decode("utf-8", "replace")
+            response = self.session.post(
+                self.base_url + path,
+                headers=self._codex_responses_headers(),
+                json=payload,
+                timeout=1200,
+            )
+            if response.status_code >= 400:
+                retry_after_header = response.headers.get("Retry-After") if hasattr(response, "headers") else None
+                retry_after = int(str(retry_after_header).strip()) if str(retry_after_header or "").strip().isdigit() else None
+                raise UpstreamHTTPError(path, response.status_code, response.text, retry_after=retry_after)
+            yield from self._iter_codex_response_events(response)
+        except UpstreamHTTPError as error:
+            body_text = str(error.body or "")
             body: Any = body_text
             try:
                 body = json.loads(body_text)
             except Exception:
                 pass
-            self._log_codex_response_failure(path, error.code, error.headers, payload, body)
-            retry_after_header = error.headers.get("Retry-After") if error.headers else None
-            retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
-            raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
+            retry_after = getattr(error, "retry_after", None)
+            self._log_codex_response_failure(path, error.status_code, {"Retry-After": retry_after}, payload, body)
+            raise UpstreamHTTPError(path, error.status_code, body, retry_after=retry_after) from error
 
     @staticmethod
     def _image_generation_metadata(size: str | None = None, quality: str = "auto") -> Dict[str, Any]:

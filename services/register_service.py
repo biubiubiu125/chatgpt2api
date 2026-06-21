@@ -12,9 +12,17 @@ from services.account_service import account_service
 from services.config import DATA_DIR
 from services.log_service import LOG_TYPE_ACCOUNT, log_service
 from services.register import mail_provider, openai_register
+from services.register.proxy_pool import RegisterProxySelection, register_proxy_pool
 
 
 REGISTER_FILE = DATA_DIR / "register.json"
+REGISTER_FATAL_FAILURE_REASONS = {
+    "unsupported_email",
+    "account_create_failed",
+    "register_proxy_unavailable",
+}
+REGISTER_FATAL_FAILURE_LIMIT = 5
+REGISTER_STALL_FAILURE_REASON = "register_task_stalled"
 
 
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
@@ -64,6 +72,13 @@ def _default_auto_refill_config() -> dict:
     }
 
 
+def _int_or_default(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _default_config() -> dict:
     return {
         **openai_register.config,
@@ -98,6 +113,25 @@ def _normalize(raw: dict) -> dict:
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
+    cfg["proxy_input_mode"] = str(cfg.get("proxy_input_mode") or "single").strip()
+    if cfg["proxy_input_mode"] not in {"single", "url", "text", "proxy_checker_dir"}:
+        cfg["proxy_input_mode"] = "single"
+    cfg["proxy_url"] = str(cfg.get("proxy_url") or "").strip()
+    cfg["proxy_list_text"] = str(cfg.get("proxy_list_text") or "")
+    cfg["proxy_checker_dir"] = str(cfg.get("proxy_checker_dir") or "/opt/proxy-checker/repo_data").strip()
+    cfg["proxy_checker_pattern"] = str(cfg.get("proxy_checker_pattern") or "user_*.txt").strip()
+    cfg["proxy_refresh_interval"] = max(10, _int_or_default(cfg.get("proxy_refresh_interval"), 120))
+    cfg["proxy_bind_url"] = bool(cfg.get("proxy_bind_url"))
+    cfg["proxy_bind_text"] = bool(cfg.get("proxy_bind_text"))
+    cfg["proxy_bind_proxy_checker"] = bool(cfg.get("proxy_bind_proxy_checker", True))
+    cfg.pop("proxy_cloudflare_cooldown_minutes", None)
+    cfg.pop("proxy_network_cooldown_minutes", None)
+    cfg["proxy_failure_threshold"] = max(1, _int_or_default(cfg.get("proxy_failure_threshold"), 2))
+    cfg["proxy_blacklist_seconds"] = max(30, _int_or_default(cfg.get("proxy_blacklist_seconds"), 900))
+    cfg["proxy_success_clear_failures"] = bool(cfg.get("proxy_success_clear_failures", True))
+    cfg["task_timeout_seconds"] = max(30, int(cfg.get("task_timeout_seconds") or 300))
+    cfg["task_stall_timeout_seconds"] = max(0, _int_or_default(cfg.get("task_stall_timeout_seconds"), 60))
+    cfg["proxy_lease_seconds"] = max(10, _int_or_default(cfg.get("proxy_lease_seconds"), 120))
     auto_refill_raw = cfg.get("auto_refill") if isinstance(cfg.get("auto_refill"), dict) else {}
     auto_refill = {**_default_auto_refill_config(), **auto_refill_raw}
     auto_refill["enabled"] = bool(auto_refill.get("enabled"))
@@ -106,6 +140,7 @@ def _normalize(raw: dict) -> dict:
     auto_refill["check_interval"] = max(10, int(auto_refill.get("check_interval") or 300))
     cfg["auto_refill"] = auto_refill
     if isinstance(cfg.get("mail"), dict):
+        cfg["mail"]["api_use_register_proxy"] = bool(cfg["mail"].get("api_use_register_proxy", True))
         cfg["mail"].pop("proxy", None)
     _normalize_mail_providers(cfg)
     cfg["enabled"] = bool(cfg.get("enabled"))
@@ -120,6 +155,9 @@ class RegisterService:
         self._store_file = store_file
         self._lock = threading.RLock()
         self._runner: threading.Thread | None = None
+        self._stop_event: threading.Event | None = None
+        self._run_id = ""
+        self._active_futures: set = set()
         self._logs: list[dict] = []
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
@@ -233,8 +271,12 @@ class RegisterService:
     def _inject_proxy_to_run_config(run_config: dict) -> dict:
         next_config = dict(run_config)
         proxy = str(next_config.get("proxy") or "").strip()
-        if proxy and isinstance(next_config.get("mail"), dict):
+        mail = next_config.get("mail") if isinstance(next_config.get("mail"), dict) else {}
+        if proxy and bool(mail.get("api_use_register_proxy", True)):
             next_config["mail"] = {**next_config["mail"], "proxy": proxy}
+        elif isinstance(next_config.get("mail"), dict):
+            next_config["mail"] = dict(next_config["mail"])
+            next_config["mail"].pop("proxy", None)
         return next_config
 
     def update(self, updates: dict) -> dict:
@@ -242,9 +284,13 @@ class RegisterService:
             self._merge_outlook_pools(updates)
             self._config = _normalize({**self._config, **updates})
             self._drop_mail_proxy()
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+            self._sync_openai_register_config(self._config)
             self._save()
             return self.get()
+
+    @staticmethod
+    def _sync_openai_register_config(cfg: dict) -> None:
+        openai_register.config.update({key: cfg[key] for key in openai_register.config if key in cfg})
 
     def start(self) -> dict:
         return self._start(trigger="manual")
@@ -257,7 +303,8 @@ class RegisterService:
     ) -> dict:
         with self._lock:
             if self._runner and self._runner.is_alive():
-                self._config["enabled"] = True
+                if not (self._stop_event and self._stop_event.is_set()):
+                    self._config["enabled"] = True
                 self._save()
                 if trigger == "auto_refill":
                     current_available = int(self._config.get("stats", {}).get("current_available") or 0)
@@ -276,8 +323,15 @@ class RegisterService:
             self._drop_mail_proxy()
             self._logs = []
             metrics = self._pool_metrics()
+            register_proxy_pool.configure(run_config)
+            register_proxy_pool.prepare(force=True)
+            self._stop_event = threading.Event()
+            self._active_futures = set()
+            openai_register.clear_worker_states()
+            job_id = uuid.uuid4().hex
+            self._run_id = job_id
             self._config["stats"] = {
-                "job_id": uuid.uuid4().hex,
+                "job_id": job_id,
                 "success": 0,
                 "fail": 0,
                 "done": 0,
@@ -289,12 +343,15 @@ class RegisterService:
                 "trigger": trigger,
                 "run_mode": run_config["mode"],
                 "run_total": run_config["total"],
+                "proxy_pool": register_proxy_pool.state(),
+                "workers": [],
             }
-            openai_register.config.update({k: run_config[k] for k in ("mail", "proxy", "total", "threads")})
+            self._sync_openai_register_config(run_config)
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
             self._save()
-            self._runner = threading.Thread(target=self._run, args=(run_config, trigger), daemon=True, name="openai-register")
+            openai_register.set_active_run_id(job_id)
+            self._runner = threading.Thread(target=self._run, args=(run_config, trigger, self._stop_event, job_id), daemon=True, name="openai-register")
             self._runner.start()
             if trigger_log:
                 self._append_log(trigger_log, "yellow")
@@ -322,9 +379,30 @@ class RegisterService:
     def stop(self) -> dict:
         with self._lock:
             self._config["enabled"] = False
+            job_id = str(self._run_id or self._config.get("stats", {}).get("job_id") or "")
+            stop_event = self._stop_event
+            futures: set = set()
+            if self._stop_event is not None:
+                self._stop_event.set()
+            released_leases = 0
+            if job_id or futures:
+                _, released_leases = self._invalidate_running_workers(
+                    run_id=job_id,
+                    stop_event=stop_event,
+                    futures=set(),
+                    reason="register_task_stopped",
+                    error="register task stopped by user",
+                    failed=False,
+                )
+            job_id = str(self._config.get("stats", {}).get("job_id") or "")
+            if job_id:
+                openai_register.clear_active_run_id(job_id)
             self._config["stats"]["updated_at"] = _now()
             self._save()
-            self._append_log("已请求停止注册任务，正在等待当前运行任务结束", "yellow")
+            self._append_log(
+                f"已请求停止注册任务，已释放代理租约 {released_leases} 个；未开始任务会由运行线程统一取消，运行中的底层请求会在超时后退出",
+                "yellow",
+            )
             return self.get()
 
     def reset(self) -> dict:
@@ -345,7 +423,7 @@ class RegisterService:
         if scope == "unused":
             with self._lock:
                 removed = self._prune_unused_outlook_pools()
-                openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+                self._sync_openai_register_config(self._config)
                 self._save()
                 self._append_log(f"已清空 Outlook 邮箱池未使用邮箱，移除 {removed} 个", "yellow")
             return self.get()
@@ -356,6 +434,18 @@ class RegisterService:
                 f"已重置 Outlook 邮箱池状态（范围={'仅失败/占用' if scope == 'failed' else '全部'}），清除 {cleared} 条记录",
                 "yellow",
             )
+        return self.get()
+
+    def reset_proxy_blacklist(self) -> dict:
+        with self._lock:
+            if self._config.get("enabled"):
+                self._append_log("注册任务运行中，不能重置注册代理黑名单/租约状态，请先停止任务", "yellow")
+                return self.get()
+        cleared = register_proxy_pool.reset_blacklist()
+        with self._lock:
+            self._append_log(f"已重置注册代理黑名单/租约状态，清理 {cleared} 条记录", "yellow")
+            self._config["stats"]["proxy_pool"] = register_proxy_pool.state()
+            self._save()
         return self.get()
 
     def _append_log(self, text: str, color: str = "") -> None:
@@ -416,6 +506,8 @@ class RegisterService:
 
     def _bump(self, **updates) -> None:
         with self._lock:
+            updates.setdefault("proxy_pool", register_proxy_pool.state())
+            updates.setdefault("workers", openai_register.get_worker_states())
             self._config["stats"].update(updates)
             stats = self._config["stats"]
             started_at = str(stats.get("started_at") or "")
@@ -433,35 +525,242 @@ class RegisterService:
             self._config["stats"]["updated_at"] = _now()
             self._save()
 
-    def _run(self, run_config: dict | None = None, trigger: str = "manual") -> None:
+    def _set_active_futures(self, futures: set) -> None:
+        with self._lock:
+            self._active_futures = set(futures)
+
+    @staticmethod
+    def _parse_iso_timestamp(value: object) -> float:
+        raw = str(value or "").strip()
+        if not raw:
+            return 0.0
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0.0
+
+    def _stalling_worker_states(self, stall_timeout_seconds: int) -> list[dict]:
+        if stall_timeout_seconds <= 0:
+            return []
+        now = time.time()
+        stalled: list[dict] = []
+        for worker in openai_register.get_worker_states():
+            status = str(worker.get("status") or "")
+            if status not in openai_register.WORKER_STATE_ACTIVE_STATUSES:
+                continue
+            updated_at = self._parse_iso_timestamp(worker.get("updated_at"))
+            if updated_at and now - updated_at >= stall_timeout_seconds:
+                stalled.append(worker)
+        return stalled
+
+    @staticmethod
+    def _active_worker_states() -> list[dict]:
+        return [
+            worker
+            for worker in openai_register.get_worker_states()
+            if str(worker.get("status") or "") in openai_register.WORKER_STATE_ACTIVE_STATUSES
+        ]
+
+    @staticmethod
+    def _worker_indexes(workers: list[dict]) -> list[int]:
+        indexes: list[int] = []
+        for worker in workers:
+            raw_index = worker.get("index")
+            if str(raw_index or "").isdigit():
+                indexes.append(int(raw_index))
+        return indexes
+
+    @staticmethod
+    def _release_worker_proxy_leases(workers: list[dict]) -> int:
+        released = 0
+        for worker in workers:
+            if register_proxy_pool.release(worker.get("proxy"), worker.get("proxy_lease_id")):
+                released += 1
+        return released
+
+    @staticmethod
+    def _mark_stalled_worker_proxies(workers: list[dict]) -> int:
+        marked = 0
+        for worker in workers:
+            proxy = str(worker.get("proxy") or "").strip()
+            if not proxy:
+                continue
+            register_proxy_pool.report(
+                RegisterProxySelection(proxy=proxy, lease_id=str(worker.get("proxy_lease_id") or "")),
+                ok=False,
+                reason=REGISTER_STALL_FAILURE_REASON,
+                error="register task stalled",
+            )
+            marked += 1
+        return marked
+
+    def _invalidate_running_workers(
+        self,
+        *,
+        run_id: str,
+        stop_event: threading.Event | None,
+        futures: set,
+        reason: str,
+        error: str,
+        failed: bool = False,
+    ) -> tuple[int, int]:
+        openai_register.clear_active_run_id(run_id)
+        if stop_event is not None:
+            stop_event.set()
+        active_workers = self._active_worker_states()
+        active_indexes = self._worker_indexes(active_workers)
+        released_leases = self._release_worker_proxy_leases(active_workers)
+        if failed:
+            openai_register.mark_worker_states_failed_for_run(active_indexes, run_id, reason, error)
+        else:
+            openai_register.mark_worker_states_stopped_for_run(active_indexes, run_id, error)
+        for future in list(futures):
+            future.cancel()
+        return len(futures), released_leases
+
+    def _run(
+        self,
+        run_config: dict | None = None,
+        trigger: str = "manual",
+        stop_event: threading.Event | None = None,
+        run_id: str = "",
+    ) -> None:
         base_config = dict(run_config or self.get())
         threads = int(base_config["threads"])
         submitted, done, success, fail = 0, 0, 0, 0
-        with ThreadPoolExecutor(max_workers=threads) as executor:
+        fatal_reason = ""
+        fatal_logged = False
+        fatal_streak = 0
+        stall_logged = False
+        stop_event = stop_event or threading.Event()
+        executor = ThreadPoolExecutor(max_workers=threads)
+        shutdown_wait = True
+        try:
             futures = set()
             while True:
                 cfg = dict(base_config if trigger == "auto_refill" else self.get())
-                while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
+                self._set_active_futures(futures)
+                if stop_event and stop_event.is_set():
+                    cancelled_count, released_leases = self._invalidate_running_workers(
+                        run_id=run_id,
+                        stop_event=stop_event,
+                        futures=futures,
+                        reason="register_task_stopped",
+                        error="register task stopped by user",
+                        failed=False,
+                    )
+                    done += cancelled_count
+                    futures.clear()
+                    shutdown_wait = False
+                    self._append_log(
+                        f"注册任务已停止，已释放代理租约 {released_leases} 个，已取消未开始任务 {cancelled_count} 个",
+                        "yellow",
+                    )
+                    break
+                stalled_workers = self._stalling_worker_states(int(cfg.get("task_stall_timeout_seconds") or 0))
+                if stalled_workers and not stop_event.is_set():
+                    fatal_reason = REGISTER_STALL_FAILURE_REASON
+                    shutdown_wait = False
+                    marked_proxies = self._mark_stalled_worker_proxies(stalled_workers)
+                    cancelled_count, released_leases = self._invalidate_running_workers(
+                        run_id=run_id,
+                        stop_event=stop_event,
+                        futures=futures,
+                        reason=REGISTER_STALL_FAILURE_REASON,
+                        error="register task stalled",
+                        failed=True,
+                    )
+                    fail += cancelled_count
+                    done += cancelled_count
+                    futures.clear()
+                    if not stall_logged:
+                        worker_refs = ", ".join(
+                            f"#{worker.get('index')} {worker.get('status')} {worker.get('step') or worker.get('last_error') or ''}".strip()
+                            for worker in stalled_workers[:5]
+                        )
+                        self._append_log(
+                            f"注册任务超过 {int(cfg.get('task_stall_timeout_seconds') or 0)} 秒无进展，已请求强制停止：{worker_refs}；已标记代理 {marked_proxies} 个，已释放代理租约 {released_leases} 个，未开始的任务已取消，运行中的底层请求会在超时后退出",
+                            "red",
+                        )
+                        stall_logged = True
+                    break
+                while (
+                    self.get()["enabled"]
+                    and not fatal_reason
+                    and not (stop_event and stop_event.is_set())
+                    and not self._target_reached(cfg, submitted)
+                    and len(futures) < threads
+                ):
                     submitted += 1
-                    futures.add(executor.submit(openai_register.worker, submitted))
+                    futures.add(executor.submit(openai_register.worker, submitted, stop_event, None, cfg.get("task_timeout_seconds"), run_id))
+                    self._set_active_futures(futures)
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
                 if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
                     break
+                if fatal_reason and not futures:
+                    break
                 if not futures:
-                    time.sleep(max(1, int(cfg.get("check_interval") or 5)))
+                    if stop_event and stop_event.wait(max(1, int(cfg.get("check_interval") or 5))):
+                        break
+                    if not stop_event:
+                        time.sleep(max(1, int(cfg.get("check_interval") or 5)))
                     continue
-                finished, futures = wait(futures, return_when=FIRST_COMPLETED)
+                finished, futures = wait(futures, timeout=1, return_when=FIRST_COMPLETED)
+                if not finished:
+                    self._bump(running=len(futures), done=done, success=success, fail=fail)
+                    continue
                 for future in finished:
                     done += 1
                     try:
                         result = future.result()
-                        success += 1 if result.get("ok") else 0
-                        fail += 0 if result.get("ok") else 1
+                        if result.get("ok"):
+                            success += 1
+                            fatal_streak = 0
+                        elif not result.get("stopped"):
+                            fail += 1
+                            reason = str(result.get("reason") or "")
+                            if reason in REGISTER_FATAL_FAILURE_REASONS:
+                                fatal_streak += 1
+                                if fatal_streak >= REGISTER_FATAL_FAILURE_LIMIT:
+                                    fatal_reason = reason
+                            else:
+                                fatal_streak = 0
                     except Exception:
                         fail += 1
+                        fatal_streak = 0
+                if fatal_reason and not fatal_logged:
+                    cancelled_count, released_leases = self._invalidate_running_workers(
+                        run_id=run_id,
+                        stop_event=stop_event,
+                        futures=futures,
+                        reason=fatal_reason,
+                        error=f"fatal register failure: {fatal_reason}",
+                        failed=True,
+                    )
+                    fail += cancelled_count
+                    done += cancelled_count
+                    futures.clear()
+                    shutdown_wait = False
+                    if stop_event is not None:
+                        stop_event.set()
+                    if fatal_reason != REGISTER_STALL_FAILURE_REASON:
+                        self._append_log(
+                            f"连续 {REGISTER_FATAL_FAILURE_LIMIT} 次遇到确定性失败（{fatal_reason}），已停止本轮注册任务，请先检查邮箱域名、代理来源或注册配置",
+                            "red",
+                        )
+                    fatal_logged = True
+                    break
+        finally:
+            self._set_active_futures(set())
+            executor.shutdown(wait=shutdown_wait, cancel_futures=True)
+            openai_register.clear_active_run_id(run_id)
         self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
         with self._lock:
             self._config["enabled"] = False
+            if self._stop_event is stop_event:
+                self._stop_event = None
+            if self._run_id == run_id:
+                self._run_id = ""
             self._save()
         self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow")
 

@@ -219,6 +219,7 @@ def _config(mail_config: dict) -> dict:
         "wait_interval": float(mail_config.get("wait_interval") or 2),
         "user_agent": str(mail_config.get("user_agent") or "Mozilla/5.0"),
         "proxy": str(mail_config.get("proxy") or "").strip(),
+        "deadline": mail_config.get("_deadline"),
     }
 
 
@@ -372,18 +373,49 @@ class BaseMailProvider:
         self.conf = conf
         self.provider_ref = provider_ref
 
-    def wait_for(self, mailbox: dict[str, Any], on_message: Callable[[dict[str, Any]], ResultT | None]) -> ResultT | None:
-        deadline = time.monotonic() + self.conf["wait_timeout"]
-        while time.monotonic() < deadline:
-            message = self.fetch_latest_message(mailbox)
-            if message:
-                result = on_message(message)
-                if result is not None:
-                    return result
-            time.sleep(max(0.2, self.conf["wait_interval"]))
-        return None
+    @staticmethod
+    def _sleep_with_control(seconds: float, check_control: Callable[[], None] | None = None) -> None:
+        end_at = time.monotonic() + max(0.0, seconds)
+        while True:
+            if check_control is not None:
+                check_control()
+            remaining = end_at - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.5, remaining))
 
-    def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
+    def wait_for(
+        self,
+        mailbox: dict[str, Any],
+        on_message: Callable[[dict[str, Any]], ResultT | None],
+        check_control: Callable[[], None] | None = None,
+    ) -> ResultT | None:
+        deadline = time.monotonic() + self.conf["wait_timeout"]
+        sentinel = object()
+        previous_check = self.conf.get("_check_control", sentinel)
+        if check_control is not None:
+            self.conf["_check_control"] = check_control
+        try:
+            while time.monotonic() < deadline:
+                if check_control is not None:
+                    check_control()
+                message = self.fetch_latest_message(mailbox)
+                if check_control is not None:
+                    check_control()
+                if message:
+                    result = on_message(message)
+                    if result is not None:
+                        return result
+                self._sleep_with_control(max(0.2, self.conf["wait_interval"]), check_control)
+            return None
+        finally:
+            if check_control is not None:
+                if previous_check is sentinel:
+                    self.conf.pop("_check_control", None)
+                else:
+                    self.conf["_check_control"] = previous_check
+
+    def wait_for_code(self, mailbox: dict[str, Any], check_control: Callable[[], None] | None = None) -> str | None:
         seen_value = mailbox.setdefault("_seen_code_message_refs", [])
         if not isinstance(seen_value, list):
             seen_value = []
@@ -400,7 +432,23 @@ class BaseMailProvider:
                 seen_refs.add(ref)
             return code
 
-        return self.wait_for(mailbox, extract_unseen_code)
+        return self.wait_for(mailbox, extract_unseen_code, check_control)
+
+    def request_timeout(self) -> float:
+        timeout = max(0.5, float(self.conf.get("request_timeout") or 30))
+        deadline = self.conf.get("deadline")
+        if deadline is None:
+            return timeout
+        try:
+            remaining = float(deadline) - time.monotonic()
+        except (TypeError, ValueError):
+            return timeout
+        if remaining <= 0:
+            return 0.5
+        return max(0.5, min(timeout, remaining))
+
+    def retry_sleep(self, seconds: float, check_control: Callable[[], None] | None = None) -> None:
+        self._sleep_with_control(seconds, check_control)
 
     def close(self) -> None:
         pass
@@ -417,7 +465,7 @@ class CloudflareTempMailProvider(BaseMailProvider):
         self.session = _create_session(conf)
 
     def _request(self, method: str, path: str, headers: dict | None = None, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200,)):
-        resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers={"Content-Type": "application/json", "User-Agent": self.conf["user_agent"], **(headers or {})}, params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
+        resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers={"Content-Type": "application/json", "User-Agent": self.conf["user_agent"], **(headers or {})}, params=params, json=payload, timeout=self.request_timeout(), verify=False)
         if resp.status_code not in expected:
             raise RuntimeError(f"CloudflareTempMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
         return {} if resp.status_code == 204 else resp.json()
@@ -488,13 +536,13 @@ class DDGMailProvider(BaseMailProvider):
             merged_headers["x-admin-auth"] = self.cf_admin_password
         if self.cf_api_key and self.cf_auth_mode == "query-key":
             params = {**(params or {}), "key": self.cf_api_key}
-        resp = self.session.request(method.upper(), f"{self.cf_api_base}{path}", headers=merged_headers, params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
+        resp = self.session.request(method.upper(), f"{self.cf_api_base}{path}", headers=merged_headers, params=params, json=payload, timeout=self.request_timeout(), verify=False)
         if resp.status_code not in expected:
             raise RuntimeError(f"DDGMail CF请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
         return {} if resp.status_code == 204 else resp.json()
 
     def _ddg_request(self, method: str, path: str, payload: dict | None = None) -> dict:
-        resp = self.session.request(method.upper(), f"https://quack.duckduckgo.com{path}", headers={"Authorization": f"Bearer {self.ddg_token}", "Content-Type": "application/json", "User-Agent": self.conf["user_agent"]}, json=payload, timeout=self.conf["request_timeout"], verify=False)
+        resp = self.session.request(method.upper(), f"https://quack.duckduckgo.com{path}", headers={"Authorization": f"Bearer {self.ddg_token}", "Content-Type": "application/json", "User-Agent": self.conf["user_agent"]}, json=payload, timeout=self.request_timeout(), verify=False)
         if resp.status_code not in (200, 201):
             raise RuntimeError(f"DDG API请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
         return resp.json()
@@ -610,7 +658,7 @@ class CloudMailGenProvider(BaseMailProvider):
             },
             params=params,
             json=payload,
-            timeout=self.conf["request_timeout"],
+            timeout=self.request_timeout(),
             verify=False,
         )
         if resp.status_code not in expected:
@@ -619,6 +667,52 @@ class CloudMailGenProvider(BaseMailProvider):
 
     def _cache_key(self) -> str:
         return f"{self.api_base}|{self.admin_email}"
+
+    @staticmethod
+    def _business_error(data: Any, action: str) -> RuntimeError | None:
+        if not isinstance(data, dict):
+            return RuntimeError(f"CloudMailGen {action} 返回结构不是对象: {data}")
+        code = data.get("code")
+        if str(code).strip() == "200":
+            return None
+        message = str(data.get("message") or data.get("msg") or data.get("error") or data)[:300]
+        return RuntimeError(f"CloudMailGen {action} 返回异常: code={code}, message={message}")
+
+    @staticmethod
+    def _is_retryable_error(error: object) -> bool:
+        text = str(error)
+        return any(
+            marker in text
+            for marker in (
+                "HTTP 429",
+                "HTTP 500",
+                "HTTP 502",
+                "HTTP 503",
+                "HTTP 504",
+                "code=429",
+                "code=500",
+                "code=502",
+                "code=503",
+                "code=504",
+            )
+        )
+
+    @staticmethod
+    def _is_token_error(error: object) -> bool:
+        text = str(error)
+        return any(
+            marker in text
+            for marker in (
+                "HTTP 401",
+                "HTTP 403",
+                "token",
+                "Token",
+                "code=401",
+                "code=403",
+                "unauthorized",
+                "Unauthorized",
+            )
+        )
 
     def _get_token(self) -> str:
         if not self.admin_email or not self.admin_password:
@@ -629,19 +723,40 @@ class CloudMailGenProvider(BaseMailProvider):
             cached = cloudmail_token_cache.get(cache_key)
             if cached and now < cached[1] - 300:
                 return cached[0]
-        data = self._request(
-            "POST",
-            "/api/public/genToken",
-            payload={"email": self.admin_email, "password": self.admin_password},
-        )
+        data = self._get_token_payload()
         token = ""
-        if isinstance(data, dict) and data.get("code") == 200:
+        if isinstance(data, dict) and str(data.get("code")).strip() == "200":
             token = str((data.get("data") or {}).get("token") or "").strip()
         if not token:
             raise RuntimeError(f"CloudMailGen genToken 返回异常: {data}")
         with cloudmail_token_lock:
             cloudmail_token_cache[cache_key] = (token, now + 24 * 3600)
         return token
+
+    def _get_token_payload(self) -> dict[str, Any]:
+        last_error: Exception | None = None
+        check_control = self.conf.get("_check_control")
+        for attempt in range(3):
+            if check_control is not None:
+                check_control()
+            try:
+                data = self._request(
+                    "POST",
+                    "/api/public/genToken",
+                    payload={"email": self.admin_email, "password": self.admin_password},
+                )
+                error = self._business_error(data, "genToken")
+                if error is not None:
+                    raise error
+                return data
+            except Exception as exc:
+                last_error = exc
+                if check_control is not None:
+                    check_control()
+                if not self._is_retryable_error(exc):
+                    raise
+                self.retry_sleep(min(3, 1 + attempt), check_control)
+        raise RuntimeError(last_error or "CloudMailGen genToken retry failed")
 
     def _resolve_address(self, username: str | None = None) -> str:
         domain = _next_domain(self.domain)
@@ -655,6 +770,42 @@ class CloudMailGenProvider(BaseMailProvider):
             local_part = _random_mailbox_name()
         return f"{local_part}@{domain}"
 
+    def _email_list(
+        self,
+        token: str,
+        address: str,
+        check_control: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        if check_control is None:
+            check_control = self.conf.get("_check_control")
+        last_error: Exception | None = None
+        for attempt in range(3):
+            if check_control is not None:
+                check_control()
+            try:
+                data = self._request(
+                    "POST",
+                    "/api/public/emailList",
+                    headers={"Authorization": token},
+                    payload={"toEmail": address, "size": 20, "timeSort": "desc"},
+                )
+                error = self._business_error(data, "emailList")
+                if error is not None:
+                    raise error
+                return data
+            except Exception as exc:
+                last_error = exc
+                if check_control is not None:
+                    check_control()
+                if not self._is_retryable_error(exc):
+                    raise
+                self.retry_sleep(min(3, 1 + attempt), check_control)
+        raise RuntimeError(last_error or "CloudMailGen emailList retry failed")
+
+    def _clear_token_cache(self) -> None:
+        with cloudmail_token_lock:
+            cloudmail_token_cache.pop(self._cache_key(), None)
+
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
         if not self.domain:
             raise RuntimeError("CloudMailGen 需要至少配置一个 domain")
@@ -666,13 +817,14 @@ class CloudMailGenProvider(BaseMailProvider):
         if not address:
             raise RuntimeError("CloudMailGen 缺少 address")
         token = self._get_token()
-        data = self._request(
-            "POST",
-            "/api/public/emailList",
-            headers={"Authorization": token},
-            payload={"toEmail": address, "size": 20, "timeSort": "desc"},
-        )
-        items = (data.get("data") or []) if isinstance(data, dict) and data.get("code") == 200 else []
+        try:
+            data = self._email_list(token, address)
+        except Exception as exc:
+            if not self._is_token_error(exc):
+                raise
+            self._clear_token_cache()
+            data = self._email_list(self._get_token(), address)
+        items = data.get("data") or []
         messages = [item for item in items if isinstance(item, dict) and _message_matches_email(item, address)]
         if not messages:
             return None
@@ -681,15 +833,21 @@ class CloudMailGenProvider(BaseMailProvider):
         return {
             "provider": self.name,
             "mailbox": address,
-            "message_id": str(item.get("id") or item.get("_id") or item.get("messageId") or ""),
-            "subject": str(item.get("subject") or ""),
-            "sender": str(item.get("from") or item.get("sender") or ""),
+            "message_id": str(item.get("id") or item.get("_id") or item.get("messageId") or item.get("emailId") or ""),
+            "subject": str(item.get("subject") or item.get("title") or ""),
+            "sender": str(item.get("from") or item.get("sender") or item.get("sendEmail") or item.get("fromEmail") or ""),
             "text_content": text_content,
             "html_content": html_content,
             "received_at": _parse_received_at(
-                item.get("createdAt") or item.get("created_at") or item.get("receivedAt") or item.get("date") or item.get("timestamp")
+                item.get("createdAt")
+                or item.get("created_at")
+                or item.get("receivedAt")
+                or item.get("date")
+                or item.get("timestamp")
+                or item.get("createTime")
+                or item.get("sendTime")
             ),
-            "to": item.get("to") or item.get("toEmail") or item.get("mailTo"),
+            "to": item.get("to") or item.get("toEmail") or item.get("mailTo") or item.get("receiveEmail"),
             "raw": item,
         }
 
@@ -717,7 +875,7 @@ class TempMailLolProvider(BaseMailProvider):
         return text, False
 
     def _request(self, method: str, path: str, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200,)):
-        resp = self.session.request(method.upper(), f"https://api.tempmail.lol/v2{path}", params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
+        resp = self.session.request(method.upper(), f"https://api.tempmail.lol/v2{path}", params=params, json=payload, timeout=self.request_timeout(), verify=False)
         if resp.status_code not in expected:
             raise RuntimeError(f"TempMail.lol 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
         data = resp.json()
@@ -767,7 +925,7 @@ class DuckMailProvider(BaseMailProvider):
 
     def _request(self, method: str, path: str, token: str = "", use_api_key: bool = False, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200, 201, 204)):
         headers = {"Authorization": f"Bearer {self.api_key if use_api_key else token}"} if use_api_key or token else {}
-        resp = self.session.request(method.upper(), f"https://api.duckmail.sbs{path}", headers=headers, params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
+        resp = self.session.request(method.upper(), f"https://api.duckmail.sbs{path}", headers=headers, params=params, json=payload, timeout=self.request_timeout(), verify=False)
         if resp.status_code not in expected:
             raise RuntimeError(f"DuckMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
         return {} if resp.status_code == 204 else resp.json()
@@ -817,7 +975,7 @@ class GptMailProvider(BaseMailProvider):
 
     def _request(self, method: str, path: str, params: dict | None = None, payload: dict | None = None):
         query = dict(params or {})
-        resp = self.session.request(method.upper(), f"https://mail.chatgpt.org.uk{path}", params=query, json=payload, timeout=self.conf["request_timeout"], verify=False)
+        resp = self.session.request(method.upper(), f"https://mail.chatgpt.org.uk{path}", params=query, json=payload, timeout=self.request_timeout(), verify=False)
         if resp.status_code != 200:
             raise RuntimeError(f"GPTMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
         data = resp.json()
@@ -858,7 +1016,7 @@ class MoEmailProvider(BaseMailProvider):
         self.session = _create_session(conf)
 
     def _request(self, method: str, path: str, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200,)):
-        resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers={"X-API-Key": self.api_key, "Content-Type": "application/json", "User-Agent": self.conf["user_agent"]}, params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
+        resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers={"X-API-Key": self.api_key, "Content-Type": "application/json", "User-Agent": self.conf["user_agent"]}, params=params, json=payload, timeout=self.request_timeout(), verify=False)
         if resp.status_code not in expected:
             raise RuntimeError(f"MoEmail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
         data = resp.json()
@@ -919,7 +1077,7 @@ class InbucketMailProvider(BaseMailProvider):
         resp = self.session.request(
             method.upper(),
             f"{self.api_base}{path}",
-            timeout=self.conf["request_timeout"],
+            timeout=self.request_timeout(),
             verify=False,
         )
         if resp.status_code not in expected:
@@ -1014,7 +1172,7 @@ class YydsMailProvider(BaseMailProvider):
 
     def _request(self, method: str, path: str, token: str = "", params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200, 201, 204)):
         headers = {"Authorization": f"Bearer {token}"} if token else {"X-API-Key": self.api_key}
-        resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers=headers, params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
+        resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers=headers, params=params, json=payload, timeout=self.request_timeout(), verify=False)
         if resp.status_code not in expected:
             raise RuntimeError(f"YYDSMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
         if resp.status_code == 204:
@@ -1145,7 +1303,7 @@ class OutlookTokenProvider(BaseMailProvider):
             OUTLOOK_TOKEN_URL,
             data={"client_id": client_id, "grant_type": "refresh_token", "refresh_token": refresh_token, "scope": scope},
             headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": self.conf["user_agent"]},
-            timeout=self.conf["request_timeout"],
+            timeout=self.request_timeout(),
             verify=False,
         )
         try:
@@ -1197,7 +1355,7 @@ class OutlookTokenProvider(BaseMailProvider):
             OUTLOOK_GRAPH_MESSAGES_URL,
             headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json", "User-Agent": self.conf["user_agent"]},
             params={"$top": self.message_limit, "$orderby": "receivedDateTime desc", "$select": "subject,receivedDateTime,from,body,bodyPreview"},
-            timeout=self.conf["request_timeout"],
+            timeout=self.request_timeout(),
             verify=False,
         )
         try:
@@ -1241,21 +1399,36 @@ class OutlookTokenProvider(BaseMailProvider):
         """返回最近 N 封邮件（Graph 已按 receivedDateTime desc 排序，最新在前）。"""
         return [self._normalize_graph_item(mailbox, item) for item in self._read_graph(access_token)]
 
-    def _imap_messages(self, mailbox: dict[str, Any], access_token: str) -> list[dict[str, Any]]:
+    def _imap_messages(
+        self,
+        mailbox: dict[str, Any],
+        access_token: str,
+        check_control: Callable[[], None] | None = None,
+    ) -> list[dict[str, Any]]:
         """返回最近 N 封邮件，最新在前。"""
         auth_string = f"user={mailbox['address']}\x01auth=Bearer {access_token}\x01\x01"
-        imap = imaplib.IMAP4_SSL(self.imap_host)
+        if check_control is not None:
+            check_control()
+        imap = imaplib.IMAP4_SSL(self.imap_host, timeout=self.request_timeout())
         try:
+            if check_control is not None:
+                check_control()
             imap.authenticate("XOAUTH2", lambda _: auth_string.encode("utf-8"))
+            if check_control is not None:
+                check_control()
             status, _ = imap.select("INBOX", readonly=True)
             if status != "OK":
                 raise RuntimeError("OutlookToken IMAP select INBOX 失败")
+            if check_control is not None:
+                check_control()
             status, data = imap.uid("search", None, "ALL")
             if status != "OK" or not data or not data[0]:
                 return []
             uids = data[0].split()[-self.message_limit :]
             messages: list[dict[str, Any]] = []
             for uid in reversed(uids):  # 最新在前
+                if check_control is not None:
+                    check_control()
                 status, fetched = imap.uid("fetch", uid, "(RFC822)")
                 if status != "OK":
                     continue
@@ -1311,7 +1484,11 @@ class OutlookTokenProvider(BaseMailProvider):
             "raw": None,
         }
 
-    def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
+    def fetch_recent_messages(
+        self,
+        mailbox: dict[str, Any],
+        check_control: Callable[[], None] | None = None,
+    ) -> list[dict[str, Any]]:
         """拉取最近 N 封邮件（最新在前），供 wait_for_code 逐封扫描验证码。"""
         client_id = str(mailbox.get("client_id") or "").strip()
         refresh_token = str(mailbox.get("refresh_token") or "").strip()
@@ -1320,7 +1497,11 @@ class OutlookTokenProvider(BaseMailProvider):
         errors: list[str] = []
         if self.mode in {"graph", "auto"}:
             try:
+                if check_control is not None:
+                    check_control()
                 access_token = self._access_token(mailbox, client_id, refresh_token, OUTLOOK_GRAPH_SCOPE)
+                if check_control is not None:
+                    check_control()
                 return self._graph_messages(mailbox, access_token)
             except Exception as error:
                 if self.mode == "graph":
@@ -1328,8 +1509,10 @@ class OutlookTokenProvider(BaseMailProvider):
                 errors.append(f"graph: {error}")
         if self.mode in {"imap", "auto"}:
             try:
+                if check_control is not None:
+                    check_control()
                 access_token = self._access_token(mailbox, client_id, refresh_token, OUTLOOK_IMAP_SCOPE)
-                return self._imap_messages(mailbox, access_token)
+                return self._imap_messages(mailbox, access_token, check_control)
             except Exception as error:
                 if self.mode == "imap":
                     raise
@@ -1342,7 +1525,7 @@ class OutlookTokenProvider(BaseMailProvider):
         messages = self.fetch_recent_messages(mailbox)
         return messages[0] if messages else None
 
-    def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
+    def wait_for_code(self, mailbox: dict[str, Any], check_control: Callable[[], None] | None = None) -> str | None:
         """轮询时遍历最近 N 封邮件，逐封提取验证码，避免最新一封是广告/安全提醒时错过验证码。"""
         seen_value = mailbox.setdefault("_seen_code_message_refs", [])
         if not isinstance(seen_value, list):
@@ -1352,7 +1535,11 @@ class OutlookTokenProvider(BaseMailProvider):
 
         deadline = time.monotonic() + self.conf["wait_timeout"]
         while time.monotonic() < deadline:
-            for message in self.fetch_recent_messages(mailbox):
+            if check_control is not None:
+                check_control()
+            for message in self.fetch_recent_messages(mailbox, check_control):
+                if check_control is not None:
+                    check_control()
                 ref = _message_tracking_ref(message)
                 if ref in seen_refs:
                     continue
@@ -1361,7 +1548,7 @@ class OutlookTokenProvider(BaseMailProvider):
                     seen_value.append(ref)
                     return code
                 seen_refs.add(ref)
-            time.sleep(max(0.2, self.conf["wait_interval"]))
+            self._sleep_with_control(max(0.2, self.conf["wait_interval"]), check_control)
         return None
 
 
@@ -1445,10 +1632,14 @@ def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
     raise RuntimeError(last_error or "所有启用的邮箱提供商均无法创建邮箱")
 
 
-def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
+def wait_for_code(
+    mail_config: dict,
+    mailbox: dict,
+    check_control: Callable[[], None] | None = None,
+) -> str | None:
     provider = _create_provider(mail_config, str(mailbox.get("provider") or ""), str(mailbox.get("provider_ref") or ""))
     try:
-        return provider.wait_for_code(mailbox)
+        return provider.wait_for_code(mailbox, check_control)
     finally:
         provider.close()
 

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import hashlib
 import json
+from pathlib import Path
 import re
 import threading
 import time
@@ -13,10 +15,13 @@ from urllib.parse import quote, urlparse
 
 from curl_cffi.requests import Session
 
-from services.config import config
+from services.config import DATA_DIR, config
 
 
 FlareSolverrRequestMethod = Callable[[str, bytes, dict[str, str], float], bytes]
+PROXY_POOL_CONNECT_TIMEOUT_SECONDS = 2.0
+PROXY_POOL_MAX_LATENCY_MS = 2000
+PROXY_POOL_STATE_FILE = DATA_DIR / "proxy_pool_state.json"
 
 
 def normalize_proxy_url(url: str) -> str:
@@ -160,13 +165,27 @@ class ProxySettingsStore:
         self,
         config_store=None,
         clearance_provider_factory: Callable[[str], FlareSolverrClearanceProvider] | None = None,
+        state_path: str | Path | None = None,
     ) -> None:
         self._config = config_store or config
         self._clearance_provider_factory = clearance_provider_factory or FlareSolverrClearanceProvider
         self._clearance_cache: dict[tuple[str, str], ClearanceBundle] = {}
         self._provider_cache: dict[str, FlareSolverrClearanceProvider] = {}
         self._flight_locks: dict[tuple[str, str], threading.Lock] = {}
+        self._pool_index = 0
+        self._state_path = Path(state_path) if state_path is not None else (PROXY_POOL_STATE_FILE if config_store is None else None)
+        self._pool_failures, self._pool_failure_sources = self._load_pool_failure_state()
         self._lock = threading.RLock()
+
+    @staticmethod
+    def _account_pool_key(account: dict | None) -> str:
+        if not isinstance(account, dict):
+            return ""
+        for key in ("email", "user_id", "id", "access_token"):
+            value = str(account.get(key) or "").strip()
+            if value:
+                return value
+        return ""
 
     def get_profile(
         self,
@@ -174,19 +193,25 @@ class ProxySettingsStore:
         proxy: str = "",
         resource: bool = False,
         upstream: bool = False,
+        select_pool: bool = True,
     ) -> ProxyRuntimeProfile:
         runtime = self._get_runtime_settings()
         clearance = dict(runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {})
         runtime_enabled = bool(runtime.get("enabled"))
         egress_mode = str(runtime.get("egress_mode") or "direct").strip().lower()
 
-        account_proxy = _clean((account or {}).get("proxy") if isinstance(account, dict) else "")
-        explicit_proxy = _clean(proxy)
-        legacy_proxy = _clean(self._config.get_proxy_settings())
+        account_proxy = normalize_proxy_url(_clean((account or {}).get("proxy") if isinstance(account, dict) else ""))
+        explicit_proxy = normalize_proxy_url(_clean(proxy))
+        pool_proxy = ""
+        has_proxy_pool = bool(self._get_proxy_pool())
+
+        account_pool_key = self._account_pool_key(account)
+        if select_pool and not account_proxy and not explicit_proxy:
+            pool_proxy = self._select_pool_proxy(account_pool_key)
 
         runtime_proxy = ""
         runtime_proxy_source = "runtime"
-        if upstream and runtime_enabled and egress_mode == "single_proxy":
+        if upstream and runtime_enabled and egress_mode == "single_proxy" and not pool_proxy and not (select_pool and has_proxy_pool):
             resource_proxy = _clean(runtime.get("resource_proxy_url")) if resource else ""
             runtime_proxy = resource_proxy or _clean(runtime.get("proxy_url"))
             runtime_proxy_source = "runtime_resource" if resource_proxy else "runtime"
@@ -196,15 +221,15 @@ class ProxySettingsStore:
         if account_proxy:
             selected_proxy = account_proxy
             source = "account"
-        elif runtime_proxy:
-            selected_proxy = runtime_proxy
-            source = runtime_proxy_source
         elif explicit_proxy:
             selected_proxy = explicit_proxy
             source = "explicit"
-        elif legacy_proxy:
-            selected_proxy = legacy_proxy
-            source = "global"
+        elif pool_proxy:
+            selected_proxy = pool_proxy
+            source = "global_pool"
+        elif runtime_proxy:
+            selected_proxy = runtime_proxy
+            source = runtime_proxy_source
 
         return ProxyRuntimeProfile(
             proxy_url=normalize_proxy_url(selected_proxy),
@@ -223,9 +248,17 @@ class ProxySettingsStore:
         proxy: str = "",
         resource: bool = False,
         upstream: bool = False,
+        profile: ProxyRuntimeProfile | None = None,
+        select_pool: bool = True,
         **session_kwargs,
     ) -> dict[str, object]:
-        profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
+        profile = profile or self.get_profile(
+            account=account,
+            proxy=proxy,
+            resource=resource,
+            upstream=upstream,
+            select_pool=select_pool,
+        )
         if profile.proxy_url:
             session_kwargs["proxy"] = profile.proxy_url
         if profile.runtime_enabled and profile.skip_ssl_verify:
@@ -240,9 +273,10 @@ class ProxySettingsStore:
         proxy: str = "",
         resource: bool = False,
         upstream: bool = True,
+        select_pool: bool = True,
     ) -> dict[str, object]:
         merged_headers: dict[str, object] = dict(headers or {})
-        profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
+        profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream, select_pool=select_pool)
         if not profile.clearance_enabled:
             return merged_headers
 
@@ -270,8 +304,9 @@ class ProxySettingsStore:
         resource: bool = False,
         force: bool = False,
         upstream: bool = True,
+        select_pool: bool = True,
     ) -> ClearanceBundle | None:
-        profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
+        profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream, select_pool=select_pool)
         if not profile.clearance_enabled:
             return None
 
@@ -329,28 +364,55 @@ class ProxySettingsStore:
         proxy: str = "",
         resource: bool = False,
         upstream: bool = True,
+        select_pool: bool = True,
     ) -> None:
-        profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
+        profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream, select_pool=select_pool)
         target_host = _host_from_url(target_url)
         key = self._cache_key(profile.proxy_url, target_host)
         with self._lock:
             self._clearance_cache.pop(key, None)
 
     def get_runtime_status(self) -> dict[str, object]:
-        profile = self.get_profile(upstream=True)
+        profile = self.get_profile(upstream=True, select_pool=False)
+        pool = self._get_proxy_pool()
         with self._lock:
+            self._prune_pool_failures_locked(pool)
             cached_hosts = [host for _proxy, host in self._clearance_cache]
             cached_count = len(self._clearance_cache)
+            pool_set = {normalize_proxy_url(proxy) for proxy in pool}
+            pool_failures = {
+                _redact_url_credentials(proxy): self._pool_failures.get(normalize_proxy_url(proxy), 0)
+                for proxy in pool
+            }
+            account_proxy_failures = {
+                _redact_url_credentials(proxy): count
+                for proxy, count in sorted(self._pool_failures.items())
+                if proxy not in pool_set and count > 0
+            }
         return {
             "enabled": profile.runtime_enabled,
             "egress_mode": profile.egress_mode,
             "proxy_source": profile.proxy_source,
             "has_proxy": bool(profile.proxy_url),
+            "proxy_pool_count": len(pool),
+            "proxy_pool_mode": self._get_proxy_pool_mode(),
+            "proxy_pool_failures": pool_failures,
+            "account_proxy_failure_count": len(account_proxy_failures),
+            "account_proxy_failures": account_proxy_failures,
             "clearance_enabled": profile.clearance_enabled,
             "clearance_mode": profile.clearance_mode,
             "has_clearance_bundle": cached_count > 0,
             "cached_clearance_hosts": sorted(set(cached_hosts)),
         }
+
+    def reset_proxy_failures(self) -> int:
+        with self._lock:
+            count = len(self._pool_failures)
+            if count:
+                self._pool_failures.clear()
+                self._pool_failure_sources.clear()
+                self._save_pool_failures_locked()
+            return count
 
     def _get_runtime_settings(self) -> dict[str, object]:
         try:
@@ -358,6 +420,160 @@ class ProxySettingsStore:
         except AttributeError:
             runtime = {}
         return runtime if isinstance(runtime, dict) else {}
+
+    def _get_proxy_pool(self) -> list[str]:
+        try:
+            pool = self._config.get_proxy_pool()
+        except AttributeError:
+            pool = []
+        return [normalize_proxy_url(item) for item in pool if normalize_proxy_url(item)]
+
+    def _get_proxy_pool_failover_threshold(self) -> int:
+        try:
+            return max(1, int(self._config.get_proxy_pool_failover_threshold()))
+        except Exception:
+            return 2
+
+    def _get_proxy_pool_mode(self) -> str:
+        try:
+            mode = str(self._config.get_proxy_pool_mode() or "").strip().lower()
+        except Exception:
+            mode = ""
+        return mode if mode in {"sticky", "round_robin"} else "sticky"
+
+    def _is_proxy_blocked(self, proxy: str) -> bool:
+        normalized = normalize_proxy_url(proxy)
+        if not normalized:
+            return False
+        threshold = self._get_proxy_pool_failover_threshold()
+        with self._lock:
+            return self._pool_failures.get(normalized, 0) >= threshold
+
+    def _load_pool_failure_state(self) -> tuple[dict[str, int], dict[str, str]]:
+        if self._state_path is None:
+            return {}, {}
+        try:
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}, {}
+        failures = data.get("failures") if isinstance(data, dict) else {}
+        if not isinstance(failures, dict):
+            return {}, {}
+        sources = data.get("sources") if isinstance(data, dict) else {}
+        sources = sources if isinstance(sources, dict) else {}
+        result: dict[str, int] = {}
+        source_result: dict[str, str] = {}
+        for raw_proxy, raw_count in failures.items():
+            proxy = normalize_proxy_url(str(raw_proxy or ""))
+            try:
+                count = int(raw_count)
+            except (TypeError, ValueError):
+                continue
+            if proxy and count > 0:
+                result[proxy] = count
+                source_result[proxy] = str(sources.get(raw_proxy) or sources.get(proxy) or "unknown")
+        return result, source_result
+
+    def _save_pool_failures_locked(self) -> None:
+        if self._state_path is None:
+            return
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "failures": dict(sorted(self._pool_failures.items())),
+                "sources": {
+                    proxy: self._pool_failure_sources.get(proxy, "unknown")
+                    for proxy in sorted(self._pool_failures)
+                },
+                "updated_at": int(time.time()),
+            }
+            self._state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _prune_pool_failures_locked(self, pool: list[str]) -> None:
+        valid = {normalize_proxy_url(proxy) for proxy in pool if normalize_proxy_url(proxy)}
+        stale = [
+            proxy
+            for proxy in self._pool_failures
+            if proxy not in valid and self._pool_failure_sources.get(proxy) != "account"
+        ]
+        if not stale:
+            return
+        for proxy in stale:
+            self._pool_failures.pop(proxy, None)
+            self._pool_failure_sources.pop(proxy, None)
+        self._save_pool_failures_locked()
+
+    def _available_pool_locked(self, pool: list[str], threshold: int, *, mutate: bool = True) -> list[str]:
+        available = [
+            proxy
+            for proxy in pool
+            if self._pool_failures.get(normalize_proxy_url(proxy), 0) < threshold
+        ]
+        return available
+
+    @staticmethod
+    def _pool_index_for_key(key: str, count: int) -> int:
+        if count <= 0:
+            return 0
+        digest = hashlib.sha256(key.encode("utf-8", errors="ignore")).digest()
+        return int.from_bytes(digest[:8], "big") % count
+
+    def _select_pool_proxy(self, account_key: str = "") -> str:
+        pool = self._get_proxy_pool()
+        if not pool:
+            return ""
+        threshold = self._get_proxy_pool_failover_threshold()
+        mode = self._get_proxy_pool_mode()
+        with self._lock:
+            self._prune_pool_failures_locked(pool)
+            available = self._available_pool_locked(pool, threshold)
+            if not available:
+                return ""
+            if account_key and mode == "sticky":
+                return available[self._pool_index_for_key(account_key, len(available))]
+            proxy = available[self._pool_index % len(available)]
+            self._pool_index += 1
+            return proxy
+
+    def _next_pool_proxy(self) -> str:
+        return self._select_pool_proxy("")
+
+    def record_proxy_result(self, proxy_url: str, *, ok: bool, source: str = "") -> None:
+        proxy = normalize_proxy_url(proxy_url)
+        if not proxy:
+            return
+        source = str(source or "").strip() or "unknown"
+        with self._lock:
+            if ok:
+                if self._pool_failures.pop(proxy, None) is not None:
+                    self._pool_failure_sources.pop(proxy, None)
+                    self._save_pool_failures_locked()
+                return
+
+        probe = test_proxy(proxy, timeout=PROXY_POOL_CONNECT_TIMEOUT_SECONDS)
+        probe_ok = bool(probe.get("ok"))
+        try:
+            latency_ms = int(probe.get("latency_ms") or 0)
+        except (TypeError, ValueError):
+            latency_ms = 0
+        try:
+            status = int(probe.get("status") or 0)
+        except (TypeError, ValueError):
+            status = 0
+        connected = status != 407 and (probe_ok or (status > 0 and status < 600))
+        if connected and latency_ms <= PROXY_POOL_MAX_LATENCY_MS:
+            with self._lock:
+                if self._pool_failures.pop(proxy, None) is not None:
+                    self._pool_failure_sources.pop(proxy, None)
+                    self._save_pool_failures_locked()
+            return
+
+        with self._lock:
+            self._pool_failures[proxy] = self._pool_failures.get(proxy, 0) + 1
+            self._pool_failure_sources[proxy] = source
+            self._save_pool_failures_locked()
 
     def _bundle_for_headers(self, profile: ProxyRuntimeProfile, target_host: str) -> ClearanceBundle | None:
         key = self._cache_key(profile.proxy_url, target_host)
@@ -541,6 +757,49 @@ def _redact_url_credentials(text: str) -> str:
     )
 
 
+def is_proxy_transport_error(message: object) -> bool:
+    text = str(message or "").lower()
+    return (
+        "curl: (28)" in text
+        or "operation timed out" in text
+        or "connection timed out" in text
+        or "read timed out" in text
+        or "connect timeout" in text
+        or "curl: (35)" in text
+        or "tls connect error" in text
+        or "openssl_internal" in text
+        or "ssl: wrong_version_number" in text
+        or "ssl: certificate_verify_failed" in text
+        or "connection aborted" in text
+        or "remote disconnected" in text
+        or "connection reset by peer" in text
+        or "failed to connect" in text
+        or "could not connect" in text
+        or "couldn't connect" in text
+        or "proxy connection" in text
+        or "proxyconnect" in text
+        or "socks connect" in text
+        or "socks error" in text
+        or "tunnel connection failed" in text
+        or "connect error" in text
+        or "connection refused" in text
+    )
+
+
+def record_backend_proxy_result(backend: object, ok: bool) -> None:
+    recorder = getattr(backend, "record_proxy_result", None)
+    if callable(recorder):
+        try:
+            recorder(ok)
+        except Exception:
+            pass
+        return
+    profile = getattr(backend, "proxy_profile", None)
+    proxy_url = str(getattr(profile, "proxy_url", "") or "")
+    if proxy_url:
+        proxy_settings.record_proxy_result(proxy_url, ok=ok, source=str(getattr(profile, "proxy_source", "") or "unknown"))
+
+
 def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
     candidate = normalize_proxy_url(_clean(url))
     proxy_source = "input"
@@ -574,11 +833,13 @@ def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
             timeout=timeout,
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
+        status_code = int(response.status_code)
+        ok = status_code < 500 and status_code != 407
         return {
-            "ok": response.status_code < 500,
-            "status": int(response.status_code),
+            "ok": ok,
+            "status": status_code,
             "latency_ms": latency_ms,
-            "error": None if response.status_code < 500 else f"HTTP {response.status_code}",
+            "error": None if ok else f"HTTP {status_code}",
             **result_base,
         }
     except Exception as exc:
@@ -592,6 +853,20 @@ def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
         }
     finally:
         session.close()
+
+
+def test_proxy_pool(*, timeout: float = 15.0) -> dict:
+    pool = proxy_settings._get_proxy_pool()
+    results = []
+    for proxy in pool:
+        results.append(test_proxy(proxy, timeout=timeout))
+    ok_count = sum(1 for item in results if item.get("ok"))
+    return {
+        "ok": bool(pool) and ok_count == len(pool),
+        "total": len(pool),
+        "ok_count": ok_count,
+        "items": results,
+    }
 
 
 def test_clearance(target_url: str = "https://chatgpt.com") -> dict:

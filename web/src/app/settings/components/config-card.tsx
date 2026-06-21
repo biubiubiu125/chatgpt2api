@@ -11,13 +11,13 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import type { ImageStorageMode } from "@/lib/api";
-import { testProxy, type ProxyTestResult } from "@/lib/api";
+import { testProxyPool, type ProxyPoolTestResult } from "@/lib/api";
 
 import { useSettingsStore } from "../store";
 
 export function ConfigCard() {
-  const [isTestingProxy, setIsTestingProxy] = useState(false);
-  const [proxyTestResult, setProxyTestResult] = useState<ProxyTestResult | null>(null);
+  const [isTestingProxyPool, setIsTestingProxyPool] = useState(false);
+  const [proxyPoolTestResult, setProxyPoolTestResult] = useState<ProxyPoolTestResult | null>(null);
   const logLevelOptions = ["debug", "info", "warning", "error"];
   const config = useSettingsStore((state) => state.config);
   const isLoadingConfig = useSettingsStore((state) => state.isLoadingConfig);
@@ -30,11 +30,10 @@ export function ConfigCard() {
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
   const setImageSettleSecs = useSettingsStore((state) => state.setImageSettleSecs);
   const setImageTimeoutRetrySecs = useSettingsStore((state) => state.setImageTimeoutRetrySecs);
-  const setAutoRemoveInvalidAccounts = useSettingsStore((state) => state.setAutoRemoveInvalidAccounts);
-  const setAutoRemoveRateLimitedAccounts = useSettingsStore((state) => state.setAutoRemoveRateLimitedAccounts);
-  const setAutoReloginAfterRefresh = useSettingsStore((state) => state.setAutoReloginAfterRefresh);
   const setLogLevel = useSettingsStore((state) => state.setLogLevel);
-  const setProxy = useSettingsStore((state) => state.setProxy);
+  const setProxyPoolText = useSettingsStore((state) => state.setProxyPoolText);
+  const setProxyPoolMode = useSettingsStore((state) => state.setProxyPoolMode);
+  const setProxyPoolFailoverThreshold = useSettingsStore((state) => state.setProxyPoolFailoverThreshold);
   const setBaseUrl = useSettingsStore((state) => state.setBaseUrl);
   const setGlobalSystemPrompt = useSettingsStore((state) => state.setGlobalSystemPrompt);
   const setSensitiveWordsText = useSettingsStore((state) => state.setSensitiveWordsText);
@@ -46,26 +45,29 @@ export function ConfigCard() {
   const isSyncingImageStorage = useSettingsStore((state) => state.isSyncingImageStorage);
   const saveConfig = useSettingsStore((state) => state.saveConfig);
 
-  const handleTestProxy = async () => {
-    const candidate = String(config?.proxy || "").trim();
-    if (!candidate) {
-      toast.error("请先填写代理地址");
+  const handleTestProxyPool = async () => {
+    if (!config?.proxy_pool?.length) {
+      toast.error("请先填写全局代理池");
       return;
     }
-    setIsTestingProxy(true);
-    setProxyTestResult(null);
+    setIsTestingProxyPool(true);
+    setProxyPoolTestResult(null);
     try {
-      const data = await testProxy(candidate);
-      setProxyTestResult(data.result);
+      const saved = await saveConfig();
+      if (!saved) {
+        return;
+      }
+      const data = await testProxyPool();
+      setProxyPoolTestResult(data.result);
       if (data.result.ok) {
-        toast.success(`代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`);
+        toast.success(`代理池全部可用：${data.result.ok_count}/${data.result.total}`);
       } else {
-        toast.error(`代理不可用：${data.result.error ?? "未知错误"}`);
+        toast.error(`代理池可用 ${data.result.ok_count}/${data.result.total}`);
       }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "测试代理失败");
+      toast.error(error instanceof Error ? error.message : "测试代理池失败");
     } finally {
-      setIsTestingProxy(false);
+      setIsTestingProxyPool(false);
     }
   };
 
@@ -97,44 +99,68 @@ export function ConfigCard() {
             <p className="text-xs text-stone-500">单位分钟，控制账号自动刷新频率。</p>
           </div>
           <div className="space-y-2">
-            <label className="text-sm text-stone-700">全局代理</label>
-            <Input
-              value={String(config?.proxy || "")}
+            <label className="text-sm text-stone-700">全局代理池</label>
+            <Textarea
+              value={(config?.proxy_pool || []).join("\n")}
               onChange={(event) => {
-                setProxy(event.target.value);
-                setProxyTestResult(null);
+                setProxyPoolText(event.target.value);
+                setProxyPoolTestResult(null);
               }}
-              placeholder="http://127.0.0.1:7890"
-              className="h-10 rounded-xl border-stone-200 bg-white"
+              placeholder={"socks5h://user:pass@1.1.1.1:10001\nsocks5h://user:pass@2.2.2.2:10002"}
+              className="min-h-28 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs leading-5 text-stone-500">
-              留空表示不使用代理。支持协议://账号:密码@主机:端口，也可直接粘贴代理商的 主机:端口:账号:密码；示例 http://user:pass@127.0.0.1:7890、127.0.0.1:7890:user:pass。账号密码含 @/: 等特殊字符时需 URL 编码。
+              一行一个代理；普通上游请求优先使用账号代理、显式代理、全局代理池，未配置代理池时才回退到清障单代理。代理池默认按账号固定，也可切换为每次轮询，不影响注册机代理。
             </p>
-            {proxyTestResult ? (
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">代理池模式</label>
+                <Select
+                  value={String(config?.proxy_pool_mode || "sticky")}
+                  onValueChange={(value) => setProxyPoolMode(value as "sticky" | "round_robin")}
+                >
+                  <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="sticky">按账号固定</SelectItem>
+                    <SelectItem value="round_robin">每次轮询</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">失败跳过次数</label>
+                <Input
+                  value={String(config?.proxy_pool_failover_threshold || "")}
+                  onChange={(event) => setProxyPoolFailoverThreshold(event.target.value)}
+                  placeholder="2"
+                  className="h-10 rounded-xl border-stone-200 bg-white"
+                />
+              </div>
+              <div className="flex items-end justify-end">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="h-10 rounded-xl border-stone-200 bg-white px-4 text-stone-700"
+                  onClick={() => void handleTestProxyPool()}
+                  disabled={isTestingProxyPool || isSavingConfig}
+                >
+                  {isTestingProxyPool ? <LoaderCircle className="size-4 animate-spin" /> : <PlugZap className="size-4" />}
+                  测试代理池
+                </Button>
+              </div>
+            </div>
+            {proxyPoolTestResult ? (
               <div
                 className={`rounded-xl border px-3 py-2 text-xs leading-6 ${
-                  proxyTestResult.ok
+                  proxyPoolTestResult.ok
                     ? "border-emerald-200 bg-emerald-50 text-emerald-800"
                     : "border-rose-200 bg-rose-50 text-rose-800"
                 }`}
               >
-                {proxyTestResult.ok
-                  ? `代理可用：HTTP ${proxyTestResult.status}，用时 ${proxyTestResult.latency_ms} ms`
-                  : `代理不可用：${proxyTestResult.error ?? "未知错误"}（用时 ${proxyTestResult.latency_ms} ms）`}
+                代理池可用 {proxyPoolTestResult.ok_count}/{proxyPoolTestResult.total}
               </div>
             ) : null}
-            <div className="flex justify-end">
-              <Button
-                type="button"
-                variant="outline"
-                className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700"
-                onClick={() => void handleTestProxy()}
-                disabled={isTestingProxy}
-              >
-                {isTestingProxy ? <LoaderCircle className="size-4 animate-spin" /> : <PlugZap className="size-4" />}
-                测试代理
-              </Button>
-            </div>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">图片访问地址</label>
@@ -189,12 +215,12 @@ export function ConfigCard() {
           <div className="space-y-2">
             <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
               <Checkbox
-                checked={Boolean(config?.auto_remove_invalid_accounts)}
-                onCheckedChange={(checked) => setAutoRemoveInvalidAccounts(Boolean(checked))}
+                checked
+                disabled
               />
               自动移除异常账号
             </label>
-            <p className="text-xs text-stone-500">刷新时检测并移除</p>
+            <p className="text-xs text-stone-500">刷新时固定检测并移除。</p>
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3">
@@ -227,23 +253,10 @@ export function ConfigCard() {
             />
             <p className="text-xs text-stone-500">单位秒，找到图片后等待多久再次确认。需配合图片二次确认机制使用。</p>
           </div>
-          <div className="flex gap-4 md:col-span-2">
-            <div className="flex-1 space-y-2">
-              <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
-                <Checkbox
-                  checked={Boolean(config?.auto_relogin_after_refresh)}
-                  onCheckedChange={(checked) => setAutoReloginAfterRefresh(Boolean(checked))}
-                />
-                刷新后自动尝试移除异常状态
-              </label>
-              <p className="text-xs text-stone-500">开启后刷新时自动尝试密码登录恢复账号。</p>
-            </div>
-            <div className="flex-1" aria-hidden="true" />
-          </div>
           <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
             <Checkbox
-              checked={Boolean(config?.auto_remove_rate_limited_accounts)}
-              onCheckedChange={(checked) => setAutoRemoveRateLimitedAccounts(Boolean(checked))}
+              checked
+              disabled
             />
             自动移除限流账号
           </label>

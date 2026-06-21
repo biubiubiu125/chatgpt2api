@@ -460,7 +460,12 @@ class AccountService:
         from curl_cffi import requests
         from services.proxy_service import proxy_settings
 
-        session = requests.Session(**proxy_settings.build_session_kwargs(account=account, impersonate="chrome110", verify=True))
+        session = requests.Session(**proxy_settings.build_session_kwargs(
+            account=account,
+            upstream=True,
+            impersonate="chrome110",
+            verify=True,
+        ))
         try:
             response = session.post(
                 self._OAUTH_TOKEN_URL,
@@ -583,7 +588,8 @@ class AccountService:
     def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
         """密码重新登录线程入口"""
         try:
-            result = self._login_with_password(email, password)
+            account = self.get_account(access_token) or {}
+            result = self._login_with_password(email, password, account=account)
             if result.get("ok"):
                 # 登录成功，更新账号
                 new_access_token = result.get("access_token", "")
@@ -692,9 +698,10 @@ class AccountService:
             if progress_id:
                 self.update_relogin_progress(progress_id, access_token, "异常", str(exc))
 
-    def _login_with_password(self, email: str, password: str) -> dict:
+    def _login_with_password(self, email: str, password: str, account: dict | None = None) -> dict:
         """通过邮箱+密码登录，返回 {access_token, refresh_token, id_token, ...}"""
         from curl_cffi import requests
+        from services.proxy_service import proxy_settings
         
         # 常量
         auth_base = "https://auth.openai.com"
@@ -705,11 +712,12 @@ class AccountService:
         user_agent = self._OAUTH_USER_AGENT
         
         # 创建 session
-        session_kwargs = {"impersonate": "chrome110", "verify": False}
-        proxy = config.get_proxy_settings()
-        if proxy:
-            session_kwargs["proxy"] = proxy
-        session = requests.Session(**session_kwargs)
+        session = requests.Session(**proxy_settings.build_session_kwargs(
+            account=account,
+            upstream=True,
+            impersonate="chrome110",
+            verify=False,
+        ))
         
         try:
             device_id = str(uuid.uuid4())
@@ -1164,9 +1172,6 @@ class AccountService:
             self._save_accounts()
 
     def remove_invalid_token(self, access_token: str, event: str, quiet: bool = False) -> bool:
-        if not config.auto_remove_invalid_accounts:
-            self.update_account(access_token, {"status": "异常", "quota": 0}, quiet=quiet)
-            return False
         removed = bool(self.delete_accounts([access_token])["removed"])
         if removed:
             self._add_account_log(
@@ -1180,6 +1185,47 @@ class AccountService:
         elif access_token:
             self.update_account(access_token, {"status": "异常", "quota": 0}, quiet=quiet)
         return removed
+
+    def remove_abnormal_image_timeout_account(self, access_token: str, event: str, error: str = "") -> bool:
+        if not access_token:
+            return False
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None:
+                self._image_inflight.pop(access_token, None)
+                return True
+            after = self._normalize_account({
+                **current,
+                "status": "异常",
+                "quota": 0,
+                "last_refresh_error": str(error or "image generation timeout"),
+                "last_refresh_error_at": datetime.now(timezone.utc).isoformat(),
+            }) or {**current, "status": "异常", "quota": 0}
+            self._accounts.pop(access_token, None)
+            self._image_inflight.pop(access_token, None)
+            self._token_aliases = {
+                old: new
+                for old, new in self._token_aliases.items()
+                if old != access_token and new != access_token
+            }
+            if self._accounts:
+                self._index %= len(self._accounts)
+            else:
+                self._index = 0
+            self._save_accounts()
+            self._add_account_log(
+                "自动移除生图超时账号",
+                self._account_log_detail(
+                    "account_auto_removed_image_timeout",
+                    access_token,
+                    before=current,
+                    after=after,
+                    source=event,
+                    error=str(error or ""),
+                ),
+            )
+            return True
 
     def get_account(self, access_token: str) -> dict | None:
         if not access_token:
@@ -1281,8 +1327,10 @@ class AccountService:
         with self._lock:
             added = 0
             skipped = 0
+            auto_removed: list[tuple[str, dict | None, dict, str, str]] = []
             for access_token, payload in deduped.items():
                 current = self._accounts.get(access_token)
+                before_account = dict(current) if current is not None else None
                 if current is None:
                     added += 1
                     self._cumulative_total += 1
@@ -1291,6 +1339,18 @@ class AccountService:
                 else:
                     skipped += 1
                 incoming = dict(payload)
+                status = str(incoming.get("status") or "").strip()
+                explicit_quota_zero = False
+                if "quota" in incoming and incoming.get("quota") is not None:
+                    try:
+                        explicit_quota_zero = int(incoming.get("quota") or 0) == 0
+                    except (TypeError, ValueError):
+                        explicit_quota_zero = True
+                explicit_unusable = (
+                    status == "异常"
+                    or status == "限流"
+                    or (explicit_quota_zero and not bool(incoming.get("image_quota_unknown")))
+                )
                 if not incoming.get("created_at"):
                     incoming.pop("created_at", None)
                 account = self._normalize_account(
@@ -1302,14 +1362,40 @@ class AccountService:
                     }
                 )
                 if account is not None:
-                    self._accounts[access_token] = account
+                    normalized_status = str(account.get("status") or "").strip()
+                    if explicit_unusable and normalized_status == "异常":
+                        auto_removed.append((access_token, before_account, account, "account_auto_removed_abnormal", "自动移除异常账号"))
+                        self._accounts.pop(access_token, None)
+                        self._image_inflight.pop(access_token, None)
+                    elif explicit_unusable and self._is_rate_limited_account(account):
+                        auto_removed.append((access_token, before_account, account, "account_auto_removed_rate_limited", "自动移除限流账号"))
+                        self._accounts.pop(access_token, None)
+                        self._image_inflight.pop(access_token, None)
+                    else:
+                        self._accounts[access_token] = account
+            removed_tokens = {token for token, _before, _account, _event_type, _summary in auto_removed}
+            if removed_tokens:
+                self._token_aliases = {
+                    old: new
+                    for old, new in self._token_aliases.items()
+                    if old not in removed_tokens and new not in removed_tokens
+                }
+                if self._accounts:
+                    self._index %= len(self._accounts)
+                else:
+                    self._index = 0
             self._save_accounts()
             items = [dict(item) for item in self._accounts.values()]
             self._add_account_log(
-                f"新增 {added} 个账号，跳过 {skipped} 个",
-                {"event_type": "accounts_added", "added": added, "skipped": skipped},
+                f"新增 {added} 个账号，跳过 {skipped} 个，自动移除 {len(auto_removed)} 个",
+                {"event_type": "accounts_added", "added": added, "skipped": skipped, "removed_unusable": len(auto_removed)},
             )
-        return {"added": added, "skipped": skipped, "items": items}
+            for access_token, before, account, event_type, summary in auto_removed:
+                self._add_account_log(
+                    summary,
+                    self._account_log_detail(event_type, access_token, before=before, after=account, source="accounts_added"),
+                )
+        return {"added": added, "skipped": skipped, "removed_unusable": len(auto_removed), "items": items}
 
     def delete_accounts(self, tokens: list[str]) -> dict:
         target_set = set(token for token in tokens if token)
@@ -1351,11 +1437,15 @@ class AccountService:
         return quota == 0
 
     def _auto_remove_account_if_needed_locked(self, access_token: str, before: dict, after: dict) -> bool:
-        if not config.auto_remove_rate_limited_accounts or not self._is_rate_limited_account(after):
+        status = str(after.get("status") or "").strip()
+        if status == "异常":
+            event_type = "account_auto_removed_abnormal"
+            summary = "自动移除异常账号"
+        elif self._is_rate_limited_account(after):
+            event_type = "account_auto_removed_rate_limited"
+            summary = "自动移除限流账号"
+        else:
             return False
-
-        event_type = "account_auto_removed_rate_limited"
-        summary = "自动移除限流账号"
         self._accounts.pop(access_token, None)
         self._image_inflight.pop(access_token, None)
         self._token_aliases = {
@@ -1373,6 +1463,85 @@ class AccountService:
             self._account_log_detail(event_type, access_token, before=before, after=after),
         )
         return True
+
+    def cleanup_unusable_accounts(self, event: str = "account_refresh_cleanup") -> dict[str, Any]:
+        with self._lock:
+            removed_items: list[tuple[str, dict, str, str]] = []
+            for token, account in self._accounts.items():
+                snapshot = dict(account)
+                status = str(snapshot.get("status") or "").strip()
+                if status == "异常":
+                    removed_items.append((token, snapshot, "account_auto_removed_abnormal", "自动移除异常账号"))
+                elif self._is_rate_limited_account(snapshot):
+                    removed_items.append((token, snapshot, "account_auto_removed_rate_limited", "自动移除限流账号"))
+            if not removed_items:
+                return {"removed": 0, "items": [dict(item) for item in self._accounts.values()]}
+
+            target_tokens = {token for token, _account, _event_type, _summary in removed_items}
+            for token in target_tokens:
+                self._accounts.pop(token, None)
+                self._image_inflight.pop(token, None)
+            self._token_aliases = {
+                old: new
+                for old, new in self._token_aliases.items()
+                if old not in target_tokens and new not in target_tokens
+            }
+            if self._accounts:
+                self._index %= len(self._accounts)
+            else:
+                self._index = 0
+            self._save_accounts()
+
+            for token, account, event_type, summary in removed_items:
+                self._add_account_log(
+                    summary,
+                    self._account_log_detail(
+                        event_type,
+                        token,
+                        before=account,
+                        after=None,
+                        source=event,
+                    ),
+                )
+            return {"removed": len(removed_items), "items": [dict(item) for item in self._accounts.values()]}
+
+    def cleanup_abnormal_accounts(self, event: str = "account_auto_refresh") -> dict[str, Any]:
+        with self._lock:
+            removed_items = [
+                (token, dict(account))
+                for token, account in self._accounts.items()
+                if str(account.get("status") or "").strip() == "异常"
+            ]
+            if not removed_items:
+                return {"removed": 0, "items": [dict(item) for item in self._accounts.values()]}
+
+            target_tokens = {token for token, _account in removed_items}
+            for token in target_tokens:
+                self._accounts.pop(token, None)
+                self._image_inflight.pop(token, None)
+            self._token_aliases = {
+                old: new
+                for old, new in self._token_aliases.items()
+                if old not in target_tokens and new not in target_tokens
+            }
+            if self._accounts:
+                self._index %= len(self._accounts)
+            else:
+                self._index = 0
+            self._save_accounts()
+
+            for token, account in removed_items:
+                self._add_account_log(
+                    "自动移除异常账号",
+                    self._account_log_detail(
+                        "account_auto_removed_abnormal",
+                        token,
+                        before=account,
+                        after=None,
+                        source=event,
+                    ),
+                )
+            return {"removed": len(removed_items), "items": [dict(item) for item in self._accounts.values()]}
 
     def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
         if not access_token:
@@ -1516,21 +1685,34 @@ class AccountService:
         self,
         access_token: str,
         event: str = "fetch_remote_info",
-        defer_invalid_removal: bool = True,
+        defer_invalid_removal: bool = False,
     ) -> dict[str, Any] | None:
         if not access_token:
             raise ValueError("access_token is required")
 
+        from services.proxy_service import is_proxy_transport_error, record_backend_proxy_result
+
         active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
+        backend = None
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
-            result = OpenAIBackendAPI(active_token).get_user_info()
+
+            backend = OpenAIBackendAPI(active_token)
+            result = backend.get_user_info()
+            record_backend_proxy_result(backend, True)
         except InvalidAccessTokenError as exc:
+            if backend is not None:
+                record_backend_proxy_result(backend, True)
             refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
             if refreshed_token and refreshed_token != active_token:
+                retry_backend = None
                 try:
-                    result = OpenAIBackendAPI(refreshed_token).get_user_info()
+                    retry_backend = OpenAIBackendAPI(refreshed_token)
+                    result = retry_backend.get_user_info()
+                    record_backend_proxy_result(retry_backend, True)
                 except InvalidAccessTokenError as retry_exc:
+                    if retry_backend is not None:
+                        record_backend_proxy_result(retry_backend, True)
                     if self._record_invalid_token_seen(
                         refreshed_token,
                         event,
@@ -1538,6 +1720,10 @@ class AccountService:
                         defer_invalid_removal=defer_invalid_removal,
                     ):
                         self.remove_invalid_token(refreshed_token, event)
+                    raise
+                except Exception as retry_error:
+                    if retry_backend is not None:
+                        record_backend_proxy_result(retry_backend, not is_proxy_transport_error(retry_error))
                     raise
                 active_token = refreshed_token
             else:
@@ -1549,6 +1735,10 @@ class AccountService:
                 ):
                     self.remove_invalid_token(active_token, event)
                 raise
+        except Exception as error:
+            if backend is not None:
+                record_backend_proxy_result(backend, not is_proxy_transport_error(error))
+            raise
         self._record_refresh_success(active_token)
         return self.update_account(active_token, result)
 
@@ -1665,12 +1855,12 @@ class AccountService:
         self,
         access_tokens: list[str],
         progress_id: str | None = None,
-        defer_invalid_removal: bool = True,
+        defer_invalid_removal: bool = False,
     ) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
-            items = self.list_accounts()
-            result = {"refreshed": 0, "errors": [], "items": items, "relogined": 0}
+            cleanup = self.cleanup_unusable_accounts("refresh_accounts")
+            result = {"refreshed": 0, "errors": [], "items": cleanup["items"], "relogined": 0, "removed_unusable": int(cleanup.get("removed") or 0)}
             if progress_id:
                 self.finish_refresh_progress(progress_id, result)
             return result
@@ -1733,33 +1923,24 @@ class AccountService:
         else:
             executor.shutdown(wait=True, cancel_futures=True)
 
-        # 自动重新登录异常账号（仅当配置开启时）
-        relogined = 0
-        if config.auto_relogin_after_refresh:
-            for token in access_tokens:
-                account = self.get_account(token)
-                if not account:
-                    continue
-                status = str(account.get("status") or "").strip()
-                if status != "异常":
-                    continue
-                email = str(account.get("email") or "").strip()
-                password = str(account.get("password") or "").strip()
-                if not email or not password:
-                    continue
-                t = Thread(
-                    target=self._password_re_login_thread,
-                    args=(token, email, password, "auto_relogin_after_refresh"),
-                    daemon=True,
-                )
-                t.start()
-                relogined += 1
+        cleanup = (
+            {"removed": 0, "items": self.list_accounts()}
+            if defer_invalid_removal
+            else self.cleanup_unusable_accounts("refresh_accounts")
+        )
+        removed_unusable = int(cleanup.get("removed") or 0)
+        if progress_id and removed_unusable:
+            with self._refresh_progress_lock:
+                progress = self._refresh_progress.get(progress_id)
+                if progress is not None:
+                    progress["removed_count"] = int(progress.get("removed_count") or 0) + removed_unusable
 
         result = {
             "refreshed": refreshed,
             "errors": errors,
-            "items": self.list_accounts(),
-            "relogined": relogined,
+            "items": cleanup.get("items") or self.list_accounts(),
+            "relogined": 0,
+            "removed_unusable": removed_unusable,
         }
 
         if progress_id:

@@ -76,6 +76,9 @@ DEFAULT_PROXY_RUNTIME = {
     },
 }
 
+DEFAULT_PROXY_POOL_MODE = "sticky"
+DEFAULT_PROXY_POOL_FAILOVER_THRESHOLD = 2
+
 DEFAULT_THIRD_PARTY_APPS = {
     "infinite_canvas": {
         "enabled": False,
@@ -277,6 +280,34 @@ def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
     }
 
 
+def _normalize_proxy_pool(value: object) -> list[str]:
+    if isinstance(value, str):
+        raw_items = value.replace(",", "\n").splitlines()
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = []
+    normalized: list[str] = []
+    for item in raw_items:
+        proxy = str(item or "").strip()
+        if proxy and proxy not in normalized:
+            normalized.append(proxy)
+    return normalized
+
+
+def _merge_legacy_proxy_into_pool(proxy_pool: object, legacy_proxy: object) -> list[str]:
+    normalized = _normalize_proxy_pool(proxy_pool)
+    proxy = str(legacy_proxy or "").strip()
+    if proxy and proxy not in normalized:
+        normalized.insert(0, proxy)
+    return normalized
+
+
+def _normalize_proxy_pool_mode(value: object) -> str:
+    mode = str(value or DEFAULT_PROXY_POOL_MODE).strip().lower()
+    return mode if mode in {"sticky", "round_robin"} else DEFAULT_PROXY_POOL_MODE
+
+
 def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
     canvas_source = source.get("infinite_canvas") if isinstance(source.get("infinite_canvas"), dict) else {}
@@ -365,7 +396,11 @@ class ConfigStore:
             )
 
     def _load(self) -> dict[str, object]:
-        return _read_json_object(self.path, name="config.json")
+        data = _read_json_object(self.path, name="config.json")
+        if data.get("proxy"):
+            data["proxy_pool"] = _merge_legacy_proxy_into_pool(data.get("proxy_pool"), data.get("proxy"))
+            data["proxy"] = ""
+        return data
 
     def _save(self) -> None:
         self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -463,24 +498,11 @@ class ConfigStore:
 
     @property
     def auto_remove_invalid_accounts(self) -> bool:
-        value = self.data.get("auto_remove_invalid_accounts", False)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
+        return True
 
     @property
     def auto_remove_rate_limited_accounts(self) -> bool:
-        value = self.data.get("auto_remove_rate_limited_accounts", True)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
-
-    @property
-    def auto_relogin_after_refresh(self) -> bool:
-        value = self.data.get("auto_relogin_after_refresh", False)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
+        return True
 
     @property
     def log_levels(self) -> list[str]:
@@ -542,6 +564,7 @@ class ConfigStore:
         data = dict(self.data)
         data.pop("image_min_free_mb", None)
         data.pop("auto_remove_zero_quota_accounts", None)
+        data.pop("auto_relogin_after_refresh", None)
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
         data["image_max_storage_mb"] = self.image_max_storage_mb
@@ -552,7 +575,6 @@ class ConfigStore:
         data["image_parallel_generation"] = self.image_parallel_generation
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
-        data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh
         data["log_levels"] = self.log_levels
         data["sensitive_words"] = self.sensitive_words
         data["ai_review"] = self.ai_review
@@ -560,13 +582,31 @@ class ConfigStore:
         data["backup"] = self.get_backup_settings()
         data["image_storage"] = self.get_image_storage_settings()
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
+        data["proxy"] = ""
+        data["proxy_pool"] = self.get_proxy_pool()
+        data["proxy_pool_mode"] = self.get_proxy_pool_mode()
+        data["proxy_pool_failover_threshold"] = self.get_proxy_pool_failover_threshold()
         data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
         data["third_party_apps"] = self.get_third_party_apps_settings()
         data.pop("auth-key", None)
         return data
 
     def get_proxy_settings(self) -> str:
-        return str(self.data.get("proxy") or "").strip()
+        pool = self.get_proxy_pool()
+        return pool[0] if pool else ""
+
+    def get_proxy_pool(self) -> list[str]:
+        return _merge_legacy_proxy_into_pool(self.data.get("proxy_pool"), self.data.get("proxy"))
+
+    def get_proxy_pool_mode(self) -> str:
+        return _normalize_proxy_pool_mode(self.data.get("proxy_pool_mode"))
+
+    def get_proxy_pool_failover_threshold(self) -> int:
+        return _normalize_positive_int(
+            self.data.get("proxy_pool_failover_threshold"),
+            DEFAULT_PROXY_POOL_FAILOVER_THRESHOLD,
+            1,
+        )
 
     def get_proxy_runtime_settings(self) -> dict[str, object]:
         return _normalize_proxy_runtime_settings(self.data.get("proxy_runtime"))
@@ -591,6 +631,7 @@ class ConfigStore:
         next_data.update(dict(data or {}))
         next_data.pop("image_min_free_mb", None)
         next_data.pop("auto_remove_zero_quota_accounts", None)
+        next_data.pop("auto_relogin_after_refresh", None)
         for key in ("image_retention_days", "image_max_storage_mb"):
             if key in next_data:
                 try:
@@ -608,6 +649,16 @@ class ConfigStore:
             )
         if "third_party_apps" in next_data:
             next_data["third_party_apps"] = _normalize_third_party_apps_settings(next_data.get("third_party_apps"))
+        next_data["proxy_pool"] = _merge_legacy_proxy_into_pool(next_data.get("proxy_pool"), next_data.get("proxy"))
+        next_data["proxy"] = ""
+        if "proxy_pool_mode" in next_data:
+            next_data["proxy_pool_mode"] = _normalize_proxy_pool_mode(next_data.get("proxy_pool_mode"))
+        if "proxy_pool_failover_threshold" in next_data:
+            next_data["proxy_pool_failover_threshold"] = _normalize_positive_int(
+                next_data.get("proxy_pool_failover_threshold"),
+                DEFAULT_PROXY_POOL_FAILOVER_THRESHOLD,
+                1,
+            )
         if "proxy_runtime" in next_data:
             incoming_runtime = next_data.get("proxy_runtime")
             if isinstance(incoming_runtime, dict):

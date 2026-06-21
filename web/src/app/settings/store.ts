@@ -13,6 +13,7 @@ import {
   fetchRegisterConfig,
   resetRegister as resetRegisterApi,
   resetOutlookPool as resetOutlookPoolApi,
+  resetRegisterProxyBlacklist as resetRegisterProxyBlacklistApi,
   fetchSettingsConfig,
   runBackupNow,
   syncImageStorage,
@@ -44,6 +45,48 @@ function createProviderId() {
     return crypto.randomUUID();
   }
   return `provider-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function numberOrDefault(value: unknown, fallback: number) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function buildRegisterPayload(registerConfig: RegisterConfig): Partial<RegisterConfig> {
+  return {
+    mail: {
+      ...registerConfig.mail,
+      api_use_register_proxy: Boolean(registerConfig.mail?.api_use_register_proxy ?? true),
+    },
+    proxy: String(registerConfig.proxy || "").trim(),
+    proxy_input_mode: registerConfig.proxy_input_mode || "single",
+    proxy_url: String(registerConfig.proxy_url || "").trim(),
+    proxy_list_text: String(registerConfig.proxy_list_text || ""),
+    proxy_checker_dir: String(registerConfig.proxy_checker_dir || "/opt/proxy-checker/repo_data").trim(),
+    proxy_checker_pattern: String(registerConfig.proxy_checker_pattern || "user_*.txt").trim(),
+    proxy_refresh_interval: Math.max(10, numberOrDefault(registerConfig.proxy_refresh_interval, 120)),
+    proxy_lease_seconds: Math.max(10, numberOrDefault(registerConfig.proxy_lease_seconds, 120)),
+    proxy_bind_url: Boolean(registerConfig.proxy_bind_url),
+    proxy_bind_text: Boolean(registerConfig.proxy_bind_text),
+    proxy_bind_proxy_checker: Boolean(registerConfig.proxy_bind_proxy_checker ?? true),
+    proxy_failure_threshold: Math.max(1, numberOrDefault(registerConfig.proxy_failure_threshold, 2)),
+    proxy_blacklist_seconds: Math.max(30, numberOrDefault(registerConfig.proxy_blacklist_seconds, 900)),
+    proxy_success_clear_failures: Boolean(registerConfig.proxy_success_clear_failures ?? true),
+    task_timeout_seconds: Math.max(30, Number(registerConfig.task_timeout_seconds) || 300),
+    task_stall_timeout_seconds: Math.max(0, Number(registerConfig.task_stall_timeout_seconds) || 60),
+    total: Math.max(1, Number(registerConfig.total) || 1),
+    threads: Math.max(1, Number(registerConfig.threads) || 1),
+    mode: registerConfig.mode,
+    target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
+    target_available: Math.max(1, Number(registerConfig.target_available) || 1),
+    check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
+    auto_refill: {
+      enabled: Boolean(registerConfig.auto_refill?.enabled),
+      min_available: Math.max(1, Number(registerConfig.auto_refill?.min_available) || 30),
+      batch_total: Math.max(1, Number(registerConfig.auto_refill?.batch_total) || 100),
+      check_interval: Math.max(10, Number(registerConfig.auto_refill?.check_interval) || 300),
+    },
+  };
 }
 
 export const PAGE_SIZE_OPTIONS = ["50", "100", "200"] as const;
@@ -178,6 +221,11 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
         images: false,
       },
     };
+  const legacyProxy = typeof config.proxy === "string" ? config.proxy.trim() : "";
+  const proxyPool = Array.isArray(config.proxy_pool) ? config.proxy_pool.map((item) => String(item).trim()).filter(Boolean) : [];
+  if (legacyProxy && !proxyPool.includes(legacyProxy)) {
+    proxyPool.unshift(legacyProxy);
+  }
   return {
     ...config,
     refresh_account_interval_minute: Number(config.refresh_account_interval_minute || 5),
@@ -191,9 +239,13 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     image_timeout_retry_secs: Number(config.image_timeout_retry_secs || 30),
     auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts),
     auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts),
-    auto_relogin_after_refresh: Boolean(config.auto_relogin_after_refresh),
     log_levels: Array.isArray(config.log_levels) ? config.log_levels : [],
-    proxy: typeof config.proxy === "string" ? config.proxy : "",
+    proxy: "",
+    proxy_pool: proxyPool,
+    proxy_pool_mode: ["sticky", "round_robin"].includes(String(config.proxy_pool_mode))
+      ? String(config.proxy_pool_mode)
+      : "sticky",
+    proxy_pool_failover_threshold: Number(config.proxy_pool_failover_threshold || 2),
     base_url: typeof config.base_url === "string" ? config.base_url : "",
     global_system_prompt: String(config.global_system_prompt || ""),
     sensitive_words: Array.isArray(config.sensitive_words) ? config.sensitive_words : [],
@@ -316,9 +368,10 @@ type SettingsStore = {
   setImageTimeoutRetrySecs: (value: string) => void;
   setAutoRemoveInvalidAccounts: (value: boolean) => void;
   setAutoRemoveRateLimitedAccounts: (value: boolean) => void;
-  setAutoReloginAfterRefresh: (value: boolean) => void;
   setLogLevel: (level: string, enabled: boolean) => void;
-  setProxy: (value: string) => void;
+  setProxyPoolText: (value: string) => void;
+  setProxyPoolMode: (value: "sticky" | "round_robin") => void;
+  setProxyPoolFailoverThreshold: (value: string) => void;
   setBaseUrl: (value: string) => void;
   setGlobalSystemPrompt: (value: string) => void;
   setSensitiveWordsText: (value: string) => void;
@@ -335,6 +388,7 @@ type SettingsStore = {
 
   loadRegister: (silent?: boolean) => Promise<void>;
   setRegisterConfig: (config: RegisterConfig) => void;
+  setRegisterField: <K extends keyof RegisterConfig>(key: K, value: RegisterConfig[K]) => void;
   setRegisterProxy: (value: string) => void;
   setRegisterTotal: (value: string) => void;
   setRegisterThreads: (value: string) => void;
@@ -354,6 +408,7 @@ type SettingsStore = {
   toggleRegister: () => Promise<void>;
   resetRegister: () => Promise<void>;
   resetOutlookPool: (scope: "all" | "failed" | "unused") => Promise<void>;
+  resetRegisterProxyBlacklist: () => Promise<void>;
 
   loadPools: (silent?: boolean) => Promise<void>;
   openAddDialog: () => void;
@@ -467,8 +522,12 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         image_timeout_retry_secs: Math.max(1, Number(config.image_timeout_retry_secs) || 30),
         auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts),
         auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts),
-        auto_relogin_after_refresh: Boolean(config.auto_relogin_after_refresh),
-        proxy: config.proxy.trim(),
+        proxy: "",
+        proxy_pool: (config.proxy_pool || []).map((item) => String(item).trim()).filter(Boolean),
+        proxy_pool_mode: ["sticky", "round_robin"].includes(String(config.proxy_pool_mode))
+          ? config.proxy_pool_mode
+          : "sticky",
+        proxy_pool_failover_threshold: Math.max(1, Number(config.proxy_pool_failover_threshold) || 2),
         base_url: String(config.base_url || "").trim(),
         global_system_prompt: String(config.global_system_prompt || "").trim(),
         sensitive_words: (config.sensitive_words || []).map((item) => String(item).trim()).filter(Boolean),
@@ -594,10 +653,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set((state) => state.config ? { config: { ...state.config, auto_remove_rate_limited_accounts: value } } : {});
   },
 
-  setAutoReloginAfterRefresh: (value) => {
-    set((state) => state.config ? { config: { ...state.config, auto_relogin_after_refresh: value } } : {});
-  },
-
   setLogLevel: (level, enabled) => {
     set((state) => {
       if (!state.config) return {};
@@ -608,18 +663,40 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     });
   },
 
-  setProxy: (value) => {
+  setProxyPoolText: (value) => {
     set((state) => {
       if (!state.config) {
         return {};
       }
+      const items = value
+        .split(/\r?\n/)
+        .map((item) => item.trim())
+        .filter(Boolean);
       return {
         config: {
           ...state.config,
-          proxy: value,
+          proxy_pool: items,
         },
       };
     });
+  },
+
+  setProxyPoolMode: (value) => {
+    set((state) => state.config ? {
+      config: {
+        ...state.config,
+        proxy_pool_mode: value,
+      },
+    } : {});
+  },
+
+  setProxyPoolFailoverThreshold: (value) => {
+    set((state) => state.config ? {
+      config: {
+        ...state.config,
+        proxy_pool_failover_threshold: value,
+      },
+    } : {});
   },
 
   setBaseUrl: (value) => {
@@ -912,6 +989,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ registerConfig: config, isLoadingRegister: false });
   },
 
+  setRegisterField: (key, value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, [key]: value } } : {});
+  },
+
   setRegisterProxy: (value) => {
     set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy: value } } : {});
   },
@@ -1011,22 +1092,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     if (!registerConfig) return;
     try {
       set({ isSavingRegister: true });
-      const data = await updateRegisterConfig({
-        mail: registerConfig.mail,
-        proxy: registerConfig.proxy.trim(),
-        total: Math.max(1, Number(registerConfig.total) || 1),
-        threads: Math.max(1, Number(registerConfig.threads) || 1),
-        mode: registerConfig.mode,
-        target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
-        target_available: Math.max(1, Number(registerConfig.target_available) || 1),
-        check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
-        auto_refill: {
-          enabled: Boolean(registerConfig.auto_refill?.enabled),
-          min_available: Math.max(1, Number(registerConfig.auto_refill?.min_available) || 30),
-          batch_total: Math.max(1, Number(registerConfig.auto_refill?.batch_total) || 100),
-          check_interval: Math.max(10, Number(registerConfig.auto_refill?.check_interval) || 300),
-        },
-      });
+      const data = await updateRegisterConfig(buildRegisterPayload(registerConfig));
       set({ registerConfig: data.register });
       toast.success("注册配置已保存");
     } catch (error) {
@@ -1042,22 +1108,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ isSavingRegister: true });
     try {
       if (!registerConfig.enabled) {
-        await updateRegisterConfig({
-          mail: registerConfig.mail,
-          proxy: registerConfig.proxy.trim(),
-          total: Math.max(1, Number(registerConfig.total) || 1),
-          threads: Math.max(1, Number(registerConfig.threads) || 1),
-          mode: registerConfig.mode,
-          target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
-          target_available: Math.max(1, Number(registerConfig.target_available) || 1),
-          check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
-          auto_refill: {
-            enabled: Boolean(registerConfig.auto_refill?.enabled),
-            min_available: Math.max(1, Number(registerConfig.auto_refill?.min_available) || 30),
-            batch_total: Math.max(1, Number(registerConfig.auto_refill?.batch_total) || 100),
-            check_interval: Math.max(10, Number(registerConfig.auto_refill?.check_interval) || 300),
-          },
-        });
+        await updateRegisterConfig(buildRegisterPayload(registerConfig));
       }
       const data = registerConfig.enabled ? await stopRegister() : await startRegister();
       set({ registerConfig: data.register });
@@ -1090,6 +1141,19 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       toast.success(scope === "unused" ? "已清空未使用邮箱" : scope === "failed" ? "已清除失败/占用的邮箱状态" : "Outlook 邮箱池状态已全部重置");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "重置邮箱池状态失败");
+    } finally {
+      set({ isSavingRegister: false });
+    }
+  },
+
+  resetRegisterProxyBlacklist: async () => {
+    set({ isSavingRegister: true });
+    try {
+      const data = await resetRegisterProxyBlacklistApi();
+      set({ registerConfig: data.register });
+      toast.success("已重置注册代理黑名单/租约状态");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "重置注册代理状态失败");
     } finally {
       set({ isSavingRegister: false });
     }
