@@ -103,6 +103,12 @@ def _attach_image_metadata(target: dict[str, Any], images: list[dict[str, Any]])
     first_size = images[0].get("size")
     if isinstance(first_size, str) and first_size:
         target["size"] = first_size
+    first_width = images[0].get("width")
+    first_height = images[0].get("height")
+    if isinstance(first_width, int) and first_width > 0:
+        target["width"] = first_width
+    if isinstance(first_height, int) and first_height > 0:
+        target["height"] = first_height
 
 
 def completion_chunk(model: str, delta: dict[str, Any], finish_reason: str | None = None, completion_id: str = "", created: int | None = None) -> dict[str, Any]:
@@ -281,10 +287,7 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
     if image_metadata:
         message = ((response.get("choices") or [{}])[0].get("message") or {})
         if isinstance(message, dict):
-            message["images"] = image_metadata
-            first_size = image_metadata[0].get("size")
-            if isinstance(first_size, str) and first_size:
-                message["size"] = first_size
+            _attach_image_metadata(message, image_metadata)
         _attach_image_metadata(response, image_metadata)
     usage = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),

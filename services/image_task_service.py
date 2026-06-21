@@ -9,12 +9,10 @@ from pathlib import Path
 from typing import Any
 
 from services.config import DATA_DIR, config
-from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
-from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 from services.account_service import account_service
-from services.proxy_service import is_proxy_transport_error, record_backend_proxy_result
 from utils.helper import is_codex_image_model, parse_image_size
+from utils.request_summary import request_text
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -23,6 +21,18 @@ TASK_STATUS_ERROR = "error"
 TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
 MAX_TASK_GROUP_WORKERS = 20
+
+
+def _default_generation_handler(payload: dict[str, Any]) -> dict[str, Any]:
+    from services.protocol import openai_v1_image_generations
+
+    return openai_v1_image_generations.handle(payload)
+
+
+def _default_edit_handler(payload: dict[str, Any]) -> dict[str, Any]:
+    from services.protocol import openai_v1_image_edit
+
+    return openai_v1_image_edit.handle(payload)
 
 
 def _now_iso() -> str:
@@ -102,7 +112,40 @@ def _account_ref_from_token(access_token: str) -> dict[str, str]:
 
 
 def _record_backend_proxy_result(backend: object, ok: bool) -> None:
-    record_backend_proxy_result(backend, ok)
+    try:
+        from services.proxy_service import record_backend_proxy_result
+
+        record_backend_proxy_result(backend, ok)
+    except Exception:
+        return
+
+
+def _is_proxy_transport_error(error_message: object) -> bool:
+    try:
+        from services.proxy_service import is_proxy_transport_error
+
+        return is_proxy_transport_error(error_message)
+    except Exception:
+        text = str(error_message or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "proxy",
+                "connection reset",
+                "connection refused",
+                "connection timed out",
+                "operation timed out",
+                "tls",
+                "ssl",
+                "curl",
+            )
+        )
+
+
+def _openai_backend_api_class() -> type:
+    from services.openai_backend_api import OpenAIBackendAPI
+
+    return OpenAIBackendAPI
 
 
 def _resolve_account_token(account_id: str = "", account_email: str = "") -> str:
@@ -164,8 +207,8 @@ class ImageTaskService:
         self,
         path: Path,
         *,
-        generation_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_generations.handle,
-        edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_edit.handle,
+        generation_handler: Callable[[dict[str, Any]], dict[str, Any]] = _default_generation_handler,
+        edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = _default_edit_handler,
         retention_days_getter: Callable[[], int] | None = None,
     ):
         self.path = path
@@ -672,9 +715,9 @@ class ImageTaskService:
         started = time.time()
         backend = None
         try:
-            from services.openai_backend_api import OpenAIBackendAPI
-            from services.protocol.conversation import ensure_image_canvas_size, format_image_result
+            from utils.image_result import format_image_result
 
+            OpenAIBackendAPI = _openai_backend_api_class()
             backend = OpenAIBackendAPI(access_token=access_token)
             file_ids, sediment_ids = backend._poll_image_results(
                 conversation_id,
@@ -691,11 +734,8 @@ class ImageTaskService:
             if not image_urls:
                 raise RuntimeError("图片 URL 解析失败")
 
-            with self._lock:
-                task = self._tasks.get(key)
-                size = _clean(task.get("size")) if task else None
             image_items = [
-                {"b64_json": __import__("base64").b64encode(ensure_image_canvas_size(image_data, size)).decode("ascii")}
+                {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
                 for image_data in backend.download_image_bytes(image_urls)
             ]
             # 获取 task 的原始 prompt（从 _public_task 的 mode 判断）
@@ -722,7 +762,7 @@ class ImageTaskService:
         except Exception as exc:
             error_message = str(exc) or "resume poll failed"
             if backend is not None:
-                _record_backend_proxy_result(backend, not is_proxy_transport_error(error_message))
+                _record_backend_proxy_result(backend, not _is_proxy_transport_error(error_message))
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[], duration_ms=duration_ms)
             self._log_call(

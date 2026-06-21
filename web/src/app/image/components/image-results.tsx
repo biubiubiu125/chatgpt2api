@@ -14,6 +14,12 @@ export type ImageLightboxItem = {
   dimensions?: string;
 };
 
+type LoadedImageDimensions = {
+  width: number;
+  height: number;
+  label: string;
+};
+
 type ImageResultsProps = {
   selectedConversation: ImageConversation | null;
   onOpenLightbox: (images: ImageLightboxItem[], index: number) => void;
@@ -61,12 +67,26 @@ function turnAspectStyle(size: string): CSSProperties | undefined {
 }
 
 function storedImageDimensions(image: StoredImage) {
-  if (typeof image.size === "string" && /^\d+x\d+$/i.test(image.size.trim())) {
-    return image.size.trim().toLowerCase().replace("x", " x ");
+  if (typeof image.width === "number" && typeof image.height === "number" && image.width > 0 && image.height > 0) {
+    return formatImageDimensions(image.width, image.height);
   }
-  return typeof image.width === "number" && typeof image.height === "number" && image.width > 0 && image.height > 0
-    ? formatImageDimensions(image.width, image.height)
+  return typeof image.size === "string" && /^\d+x\d+$/i.test(image.size.trim())
+    ? image.size.trim().toLowerCase().replace("x", " x ")
     : undefined;
+}
+
+function imageAspectStyle(
+  image: StoredImage,
+  fallbackSize: string,
+  loadedDimensions?: LoadedImageDimensions,
+): CSSProperties | undefined {
+  if (loadedDimensions) {
+    return { aspectRatio: `${loadedDimensions.width} / ${loadedDimensions.height}` };
+  }
+  if (typeof image.width === "number" && typeof image.height === "number" && image.width > 0 && image.height > 0) {
+    return { aspectRatio: `${image.width} / ${image.height}` };
+  }
+  return turnAspectStyle(image.size || fallbackSize);
 }
 
 async function downloadStoredImage(image: StoredImage, index: number) {
@@ -119,7 +139,8 @@ export function ImageResults({
   onDismissErrors,
   formatConversationTime,
 }: ImageResultsProps) {
-  const imageDimensionsRef = useRef<Record<string, string>>({});
+  const imageDimensionsRef = useRef<Record<string, LoadedImageDimensions>>({});
+  const [, setImageDimensionsVersion] = useState(0);
   const [currentTime, setCurrentTime] = useState(Date.now());
   
   // 仅在存在 loading 图片时启动定时器，避免空闲时无谓重渲染
@@ -135,10 +156,14 @@ export function ImageResults({
   }, [hasLoadingImages]);
 
   const updateImageDimensions = (id: string, width: number, height: number) => {
-    const dimensions = formatImageDimensions(width, height);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+      return;
+    }
+    const label = formatImageDimensions(width, height);
     // 使用 ref 存储，不触发 React 重渲染，消除级联重渲染
-    if (imageDimensionsRef.current[id] !== dimensions) {
-      imageDimensionsRef.current[id] = dimensions;
+    if (imageDimensionsRef.current[id]?.label !== label) {
+      imageDimensionsRef.current[id] = { width, height, label };
+      setImageDimensionsVersion((value) => value + 1);
     }
   };
 
@@ -176,7 +201,8 @@ export function ImageResults({
         }));
         const successfulTurnImages = turn.images.flatMap((image) => {
           const src = image.status === "success" ? getStoredImageSrc(image) : "";
-          const dimensions = imageDimensionsRef.current[image.id] || storedImageDimensions(image);
+          const loadedDimensions = imageDimensionsRef.current[image.id];
+          const dimensions = loadedDimensions?.label || storedImageDimensions(image);
           return src
             ? [
                 {
@@ -274,7 +300,8 @@ export function ImageResults({
                       if (image.status === "success" && imageSrc) {
                         const currentIndex = successfulTurnImages.findIndex((item) => item.id === image.id);
                         const sizeLabel = image.b64_json ? formatBase64ImageSize(image.b64_json) : "";
-                        const dimensions = imageDimensionsRef.current[image.id] || storedImageDimensions(image);
+                        const loadedDimensions = imageDimensionsRef.current[image.id];
+                        const dimensions = loadedDimensions?.label || storedImageDimensions(image);
                         const imageMeta = [sizeLabel, dimensions].filter(Boolean).join(" · ");
 
                         return (
@@ -286,7 +313,7 @@ export function ImageResults({
                               src={imageSrc}
                               alt={`Generated result ${index + 1}`}
                               className="group block aspect-square w-full cursor-zoom-in overflow-hidden rounded-xl sm:aspect-auto"
-                              style={turnAspectStyle(turn.size)}
+                              style={imageAspectStyle(image, turn.size, loadedDimensions)}
                               onLoad={(event) => {
                                 updateImageDimensions(
                                   image.id,

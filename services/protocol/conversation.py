@@ -7,15 +7,12 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from io import BytesIO
 from typing import Any, Iterable, Iterator
 
-from PIL import Image
 import tiktoken
 
 from services.account_service import account_service
 from services.config import config
-from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from services.proxy_service import is_proxy_transport_error, record_backend_proxy_result
 from utils.helper import (
@@ -25,7 +22,8 @@ from utils.helper import (
     is_supported_image_model,
     split_image_model,
 )
-from utils.image_tokens import count_image_content_tokens, image_size_from_bytes
+from utils.image_result import format_image_result as _format_image_result, save_image_bytes
+from utils.image_tokens import count_image_content_tokens
 from utils.log import logger
 
 
@@ -163,48 +161,6 @@ def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
     return [base64.b64encode(data).decode("ascii") for data, _, _ in images if data]
 
 
-def save_image_bytes(image_data: bytes, base_url: str | None = None) -> str:
-    return image_storage_service.save(image_data, base_url).url
-
-
-def requested_image_size(size: str | None) -> tuple[int, int] | None:
-    match = re.fullmatch(r"(\d{2,5})x(\d{2,5})", str(size or "").strip().lower())
-    if not match:
-        return None
-    width, height = int(match.group(1)), int(match.group(2))
-    return (width, height) if width > 0 and height > 0 else None
-
-
-def ensure_image_canvas_size(image_data: bytes, size: str | None) -> bytes:
-    target_size = requested_image_size(size)
-    if not target_size:
-        return image_data
-    current_size = image_size_from_bytes(image_data)
-    if current_size == target_size:
-        return image_data
-    try:
-        with Image.open(BytesIO(image_data)) as image:
-            converted = image.convert("RGBA") if image.mode in {"RGBA", "LA", "P"} else image.convert("RGB")
-            resized = converted.resize(target_size, Image.Resampling.LANCZOS)
-            output = BytesIO()
-            resized.save(output, format="PNG")
-            logger.info({
-                "event": "image_canvas_resized",
-                "target_size": size,
-                "current_size": current_size,
-                "final_size": target_size,
-            })
-            return output.getvalue()
-    except Exception as exc:
-        logger.warning({
-            "event": "image_canvas_resize_failed",
-            "target_size": size,
-            "current_size": current_size,
-            "error": str(exc)[:200],
-        })
-        return image_data
-
-
 def message_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -330,37 +286,15 @@ def format_image_result(
     created: int | None = None,
     message: str = "",
 ) -> dict[str, Any]:
-    data: list[dict[str, Any]] = []
-    for item in items:
-        b64_json = str(item.get("b64_json") or "").strip()
-        if not b64_json:
-            continue
-        image_bytes = base64.b64decode(b64_json)
-        image_size = image_size_from_bytes(image_bytes)
-        revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
-        if response_format == "b64_json":
-            result_item = {
-                "b64_json": b64_json,
-                "url": save_image_bytes(image_bytes, base_url),
-                "revised_prompt": revised_prompt,
-            }
-        else:
-            result_item = {
-                "url": save_image_bytes(image_bytes, base_url),
-                "revised_prompt": revised_prompt,
-            }
-        if image_size:
-            result_item["width"], result_item["height"] = image_size
-            result_item["size"] = f"{image_size[0]}x{image_size[1]}"
-        data.append(result_item)
-    result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
-    if data:
-        for key in ("size", "width", "height"):
-            if data[0].get(key):
-                result[key] = data[0][key]
-    if message and not data:
-        result["message"] = message
-    return result
+    return _format_image_result(
+        items,
+        prompt,
+        response_format,
+        base_url,
+        created,
+        message,
+        save_image=save_image_bytes,
+    )
 
 
 @dataclass
@@ -1071,7 +1005,7 @@ def stream_image_outputs(
         if request.progress_callback:
             request.progress_callback("receiving_image")
         image_items = [
-            {"b64_json": base64.b64encode(ensure_image_canvas_size(image_data, request.size)).decode("ascii")}
+            {"b64_json": base64.b64encode(image_data).decode("ascii")}
             for image_data in backend.download_image_bytes(image_urls)
         ]
         data = format_image_result(
@@ -1168,7 +1102,7 @@ def stream_image_outputs(
                     if request.progress_callback:
                         request.progress_callback("receiving_image")
                     image_items = [
-                        {"b64_json": base64.b64encode(ensure_image_canvas_size(image_data, request.size)).decode("ascii")}
+                        {"b64_json": base64.b64encode(image_data).decode("ascii")}
                         for image_data in backend.download_image_bytes(image_urls)
                     ]
                     data = format_image_result(
@@ -1280,7 +1214,7 @@ def stream_image_outputs(
                 if request.progress_callback:
                     request.progress_callback("receiving_image")
                 image_items = [
-                    {"b64_json": base64.b64encode(ensure_image_canvas_size(image_data, request.size)).decode("ascii")}
+                    {"b64_json": base64.b64encode(image_data).decode("ascii")}
                     for image_data in backend.download_image_bytes(image_urls)
                 ]
                 data = format_image_result(

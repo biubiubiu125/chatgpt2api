@@ -3,10 +3,7 @@ from __future__ import annotations
 import base64
 import math
 import re
-from io import BytesIO
 from typing import Any
-
-from PIL import Image
 
 DEFAULT_IMAGE_SIZE = (1024, 1024)
 IMAGE_INPUT_TOKEN_MODEL = "gpt-5.4-mini"
@@ -46,17 +43,110 @@ def _model_name(model: str) -> str:
     return str(model or "").strip().lower()
 
 
-def image_size_from_bytes(data: bytes) -> tuple[int, int] | None:
-    if not data:
+def _normalized_size(width: int, height: int) -> tuple[int, int] | None:
+    if width <= 0 or height <= 0:
         return None
+    return int(width), int(height)
+
+
+def _png_size(data: bytes) -> tuple[int, int] | None:
+    if len(data) < 24 or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
+    width = int.from_bytes(data[16:20], "big")
+    height = int.from_bytes(data[20:24], "big")
+    return _normalized_size(width, height)
+
+
+def _gif_size(data: bytes) -> tuple[int, int] | None:
+    if len(data) < 10 or data[:6] not in {b"GIF87a", b"GIF89a"}:
+        return None
+    width = int.from_bytes(data[6:8], "little")
+    height = int.from_bytes(data[8:10], "little")
+    return _normalized_size(width, height)
+
+
+def _jpeg_size(data: bytes) -> tuple[int, int] | None:
+    if len(data) < 4 or not data.startswith(b"\xff\xd8"):
+        return None
+    pos = 2
+    while pos + 3 < len(data):
+        if data[pos] != 0xFF:
+            pos += 1
+            continue
+        while pos < len(data) and data[pos] == 0xFF:
+            pos += 1
+        if pos >= len(data):
+            return None
+        marker = data[pos]
+        pos += 1
+        if marker in {0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
+            continue
+        if pos + 2 > len(data):
+            return None
+        segment_length = int.from_bytes(data[pos:pos + 2], "big")
+        if segment_length < 2 or pos + segment_length > len(data):
+            return None
+        if marker in {
+            0xC0, 0xC1, 0xC2, 0xC3,
+            0xC5, 0xC6, 0xC7,
+            0xC9, 0xCA, 0xCB,
+            0xCD, 0xCE, 0xCF,
+        } and segment_length >= 7:
+            height = int.from_bytes(data[pos + 3:pos + 5], "big")
+            width = int.from_bytes(data[pos + 5:pos + 7], "big")
+            return _normalized_size(width, height)
+        pos += segment_length
+    return None
+
+
+def _webp_size(data: bytes) -> tuple[int, int] | None:
+    if len(data) < 20 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return None
+    pos = 12
+    while pos + 8 <= len(data):
+        chunk = data[pos:pos + 4]
+        chunk_size = int.from_bytes(data[pos + 4:pos + 8], "little")
+        payload_start = pos + 8
+        payload_end = payload_start + chunk_size
+        if payload_end > len(data):
+            return None
+        payload = data[payload_start:payload_end]
+        if chunk == b"VP8X" and len(payload) >= 10:
+            width = 1 + int.from_bytes(payload[4:7], "little")
+            height = 1 + int.from_bytes(payload[7:10], "little")
+            return _normalized_size(width, height)
+        if chunk == b"VP8L" and len(payload) >= 5 and payload[0] == 0x2F:
+            width = 1 + (((payload[2] & 0x3F) << 8) | payload[1])
+            height = 1 + (((payload[4] & 0x0F) << 10) | (payload[3] << 2) | ((payload[2] & 0xC0) >> 6))
+            return _normalized_size(width, height)
+        if chunk == b"VP8 " and len(payload) >= 10 and payload[3:6] == b"\x9d\x01\x2a":
+            width = int.from_bytes(payload[6:8], "little") & 0x3FFF
+            height = int.from_bytes(payload[8:10], "little") & 0x3FFF
+            return _normalized_size(width, height)
+        pos = payload_end + (chunk_size % 2)
+    return None
+
+
+def _image_size_from_header(data: bytes) -> tuple[int, int] | None:
+    return _png_size(data) or _jpeg_size(data) or _webp_size(data) or _gif_size(data)
+
+
+def _image_size_from_pillow(data: bytes) -> tuple[int, int] | None:
     try:
+        from io import BytesIO
+        from PIL import Image
+
         with Image.open(BytesIO(data)) as image:
             width, height = image.size
     except Exception:
         return None
-    if width <= 0 or height <= 0:
+    return _normalized_size(width, height)
+
+
+def image_size_from_bytes(data: bytes) -> tuple[int, int] | None:
+    if not data:
         return None
-    return int(width), int(height)
+    return _image_size_from_header(data) or _image_size_from_pillow(data)
 
 
 def _decode_data_url(value: str) -> bytes:
@@ -81,7 +171,7 @@ def parse_image_size(size: object, default: tuple[int, int] = DEFAULT_IMAGE_SIZE
                 return width, height
         except (TypeError, ValueError):
             pass
-    match = re.search(r"(\d{2,5})\D+(\d{2,5})", str(size or ""))
+    match = re.search(r"(\d{1,5})\D+(\d{1,5})", str(size or ""))
     if not match:
         return default
     width, height = int(match.group(1)), int(match.group(2))
@@ -282,6 +372,16 @@ def count_image_output_items_tokens(
                     image_size = image_size_from_bytes(base64.b64decode(b64_json))
                 except Exception:
                     image_size = None
+            if image_size is None:
+                try:
+                    width = int(item.get("width") or 0)
+                    height = int(item.get("height") or 0)
+                    if width > 0 and height > 0:
+                        image_size = (width, height)
+                except (TypeError, ValueError):
+                    image_size = None
+            if image_size is None and item.get("size"):
+                image_size = parse_image_size(item.get("size"), fallback_size)
         width, height = image_size or fallback_size
         total += count_generated_image_tokens(width, height, quality)
     return total
