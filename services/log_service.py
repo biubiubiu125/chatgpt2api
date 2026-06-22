@@ -24,6 +24,21 @@ LOG_TYPE_ACCOUNT = "account"
 INTERNAL_RESPONSE_KEYS = {"_account_email", "_account_emails", "_access_token", "_conversation_id"}
 
 
+def _exception_log_fields(exc: Exception) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        try:
+            fields["status_code"] = int(status_code)
+        except (TypeError, ValueError):
+            fields["status_code"] = str(status_code)
+    for attr, key in (("error_type", "error_type"), ("code", "error_code"), ("param", "error_param")):
+        value = getattr(exc, attr, None)
+        if value is not None and value != "":
+            fields[key] = value
+    return fields
+
+
 class LogService:
     def __init__(self, path: Path):
         self.path = path
@@ -243,7 +258,8 @@ class LoggedCall:
         except ImageGenerationError as exc:
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      account_emails=getattr(exc, "account_emails", []),
-                     conversation_id=getattr(exc, "conversation_id", ""))
+                     conversation_id=getattr(exc, "conversation_id", ""),
+                     extra=_exception_log_fields(exc))
             return _image_error_response(exc)
         except HTTPException as exc:
             self.log("调用失败", status="failed", error=str(exc.detail))
@@ -269,7 +285,8 @@ class LoggedCall:
         except ImageGenerationError as exc:
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      account_emails=getattr(exc, "account_emails", []),
-                     conversation_id=getattr(exc, "conversation_id", ""))
+                     conversation_id=getattr(exc, "conversation_id", ""),
+                     extra=_exception_log_fields(exc))
             return _image_error_response(exc)
         except HTTPException as exc:
             self.log("调用失败", status="failed", error=str(exc.detail))
@@ -306,6 +323,7 @@ class LoggedCall:
                 account_email=(account_emails[0] if account_emails else getattr(exc, "account_email", "")),
                 account_emails=[*account_emails, *list(getattr(exc, "account_emails", []) or [])],
                 conversation_id=(conversation_ids[0] if conversation_ids else getattr(exc, "conversation_id", "")),
+                extra=_exception_log_fields(exc),
             )
             if self.endpoint.startswith("/v1/images") and not hasattr(exc, "to_openai_error"):
                 from services.protocol.conversation import ImageGenerationError, public_image_error_message
@@ -320,7 +338,7 @@ class LoggedCall:
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
             urls: list[str] | None = None, account_email: str = "", account_emails: list[str] | None = None,
-            conversation_id: str = "") -> None:
+            conversation_id: str = "", extra: dict[str, Any] | None = None) -> None:
         detail = {
             "key_id": self.identity.get("id"),
             "key_name": self.identity.get("name"),
@@ -339,6 +357,8 @@ class LoggedCall:
             detail["request_shape"] = self.request_shape
         if error:
             detail["error"] = error
+        if extra:
+            detail.update(extra)
         emails = _dedupe_strings([*(account_emails or []), *_collect_account_emails(result)])
         email = str(account_email or "").strip() or (emails[0] if emails else "")
         if email:

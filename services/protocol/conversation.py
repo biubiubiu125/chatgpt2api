@@ -67,6 +67,11 @@ class ImageGenerationError(Exception):
 def public_image_error_message(message: str) -> str:
     text = str(message or "").strip()
     lower = text.lower()
+    if is_model_text_reply_instead_of_image(text):
+        return (
+            "The upstream model returned a text/tool description instead of an image. "
+            "Please retry later."
+        )
     if any(item in lower for item in ("backend-api/", "status=", "body=", "chatgpt.com", "upstreamhttperror")):
         return "The image generation request failed. Please try again later."
     return text or "The image generation request failed. Please try again later."
@@ -165,6 +170,9 @@ REFERENCED_IMAGE_IDS_RE = re.compile(r'"referenced_image_ids"\s*:\s*\[([^\]]+)\]
 TOOL_PARAMS_JSON_RE = re.compile(
     r'\{\s*"size"\s*:\s*"\d+x\d+"\s*,\s*"n"\s*:\s*\d+\s*\}'
 )
+TOOL_PARAM_FIELD_RE = re.compile(
+    r'"(?:prompt|size|n|transparent_background|is_style_transfer|referenced_image_ids)"\s*:'
+)
 
 
 def is_model_text_reply_instead_of_image(message: str) -> bool:
@@ -184,6 +192,9 @@ def is_model_text_reply_instead_of_image(message: str) -> bool:
         return True
     # 检测部分工具参数 JSON（模型返回了工具参数但未触发工具）
     if TOOL_PARAMS_JSON_RE.search(message):
+        return True
+    stripped = message.strip()
+    if stripped.startswith("{") and TOOL_PARAM_FIELD_RE.search(stripped):
         return True
     return False
 
