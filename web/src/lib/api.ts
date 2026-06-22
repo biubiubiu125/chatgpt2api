@@ -68,6 +68,21 @@ type ModelListResponse = {
   data: Model[];
 };
 
+export type UpstreamModelsProbeResponse = {
+  ok: boolean;
+  status: "ok" | "error" | string;
+  probe_scope?: string;
+  probe_scope_label?: string;
+  covers_image_generation?: boolean;
+  status_code?: number | null;
+  latency_ms: number;
+  model_count: number;
+  models: string[];
+  error?: string | null;
+  proxy_source?: string;
+  has_proxy?: boolean;
+};
+
 type AccountMutationResponse = {
   items: Account[];
   added?: number;
@@ -176,6 +191,8 @@ export type SettingsConfig = {
   image_poll_timeout_secs?: number | string;
   image_account_concurrency?: number | string;
   image_parallel_generation?: boolean;
+  image_resize_max_side?: number | string;
+  image_resize_max_pixels?: number | string;
   image_settle_enabled?: boolean;
   image_check_before_hit_enabled?: boolean;
   image_settle_secs?: number | string;
@@ -189,6 +206,11 @@ export type SettingsConfig = {
   backup?: BackupSettings;
   backup_state?: BackupState;
   [key: string]: unknown;
+};
+
+export type ImageResizeLimitsResponse = {
+  max_side: number;
+  max_pixels: number;
 };
 
 export type BackupInclude = {
@@ -345,12 +367,6 @@ export type RegisterConfig = {
     providers: Array<Record<string, unknown>>;
   };
   proxy: string;
-  proxy_input_mode?: "auto" | "single" | "proxy_checker_dir";
-  proxy_checker_dir?: string;
-  proxy_checker_pattern?: string;
-  proxy_refresh_interval?: number;
-  proxy_bind_proxy_checker?: boolean;
-  proxy_selection_strategy?: "round_robin" | "random";
   task_timeout_seconds?: number;
   task_stall_timeout_seconds?: number;
   total: number;
@@ -387,18 +403,15 @@ export type RegisterConfig = {
       mode?: string;
       source_label?: string;
       count?: number;
-      selected_file?: string;
       last_error?: string;
       status?: string;
       usage_label?: string;
       using_cached?: boolean;
       wait_retriable?: boolean;
-      selection_strategy?: "round_robin" | "random" | string;
+      selection_strategy?: "single" | string;
       single_available?: boolean;
-      proxy_checker_cached?: boolean;
       source_counts?: {
         single?: number;
-        proxy_checker_dir?: number;
       };
     };
     workers?: Array<Record<string, unknown>>;
@@ -428,6 +441,10 @@ export async function fetchAccounts() {
 
 export async function fetchModels() {
   return httpRequest<ModelListResponse>("/v1/models");
+}
+
+export async function probeUpstreamModels() {
+  return httpRequest<UpstreamModelsProbeResponse>("/api/upstream/models/probe");
 }
 
 export async function createAccounts(tokens: string[], accounts: AccountImportPayload[] = []) {
@@ -627,6 +644,10 @@ export async function resumeImagePoll(taskId: string, extraTimeoutSecs = 30) {
 
 export async function fetchSettingsConfig() {
   return httpRequest<{ config: SettingsConfig }>("/api/settings");
+}
+
+export async function fetchImageResizeLimits() {
+  return httpRequest<ImageResizeLimitsResponse>("/api/image/resize-limits");
 }
 
 export async function updateSettingsConfig(settings: SettingsConfig) {

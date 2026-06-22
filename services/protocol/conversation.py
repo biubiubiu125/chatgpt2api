@@ -14,7 +14,11 @@ import tiktoken
 from services.account_service import account_service
 from services.config import config
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
-from services.proxy_service import is_proxy_transport_error, record_backend_proxy_result
+from services.proxy_service import (
+    is_cloudflare_upstream_error,
+    is_proxy_transport_error,
+    record_backend_proxy_result,
+)
 from utils.helper import (
     IMAGE_MODELS,
     extract_image_from_message_content,
@@ -78,6 +82,25 @@ def is_token_invalid_error(message: str) -> bool:
     )
 
 
+def _exception_text(exc: Exception) -> str:
+    parts = [str(exc), str(getattr(exc, "task_error", "") or ""), repr(getattr(exc, "body", "") or "")]
+    return " ".join(part for part in parts if part)
+
+
+def is_token_invalid_exception(exc: Exception) -> bool:
+    return is_token_invalid_error(_exception_text(exc))
+
+
+def raise_token_invalid_generation_error(exc: Exception, conversation_id: str = "") -> None:
+    raise ImageGenerationError(
+        _exception_text(exc) or "token_revoked",
+        status_code=401,
+        error_type="authentication_error",
+        code="token_revoked",
+        conversation_id=conversation_id or str(getattr(exc, "conversation_id", "") or ""),
+    ) from exc
+
+
 def is_tls_connection_error(message: str) -> bool:
     """检测 TLS/SSL 连接错误，这类错误通常可以通过重试解决。"""
     text = str(message or "").lower()
@@ -106,7 +129,17 @@ def is_connection_timeout_error(message: str) -> bool:
 
 
 def is_proxy_failure_error(message: str) -> bool:
-    return is_proxy_transport_error(message)
+    return is_upstream_connection_error(message)
+
+
+def is_upstream_connection_error(message: str) -> bool:
+    text = str(message or "").lower()
+    return (
+        is_tls_connection_error(text)
+        or is_connection_timeout_error(text)
+        or is_proxy_transport_error(text)
+        or is_cloudflare_upstream_error(text)
+    )
 
 
 def _record_backend_proxy_result(backend: object, ok: bool) -> None:
@@ -117,10 +150,8 @@ def image_stream_error_message(message: str) -> str:
     text = str(message or "")
     if is_token_invalid_error(text):
         return "image generation failed"
-    if is_tls_connection_error(text):
+    if is_upstream_connection_error(text):
         return "upstream image connection failed, please retry later"
-    if is_connection_timeout_error(text):
-        return "upstream connection timed out, please retry later"
     return text or "image generation failed"
 
 
@@ -285,6 +316,7 @@ def format_image_result(
     base_url: str | None = None,
     created: int | None = None,
     message: str = "",
+    requested_size: object = None,
 ) -> dict[str, Any]:
     return _format_image_result(
         items,
@@ -293,6 +325,7 @@ def format_image_result(
         base_url,
         created,
         message,
+        requested_size=requested_size,
         save_image=save_image_bytes,
     )
 
@@ -832,6 +865,13 @@ def _get_detailed_error_from_tasks(
                 return error_msg
         return ""
     except Exception as exc:
+        if is_token_invalid_exception(exc):
+            logger.warning({
+                "event": "image_task_error_query_invalid_token",
+                "conversation_id": conversation_id,
+                "error": _exception_text(exc)[:300],
+            })
+            raise
         logger.warning({
             "event": "image_task_error_query_failed",
             "conversation_id": conversation_id,
@@ -944,6 +984,19 @@ def stream_image_outputs(
     detailed_error = ""
     if not file_ids and not sediment_ids and conversation_id:
         detailed_error = _get_detailed_error_from_tasks(backend, conversation_id, timeout_secs=5.0, wait_secs=1.0)
+        if detailed_error and is_token_invalid_error(detailed_error):
+            logger.warning({
+                "event": "image_task_error_invalid_token",
+                "conversation_id": conversation_id,
+                "error": detailed_error[:300],
+            })
+            raise ImageGenerationError(
+                detailed_error,
+                status_code=401,
+                error_type="authentication_error",
+                code="token_revoked",
+                conversation_id=conversation_id,
+            )
         if detailed_error and not should_poll_for_image and not is_text_reply:
             logger.info({
                 "event": "image_task_error_before_poll",
@@ -977,6 +1030,13 @@ def stream_image_outputs(
             conversation_id, file_ids, sediment_ids, poll_timeout_secs=poll_timeout,
         )
     except (ImageContentPolicyError, ImagePollTimeoutError) as exc:
+        if is_token_invalid_exception(exc):
+            logger.warning({
+                "event": "image_resolve_invalid_token",
+                "conversation_id": conversation_id,
+                "error": _exception_text(exc)[:300],
+            })
+            raise_token_invalid_generation_error(exc, conversation_id)
         # 当检测到文本回复时，task error 不应直接判定为内容策略违规，
         # 因为图片可能仍在后台异步生成中
         if is_text_reply and isinstance(exc, ImageContentPolicyError):
@@ -989,6 +1049,13 @@ def stream_image_outputs(
         else:
             raise
     except Exception as exc:
+        if is_token_invalid_exception(exc):
+            logger.warning({
+                "event": "image_text_reply_first_poll_invalid_token",
+                "conversation_id": conversation_id,
+                "error": _exception_text(exc)[:300],
+            })
+            raise
         # 当检测到文本回复时，首次轮询的临时网络错误不应直接中断，
         # 因为图片可能仍在后台异步生成中，后续 retry poll 会继续尝试。
         if is_text_reply and conversation_id:
@@ -1014,6 +1081,7 @@ def stream_image_outputs(
             request.response_format,
             request.base_url,
             int(time.time()),
+            requested_size=request.size,
         )["data"]
         if data:
             yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
@@ -1064,10 +1132,18 @@ def stream_image_outputs(
                     sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
                     break  # 轮询成功，退出重试循环
                 except Exception as exc:
-                    error_str = str(exc)
+                    if is_token_invalid_exception(exc):
+                        logger.warning({
+                            "event": "image_model_text_reply_poll_invalid_token",
+                            "conversation_id": conversation_id,
+                            "poll_attempt": poll_attempt,
+                            "error": _exception_text(exc)[:300],
+                        })
+                        raise_token_invalid_generation_error(exc, conversation_id)
+                    error_str = _exception_text(exc)
                     is_transient = (
                         isinstance(exc, ImagePollTimeoutError)
-                        or is_tls_connection_error(error_str)
+                        or is_upstream_connection_error(error_str)
                         or "upstream" in error_str.lower()
                         or "connection" in error_str.lower()
                         or "timeout" in error_str.lower()
@@ -1111,6 +1187,7 @@ def stream_image_outputs(
                         request.response_format,
                         request.base_url,
                         int(time.time()),
+                        requested_size=request.size,
                     )["data"]
                     if data:
                         yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
@@ -1176,10 +1253,18 @@ def stream_image_outputs(
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
                 break  # 轮询成功，退出重试循环
             except Exception as exc:
-                error_str = str(exc)
+                if is_token_invalid_exception(exc):
+                    logger.warning({
+                        "event": "image_stream_retry_poll_invalid_token",
+                        "conversation_id": conversation_id,
+                        "poll_attempt": poll_attempt,
+                        "error": _exception_text(exc)[:300],
+                    })
+                    raise_token_invalid_generation_error(exc, conversation_id)
+                error_str = _exception_text(exc)
                 is_transient = (
                     isinstance(exc, ImagePollTimeoutError)
-                    or is_tls_connection_error(error_str)
+                    or is_upstream_connection_error(error_str)
                     or "upstream" in error_str.lower()
                     or "connection" in error_str.lower()
                     or "timeout" in error_str.lower()
@@ -1223,6 +1308,7 @@ def stream_image_outputs(
                     request.response_format,
                     request.base_url,
                     int(time.time()),
+                    requested_size=request.size,
                 )["data"]
                 if data:
                     yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
@@ -1279,8 +1365,8 @@ def stream_codex_image_outputs(
         raise ImageGenerationError("No image result found in response")
     image_items = []
     for item in images:
-        # Codex image generation supports native size parameters. Keep the upstream
-        # image bytes unchanged so 2K/4K results reflect the real upstream output.
+        # Codex image generation supports native size parameters, then the public
+        # response is normalized to the requested size below when needed.
         image_data = base64.b64decode(item)
         image_items.append({
             "b64_json": base64.b64encode(image_data).decode("ascii"),
@@ -1292,6 +1378,7 @@ def stream_codex_image_outputs(
         request.response_format,
         request.base_url,
         int(time.time()),
+        requested_size=request.size,
     )["data"]
     if data:
         yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data)
@@ -1308,16 +1395,13 @@ def _generate_single_image(
 ) -> list[ImageOutput]:
     """Run generation for one image, preserving account leases across retries."""
     MAX_TEXT_REPLY_RETRIES = 3
-    MAX_TLS_RETRIES = 3
-    MAX_CONN_TIMEOUT_RETRIES = 3
+    MAX_UPSTREAM_CONNECTION_RETRIES_PER_TOKEN = 1
 
     text_reply_retry_count = 0
-    tls_retry_count = 0
-    conn_timeout_retry_count = 0
+    upstream_connection_retries_by_token: dict[str, int] = {}
     account_email = ""
     current_token = str(access_token or "").strip()
     attempted_tokens: set[str] = {current_token} if current_token else set()
-    use_lease_pool = token_pool is not None or bool(current_token)
     if token_pool is None and current_token:
         token_pool = ImageTokenLeasePool(request, {current_token})
 
@@ -1356,6 +1440,15 @@ def _generate_single_image(
             return True
         except Exception:
             return False
+
+    def remove_invalid_current_token(invalid_token: str, reason: str) -> None:
+        nonlocal current_token
+        account_service.remove_invalid_token(invalid_token, reason)
+        account_service.release_image_slot(invalid_token)
+        if token_pool is not None:
+            token_pool.release(invalid_token)
+        if current_token == invalid_token:
+            current_token = ""
 
     while True:
         try:
@@ -1483,8 +1576,19 @@ def _generate_single_image(
             ) from exc
         except ImageGenerationError as exc:
             attach_account_context(exc)
-            error_text = str(exc)
+            error_text = _exception_text(exc)
             _record_backend_proxy_result(backend, not is_proxy_failure_error(error_text))
+            if is_token_invalid_exception(exc):
+                logger.warning({
+                    "event": "image_stream_invalid_token_retry",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "emitted_for_token": emitted_for_token,
+                    "index": index,
+                    "error": error_text[:200],
+                })
+                remove_invalid_current_token(token, "image_stream")
+                continue
             if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
                 text_reply_retry_count += 1
                 if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
@@ -1528,7 +1632,7 @@ def _generate_single_image(
             release_current_token(False)
             raise
         except Exception as exc:
-            last_error = str(exc)
+            last_error = _exception_text(exc)
             _record_backend_proxy_result(backend, not is_proxy_failure_error(last_error))
             logger.warning({
                 "event": "image_stream_fail",
@@ -1537,46 +1641,40 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
-            if not emitted_for_token and is_token_invalid_error(last_error):
-                if not use_lease_pool:
-                    refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
-                    if refreshed_token and refreshed_token != token:
-                        current_token = refreshed_token
-                        continue
-                    account_service.remove_invalid_token(token, "image_stream")
-                    release_current_token(False)
+            if is_token_invalid_exception(exc):
+                logger.warning({
+                    "event": "image_stream_invalid_token_retry",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "emitted_for_token": emitted_for_token,
+                    "index": index,
+                    "error": last_error[:200],
+                })
+                remove_invalid_current_token(token, "image_stream")
+                continue
+            if is_upstream_connection_error(last_error):
+                retry_count = upstream_connection_retries_by_token.get(token, 0) + 1
+                upstream_connection_retries_by_token[token] = retry_count
+                if retry_count <= MAX_UPSTREAM_CONNECTION_RETRIES_PER_TOKEN:
+                    logger.warning({
+                        "event": "image_stream_upstream_connection_retry",
+                        "request_token": token,
+                        "account_email": account_email,
+                        "retry_count": retry_count,
+                        "index": index,
+                        "error": last_error[:200],
+                    })
+                    time.sleep(2.0)
                     continue
+                logger.warning({
+                    "event": "image_stream_upstream_connection_switch_account",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "retry_count": retry_count,
+                    "index": index,
+                    "error": last_error[:200],
+                })
                 if switch_token(False):
-                    continue
-                release_current_token(False)
-                raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, account_id=account_id, conversation_id="") from exc
-            if not emitted_for_token and is_tls_connection_error(last_error):
-                tls_retry_count += 1
-                if tls_retry_count <= MAX_TLS_RETRIES:
-                    logger.warning({
-                        "event": "image_stream_tls_retry",
-                        "request_token": token,
-                        "account_email": account_email,
-                        "retry_count": tls_retry_count,
-                        "index": index,
-                        "error": last_error[:200],
-                    })
-                    time.sleep(min(2.0 * tls_retry_count, 10.0))
-                    continue
-            if not emitted_for_token and is_connection_timeout_error(last_error):
-                conn_timeout_retry_count += 1
-                if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
-                    wait_secs = min(3.0 * conn_timeout_retry_count, 9.0)
-                    logger.warning({
-                        "event": "image_stream_conn_timeout_retry",
-                        "request_token": token,
-                        "account_email": account_email,
-                        "retry_count": conn_timeout_retry_count,
-                        "index": index,
-                        "wait_secs": wait_secs,
-                        "error": last_error[:200],
-                    })
-                    time.sleep(wait_secs)
                     continue
             release_current_token(False)
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, account_id=account_id, conversation_id="") from exc

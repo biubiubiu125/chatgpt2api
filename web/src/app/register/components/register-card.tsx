@@ -12,8 +12,6 @@ import type { RegisterConfig } from "@/lib/api";
 
 import { useSettingsStore } from "../../settings/store";
 
-type RegisterProxyPoolStats = NonNullable<RegisterConfig["stats"]["proxy_pool"]>;
-
 export function RegisterCard() {
   const config = useSettingsStore((state) => state.registerConfig);
   const isLoading = useSettingsStore((state) => state.isLoadingRegister);
@@ -49,21 +47,9 @@ export function RegisterCard() {
   const stats = config.stats || { success: 0, fail: 0, done: 0, running: 0, threads: config.threads, proxy_pool: {} };
   const providers = config.mail.providers || [];
   const logs = config.logs || [];
-  const proxyPool: RegisterProxyPoolStats = stats.proxy_pool || {};
-  const proxyStrategyLabel = (proxyPool.selection_strategy || config.proxy_selection_strategy) === "random" ? "自动随机" : "自动轮询";
-  const proxyPoolUsageLabel = proxyPool.usage_label || ((proxyPool.count || 0) > 0 ? proxyStrategyLabel : "无可用注册代理");
-  const proxyPoolSourceCounts = proxyPool.source_counts
-    ? `单代理 ${proxyPool.source_counts.single || 0} / Proxy Checker ${proxyPool.source_counts.proxy_checker_dir || 0}`
-    : "";
   const fieldValue = (value: unknown, fallback: number | string) => value ?? fallback;
-  const setRegisterTextField = (key: keyof RegisterConfig, value: string) => {
-    setRegisterField(key, value as RegisterConfig[keyof RegisterConfig]);
-  };
   const setRegisterNumberField = (key: keyof RegisterConfig, value: string) => {
     setRegisterField(key, (Number(value) || 0) as RegisterConfig[keyof RegisterConfig]);
-  };
-  const setRegisterBooleanField = (key: keyof RegisterConfig, value: boolean) => {
-    setRegisterField(key, value as RegisterConfig[keyof RegisterConfig]);
   };
   const updateProviderType = (index: number, type: string) => {
     const providerId = String(providers[index]?.provider_id || providers[index]?.id || "");
@@ -150,15 +136,6 @@ export function RegisterCard() {
           <div className="space-y-3 rounded-xl border border-stone-200 bg-white/60 p-3">
             <div className="grid gap-4 md:grid-cols-2">
               <div className="space-y-2">
-                <label className="text-sm text-stone-700">Proxy Checker 目录</label>
-                <Input value={String(config.proxy_checker_dir || "")} placeholder="/opt/proxy-checker/repo_data" onChange={(event) => setRegisterTextField("proxy_checker_dir", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
-                <p className="text-xs text-stone-500">留空则不启用 Proxy Checker。</p>
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm text-stone-700">文件匹配</label>
-                <Input value={String(config.proxy_checker_pattern || "user_*.txt")} onChange={(event) => setRegisterTextField("proxy_checker_pattern", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
-              </div>
-              <div className="space-y-2">
                 <label className="text-sm text-stone-700">单任务超时（秒）</label>
                 <Input value={String(config.task_timeout_seconds || 300)} onChange={(event) => setRegisterNumberField("task_timeout_seconds", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
               </div>
@@ -166,31 +143,11 @@ export function RegisterCard() {
                 <label className="text-sm text-stone-700">无进展强停（秒）</label>
                 <Input value={String(fieldValue(config.task_stall_timeout_seconds, 60))} onChange={(event) => setRegisterNumberField("task_stall_timeout_seconds", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
               </div>
-              <div className="space-y-2">
-                <label className="text-sm text-stone-700">代理刷新间隔（秒）</label>
-                <Input value={String(fieldValue(config.proxy_refresh_interval, 120))} onChange={(event) => setRegisterNumberField("proxy_refresh_interval", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm text-stone-700">取用方式</label>
-                <Select value={config.proxy_selection_strategy || "round_robin"} onValueChange={(value) => setRegisterTextField("proxy_selection_strategy", value)} disabled={config.enabled}>
-                  <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="round_robin">轮询</SelectItem>
-                    <SelectItem value="random">随机</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
             </div>
-            <div className="grid gap-2 md:grid-cols-2">
+            <div className="grid gap-2">
               <label className="flex items-center gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2 text-sm text-stone-700">
                 <Checkbox checked={Boolean(config.mail?.api_use_register_proxy ?? true)} onCheckedChange={(checked) => setRegisterField("mail", { ...config.mail, api_use_register_proxy: Boolean(checked) })} disabled={config.enabled} />
                 邮箱 API 使用注册代理
-              </label>
-              <label className="flex items-center gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2 text-sm text-stone-700">
-                <Checkbox checked={Boolean(config.proxy_bind_proxy_checker ?? true)} onCheckedChange={(checked) => setRegisterBooleanField("proxy_bind_proxy_checker", Boolean(checked))} disabled={config.enabled} />
-                Proxy Checker 代理注册成功后绑定账号
               </label>
             </div>
           </div>
@@ -487,28 +444,6 @@ export function RegisterCard() {
                   <div className="mt-1 text-base font-semibold text-stone-800">{value}</div>
                 </div>
               ))}
-            </div>
-            <div className="grid gap-2 border border-stone-200 bg-white/70 p-3 text-xs text-stone-600 md:grid-cols-4">
-              <div>
-                <div className="text-stone-400">代理来源</div>
-                <div className="mt-1 font-medium text-stone-800">{proxyPool.source_label || "-"}</div>
-              </div>
-              <div>
-                <div className="text-stone-400">代理数</div>
-                <div className="mt-1 font-medium text-stone-800">
-                  {proxyPool.count || 0}{proxyPoolSourceCounts ? ` (${proxyPoolSourceCounts})` : ""}
-                </div>
-              </div>
-              <div>
-                <div className="text-stone-400">取用方式</div>
-                <div className="mt-1 font-medium text-stone-800">{proxyPoolUsageLabel}</div>
-              </div>
-              <div>
-                <div className="text-stone-400">当前文件</div>
-                <div className="mt-1 truncate font-medium text-stone-800" title={proxyPool.selected_file || ""}>{proxyPool.selected_file || "-"}</div>
-              </div>
-              {proxyPool.last_error ? <div className="text-rose-600 md:col-span-4">{proxyPool.last_error}</div> : null}
-              {proxyPool.proxy_checker_cached ? <div className="text-amber-700 md:col-span-4">Proxy Checker 当前使用上轮缓存代理。</div> : null}
             </div>
             <div className="grid grid-cols-3 gap-2">
               <Button className="h-10 rounded-xl bg-stone-950 px-3 text-white hover:bg-stone-800" onClick={() => void toggle()} disabled={isSaving}>

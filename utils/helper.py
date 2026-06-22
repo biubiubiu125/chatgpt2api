@@ -15,6 +15,7 @@ from urllib.parse import urljoin, urlparse
 from curl_cffi import CurlOpt, requests
 from fastapi import HTTPException
 from services.proxy_service import proxy_settings
+from utils.image_resize_limits import get_image_resize_limits
 from utils.log import logger
 
 BASE_IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
@@ -32,11 +33,6 @@ SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "imag
 MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_JSON_EDIT_IMAGES = 10
 MAX_IMAGE_COUNT = 50
-MAX_IMAGE_PIXELS = 3840 * 2160
-MAX_IMAGE_SIDE = 3840
-IMAGE_SIZE_MULTIPLE = 16
-MIN_IMAGE_RATIO = 1 / 3
-MAX_IMAGE_RATIO = 3
 DEFAULT_IMAGE_ASPECT_RATIO = "1:1"
 DEFAULT_IMAGE_RESOLUTION_TIER = "2k"
 IMAGE_SIZE_PRESETS = {
@@ -667,24 +663,17 @@ def parse_image_size(raw_value: object, aspect_ratio: object = None) -> str | No
             supported_ratios = ", ".join(sorted({ratio for ratio, _ in IMAGE_SIZE_PRESETS}))
             raise HTTPException(status_code=400, detail={"error": f"aspect_ratio must be one of: {supported_ratios}"})
         return preset
-    match = re.fullmatch(r"(\d{2,5})\s*[x×]\s*(\d{2,5})", text)
+    match = re.fullmatch(r"(\d{1,5})\s*[x×]\s*(\d{1,5})", text)
     if not match:
         raise HTTPException(status_code=400, detail={"error": "size must be WIDTHxHEIGHT, 1k, 2k, or 4k"})
     width, height = int(match.group(1)), int(match.group(2))
     if width <= 0 or height <= 0:
         raise HTTPException(status_code=400, detail={"error": "size width and height must be positive"})
-    if width > MAX_IMAGE_SIDE or height > MAX_IMAGE_SIDE:
-        raise HTTPException(status_code=400, detail={"error": f"size width and height must not exceed {MAX_IMAGE_SIDE}"})
-    if width % IMAGE_SIZE_MULTIPLE != 0 or height % IMAGE_SIZE_MULTIPLE != 0:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": f"size width and height must be multiples of {IMAGE_SIZE_MULTIPLE}"},
-        )
-    ratio = width / height
-    if ratio < MIN_IMAGE_RATIO or ratio > MAX_IMAGE_RATIO:
-        raise HTTPException(status_code=400, detail={"error": "size aspect ratio must be between 1:3 and 3:1"})
-    if width * height > MAX_IMAGE_PIXELS:
-        raise HTTPException(status_code=400, detail={"error": "size must not exceed 3840x2160 total pixels"})
+    max_side, max_pixels = get_image_resize_limits()
+    if width > max_side or height > max_side:
+        raise HTTPException(status_code=400, detail={"error": f"size width and height must not exceed {max_side}"})
+    if width * height > max_pixels:
+        raise HTTPException(status_code=400, detail={"error": f"size total pixels must not exceed {max_pixels}"})
     return f"{width}x{height}"
 
 

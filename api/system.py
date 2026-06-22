@@ -81,6 +81,14 @@ def create_router(app_version: str) -> APIRouter:
         require_admin(authorization)
         return {"config": config.get()}
 
+    @router.get("/api/image/resize-limits")
+    async def get_image_resize_limits(authorization: str | None = Header(default=None)):
+        require_identity(authorization)
+        return {
+            "max_side": config.image_resize_max_side,
+            "max_pixels": config.image_resize_max_pixels,
+        }
+
     @router.get("/api/third-party-apps")
     async def get_third_party_apps(authorization: str | None = Header(default=None)):
         require_identity(authorization)

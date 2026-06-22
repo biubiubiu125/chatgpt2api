@@ -48,6 +48,7 @@ import {
   fetchModels,
   fetchRefreshProgress,
   fetchReLoginProgress,
+  probeUpstreamModels,
   reLoginAccounts,
   refreshAccounts,
   testProxy,
@@ -57,6 +58,7 @@ import {
   type AccountStatus,
   type Model,
   type RefreshProgressResponse,
+  type UpstreamModelsProbeResponse,
 } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { cn } from "@/lib/utils";
@@ -189,6 +191,7 @@ function AccountsPageContent() {
   const didLoadRef = useRef(false);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [availableModels, setAvailableModels] = useState<Model[]>([]);
+  const [upstreamProbe, setUpstreamProbe] = useState<UpstreamModelsProbeResponse | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState("all");
@@ -201,6 +204,7 @@ function AccountsPageContent() {
   const [isTestingProxy, setIsTestingProxy] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingModels, setIsLoadingModels] = useState(true);
+  const [isProbingUpstream, setIsProbingUpstream] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [refreshingTokens, setRefreshingTokens] = useState<Set<string>>(new Set());
   const [isDeleting, setIsDeleting] = useState(false);
@@ -253,6 +257,28 @@ function AccountsPageContent() {
     }
   };
 
+  const probeModels = async () => {
+    setIsProbingUpstream(true);
+    try {
+      const data = await probeUpstreamModels();
+      setUpstreamProbe(data);
+    } catch {
+      setUpstreamProbe({
+        ok: false,
+        status: "error",
+        probe_scope: "anonymous_models",
+        probe_scope_label: "匿名模型列表",
+        covers_image_generation: false,
+        latency_ms: 0,
+        model_count: 0,
+        models: [],
+        error: "匿名模型探活接口请求失败",
+      });
+    } finally {
+      setIsProbingUpstream(false);
+    }
+  };
+
   useEffect(() => {
     if (didLoadRef.current) {
       return;
@@ -260,6 +286,7 @@ function AccountsPageContent() {
     didLoadRef.current = true;
     void loadAccounts();
     void loadModels();
+    void probeModels();
 
     // 清理进度条定时器
     return () => {
@@ -903,6 +930,28 @@ function AccountsPageContent() {
             <div className="mb-3 text-sm font-medium text-stone-700">
               系统可用模型
               <span className="ml-1 text-stone-400">({availableModels.length})</span>
+            </div>
+            <div
+              className={cn(
+                "mb-3 inline-flex rounded-full px-2.5 py-1 text-xs",
+                upstreamProbe?.ok
+                  ? "bg-emerald-50 text-emerald-700"
+                  : upstreamProbe
+                    ? "bg-rose-50 text-rose-700"
+                    : "bg-stone-100 text-stone-500",
+              )}
+              title={
+                upstreamProbe?.error
+                  || (upstreamProbe && !upstreamProbe.covers_image_generation
+                    ? "仅探测匿名模型列表，不代表生图链路完整正常"
+                    : undefined)
+              }
+            >
+              {isProbingUpstream
+                ? "匿名模型探活中..."
+                : upstreamProbe?.ok
+                  ? `${upstreamProbe.probe_scope_label || "匿名模型列表"}正常 ${upstreamProbe.latency_ms} ms`
+                  : upstreamProbe?.error || "匿名模型状态未知"}
             </div>
             <div className="flex flex-wrap gap-2">
               {availableModels.length > 0 ? (

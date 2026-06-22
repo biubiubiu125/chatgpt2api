@@ -36,11 +36,6 @@ config = {
         "providers": [],
     },
     "proxy": "",
-    "proxy_checker_dir": "",
-    "proxy_checker_pattern": "user_*.txt",
-    "proxy_refresh_interval": 120,
-    "proxy_bind_proxy_checker": True,
-    "proxy_selection_strategy": "round_robin",
     "task_timeout_seconds": 300,
     "task_stall_timeout_seconds": 60,
     "total": 10,
@@ -1276,7 +1271,6 @@ def _wait_for_register_proxy(
             proxy_source=selection.source_label,
             proxy_count=selection.count,
             bind_account_proxy=selection.bind_to_account,
-            selected_proxy_file=selection.selected_file,
             last_error=selection.last_error,
         )
         heartbeat_with_proxy(index, selection)
@@ -1327,7 +1321,6 @@ def worker(
             proxy_source=selection.source_label,
             proxy_count=selection.count,
             bind_account_proxy=selection.bind_to_account,
-            selected_proxy_file=selection.selected_file,
             last_error="",
             failure_reason="",
         )

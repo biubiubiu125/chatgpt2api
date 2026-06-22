@@ -58,12 +58,6 @@ function buildRegisterPayload(registerConfig: RegisterConfig): Partial<RegisterC
       api_use_register_proxy: Boolean(registerConfig.mail?.api_use_register_proxy ?? true),
     },
     proxy: String(registerConfig.proxy || "").trim(),
-    proxy_input_mode: "auto",
-    proxy_checker_dir: String(registerConfig.proxy_checker_dir || "").trim(),
-    proxy_checker_pattern: String(registerConfig.proxy_checker_pattern || "user_*.txt").trim(),
-    proxy_refresh_interval: Math.max(10, numberOrDefault(registerConfig.proxy_refresh_interval, 120)),
-    proxy_bind_proxy_checker: Boolean(registerConfig.proxy_bind_proxy_checker ?? true),
-    proxy_selection_strategy: registerConfig.proxy_selection_strategy === "random" ? "random" : "round_robin",
     task_timeout_seconds: Math.max(30, Number(registerConfig.task_timeout_seconds) || 300),
     task_stall_timeout_seconds: Math.max(0, Number(registerConfig.task_stall_timeout_seconds) || 60),
     total: Math.max(1, Number(registerConfig.total) || 1),
@@ -225,6 +219,8 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     image_max_storage_mb: Number(config.image_max_storage_mb || 0),
     image_poll_timeout_secs: Number(config.image_poll_timeout_secs || 120),
     image_account_concurrency: Number(config.image_account_concurrency || 3),
+    image_resize_max_side: Number(config.image_resize_max_side || 4096),
+    image_resize_max_pixels: Number(config.image_resize_max_pixels || 4096 * 4096),
     image_settle_enabled: Boolean(config.image_settle_enabled !== false),
     image_check_before_hit_enabled: Boolean(config.image_check_before_hit_enabled !== false),
     image_settle_secs: Number(config.image_settle_secs || 2.0),
@@ -498,8 +494,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
     set({ isSavingConfig: true });
     try {
+      const editableConfig = { ...config };
+      delete editableConfig.image_resize_max_side;
+      delete editableConfig.image_resize_max_pixels;
       const data = await updateSettingsConfig({
-        ...config,
+        ...editableConfig,
         refresh_account_interval_minute: Math.max(1, Number(config.refresh_account_interval_minute) || 1),
         image_retention_days: Math.max(1, Number(config.image_retention_days) || 30),
         image_max_storage_mb: Math.max(0, Number(config.image_max_storage_mb) || 0),

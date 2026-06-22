@@ -106,7 +106,6 @@ def _default_config() -> dict:
 def _normalize(raw: dict) -> dict:
     cfg = _default_config()
     cfg.update({k: v for k, v in raw.items() if k not in {"stats", "logs"}})
-    raw_proxy_input_mode = str(raw.get("proxy_input_mode") or "").strip().lower()
     cfg["total"] = max(1, int(cfg.get("total") or 1))
     cfg["threads"] = max(1, int(cfg.get("threads") or 1))
     cfg["mode"] = str(cfg.get("mode") or "total").strip() if str(cfg.get("mode") or "total").strip() in {"total", "quota", "available"} else "total"
@@ -114,16 +113,9 @@ def _normalize(raw: dict) -> dict:
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
-    cfg["proxy_input_mode"] = "auto"
-    proxy_checker_dir = str(cfg.get("proxy_checker_dir") or "").strip()
-    if raw_proxy_input_mode in {"single", "url", "text"}:
-        proxy_checker_dir = ""
-    cfg["proxy_checker_dir"] = proxy_checker_dir
-    cfg["proxy_checker_pattern"] = str(cfg.get("proxy_checker_pattern") or "user_*.txt").strip()
-    cfg["proxy_refresh_interval"] = max(10, _int_or_default(cfg.get("proxy_refresh_interval"), 120))
-    cfg["proxy_bind_proxy_checker"] = bool(cfg.get("proxy_bind_proxy_checker", True))
-    proxy_selection_strategy = str(cfg.get("proxy_selection_strategy") or "round_robin").strip().lower()
-    cfg["proxy_selection_strategy"] = proxy_selection_strategy if proxy_selection_strategy in {"round_robin", "random"} else "round_robin"
+    for key in list(cfg):
+        if str(key).startswith("proxy_"):
+            cfg.pop(key, None)
     cfg.pop("proxy_url", None)
     cfg.pop("proxy_list_text", None)
     cfg.pop("proxy_bind_url", None)

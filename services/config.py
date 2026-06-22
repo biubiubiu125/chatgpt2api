@@ -9,6 +9,7 @@ from pathlib import Path
 import time
 
 from services.storage.base import StorageBackend
+from utils.image_resize_limits import get_image_resize_limits
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
@@ -465,6 +466,14 @@ class ConfigStore:
             return 3
 
     @property
+    def image_resize_max_side(self) -> int:
+        return get_image_resize_limits()[0]
+
+    @property
+    def image_resize_max_pixels(self) -> int:
+        return get_image_resize_limits()[1]
+
+    @property
     def image_parallel_generation(self) -> bool:
         value = self.data.get("image_parallel_generation", True)
         if isinstance(value, str):
@@ -572,6 +581,8 @@ class ConfigStore:
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency
         data["image_parallel_generation"] = self.image_parallel_generation
+        data["image_resize_max_side"] = self.image_resize_max_side
+        data["image_resize_max_pixels"] = self.image_resize_max_pixels
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
         data["log_levels"] = self.log_levels
@@ -623,6 +634,8 @@ class ConfigStore:
         next_data.pop("image_min_free_mb", None)
         next_data.pop("auto_remove_zero_quota_accounts", None)
         next_data.pop("auto_relogin_after_refresh", None)
+        next_data.pop("image_resize_max_side", None)
+        next_data.pop("image_resize_max_pixels", None)
         for key in ("image_retention_days", "image_max_storage_mb"):
             if key in next_data:
                 try:

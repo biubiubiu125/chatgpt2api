@@ -39,6 +39,69 @@ class ImageContentPolicyError(RuntimeError):
     pass
 
 
+def _is_token_invalid_error(value: Any) -> bool:
+    text = str(value or "").lower()
+    return (
+        "token_invalidated" in text
+        or "token_revoked" in text
+        or "authentication token has been invalidated" in text
+        or "invalidated oauth token" in text
+    )
+
+
+def _is_token_invalid_exception(exc: Exception) -> bool:
+    parts = [str(exc), repr(getattr(exc, "body", "") or "")]
+    return any(_is_token_invalid_error(part) for part in parts if part)
+
+
+def _error_body_text(value: Any, limit: int = 2000) -> str:
+    if isinstance(value, (dict, list)):
+        try:
+            text = json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = repr(value)
+    else:
+        text = str(value or "")
+    return text[:limit]
+
+
+def _is_chatgpt_origin_url(url: str) -> bool:
+    host = (urlparse(str(url or "")).hostname or "").lower()
+    return host == "chatgpt.com" or host.endswith(".chatgpt.com")
+
+
+def _is_image_download_token_failure(status_code: int, body: Any, url: str = "") -> bool:
+    if _is_token_invalid_error(body):
+        return True
+    if not _is_chatgpt_origin_url(url):
+        return False
+    if status_code == 401:
+        return True
+    if status_code != 403:
+        return False
+    text = _error_body_text(body).lower()
+    if any(marker in text for marker in ("cloudflare", "cf-ray", "cf-chl", "just a moment")):
+        return False
+    if not text.strip():
+        return True
+    return any(
+        marker in text
+        for marker in (
+            "unauthorized",
+            "authentication",
+            "access token",
+            "bearer",
+            "oauth",
+            "jwt",
+            "signature",
+            "signed url",
+            "expired",
+            "forbidden",
+            "access denied",
+        )
+    )
+
+
 @dataclass
 class ChatRequirements:
     """保存一次对话请求所需的 sentinel token。"""
@@ -2172,14 +2235,29 @@ class OpenAIBackendAPI:
                     is_error, error_msg, metadata = self.check_task_error(task)
                     if is_error and error_msg:
                         last_task_error = error_msg
+                        event_name = (
+                            "image_poll_task_invalid_token_detected"
+                            if _is_token_invalid_error(error_msg)
+                            else "image_poll_task_error_not_blocking"
+                        )
                         logger.info({
-                            "event": "image_poll_task_error_not_blocking",
+                            "event": event_name,
                             "conversation_id": conversation_id,
                             "attempt": attempt,
                             "error_msg": error_msg,
                             "metadata": metadata,
                         })
+                        if _is_token_invalid_error(error_msg):
+                            raise RuntimeError(error_msg)
             except Exception as exc:
+                if _is_token_invalid_exception(exc):
+                    logger.warning({
+                        "event": "image_poll_task_invalid_token",
+                        "conversation_id": conversation_id,
+                        "attempt": attempt,
+                        "error": str(exc)[:300],
+                    })
+                    raise
                 # tasks 查询失败不影响正常轮询流程
                 logger.debug({
                     "event": "image_poll_task_check_failed",
@@ -2381,6 +2459,15 @@ class OpenAIBackendAPI:
             try:
                 url = self._get_file_download_url(file_id)
             except Exception as exc:
+                if _is_token_invalid_exception(exc):
+                    logger.warning({
+                        "event": "image_download_url_invalid_token",
+                        "source": "file",
+                        "conversation_id": conversation_id,
+                        "id": file_id,
+                        "error": repr(exc)[:300],
+                    })
+                    raise
                 logger.debug({
                     "event": "image_download_url_failed",
                     "source": "file",
@@ -2412,6 +2499,15 @@ class OpenAIBackendAPI:
             try:
                 url = self._get_attachment_download_url(conversation_id, sediment_id)
             except Exception as exc:
+                if _is_token_invalid_exception(exc):
+                    logger.warning({
+                        "event": "image_download_url_invalid_token",
+                        "source": "sediment",
+                        "conversation_id": conversation_id,
+                        "id": sediment_id,
+                        "error": repr(exc)[:300],
+                    })
+                    raise
                 logger.debug({
                     "event": "image_download_url_failed",
                     "source": "sediment",
@@ -2480,6 +2576,8 @@ class OpenAIBackendAPI:
                 # 如果轮询超时且有 task error（如 moderation 拦截），抛出 ImageContentPolicyError
                 # 而非 ImagePollTimeoutError，让调用方能区分真正的超时和上游拒绝
                 task_error = getattr(exc, "task_error", "")
+                if _is_token_invalid_error(task_error):
+                    raise RuntimeError(task_error) from exc
                 if not file_ids and not sediment_ids:
                     if task_error:
                         raise ImageContentPolicyError(task_error) from exc
@@ -2491,6 +2589,8 @@ class OpenAIBackendAPI:
                     "sediment_ids": sediment_ids,
                 })
             except Exception as exc:
+                if _is_token_invalid_exception(exc):
+                    raise
                 if not file_ids and not sediment_ids:
                     raise
                 logger.warning({
@@ -2509,7 +2609,18 @@ class OpenAIBackendAPI:
         images = []
         for url in urls:
             response = self.session.get(url, timeout=120)
-            ensure_ok(response, "image_download")
+            try:
+                ensure_ok(response, "image_download")
+            except UpstreamHTTPError as exc:
+                if _is_image_download_token_failure(exc.status_code, exc.body, url):
+                    logger.warning({
+                        "event": "image_download_invalid_token",
+                        "status_code": exc.status_code,
+                        "url_host": urlparse(url).netloc,
+                        "body_preview": _error_body_text(exc.body, 300),
+                    })
+                    raise RuntimeError(f"token_revoked: image_download status={exc.status_code}") from exc
+                raise
             if response.content not in images:
                 images.append(response.content)
         return images

@@ -22,6 +22,7 @@ import {
   createImageEditTask,
   createImageGenerationTask,
   fetchAccounts,
+  fetchImageResizeLimits,
   fetchModels,
   fetchImageTasks,
   resumeImagePoll,
@@ -59,11 +60,8 @@ const IMAGE_COUNT_STORAGE_KEY = "chatgpt2api:image_last_count";
 const SCROLL_POSITIONS_STORAGE_KEY = "chatgpt2api:image_scroll_positions";
 const SCROLL_TO_LATEST_THRESHOLD = 160;
 const MAX_IMAGE_COUNT = 50;
-const MAX_IMAGE_SIDE = 3840;
-const MAX_IMAGE_PIXELS = 3840 * 2160;
-const IMAGE_SIZE_MULTIPLE = 16;
-const MIN_IMAGE_RATIO = 1 / 3;
-const MAX_IMAGE_RATIO = 3;
+const DEFAULT_MAX_IMAGE_SIDE = 4096;
+const DEFAULT_MAX_IMAGE_PIXELS = DEFAULT_MAX_IMAGE_SIDE * DEFAULT_MAX_IMAGE_SIDE;
 const DEFAULT_IMAGE_RATIO = "1:1";
 const DEFAULT_IMAGE_TIER = "2k";
 const DEFAULT_IMAGE_PRESET = IMAGE_SIZE_PRESET_BY_RATIO_TIER[`${DEFAULT_IMAGE_RATIO}:${DEFAULT_IMAGE_TIER}`] ?? {
@@ -107,13 +105,27 @@ function isDefaultImageSizeRequest(size: string | null | undefined) {
   return !value || value === "auto";
 }
 
-function safeImageSize(size: string) {
+type ImageResizeLimits = {
+  maxSide: number;
+  maxPixels: number;
+};
+
+function resolveImageResizeLimits(config: ReturnType<typeof useSettingsStore.getState>["config"] | null): ImageResizeLimits {
+  const maxSide = Number(config?.image_resize_max_side || DEFAULT_MAX_IMAGE_SIDE);
+  const maxPixels = Number(config?.image_resize_max_pixels || DEFAULT_MAX_IMAGE_PIXELS);
+  return {
+    maxSide: Number.isInteger(maxSide) && maxSide > 0 ? maxSide : DEFAULT_MAX_IMAGE_SIDE,
+    maxPixels: Number.isInteger(maxPixels) && maxPixels > 0 ? maxPixels : DEFAULT_MAX_IMAGE_PIXELS,
+  };
+}
+
+function safeImageSize(size: string, limits: ImageResizeLimits = resolveImageResizeLimits(null)) {
   if (isDefaultImageSizeRequest(size)) {
     const preset = imageSizePresetFor(DEFAULT_IMAGE_RATIO, DEFAULT_IMAGE_TIER);
     return `${preset.width}x${preset.height}`;
   }
   const parsed = parseImageSize(size);
-  if (!isValidImageSize(parsed.width, parsed.height)) {
+  if (!isValidImageSize(parsed.width, parsed.height, limits)) {
     const preset = imageSizePresetFor(DEFAULT_IMAGE_RATIO, DEFAULT_IMAGE_TIER);
     return `${preset.width}x${preset.height}`;
   }
@@ -136,23 +148,16 @@ function strictImageSizePresetFor(ratio: string, tier: string) {
   return IMAGE_SIZE_PRESET_BY_RATIO_TIER[`${ratio}:${tier}`] ?? null;
 }
 
-function isValidImageSize(widthValue: string, heightValue: string) {
+function isValidImageSize(widthValue: string, heightValue: string, limits: ImageResizeLimits = resolveImageResizeLimits(null)) {
   const width = Number(widthValue);
   const height = Number(heightValue);
   if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
     return false;
   }
-  if (width > MAX_IMAGE_SIDE || height > MAX_IMAGE_SIDE) {
+  if (width > limits.maxSide || height > limits.maxSide) {
     return false;
   }
-  if (width % IMAGE_SIZE_MULTIPLE !== 0 || height % IMAGE_SIZE_MULTIPLE !== 0) {
-    return false;
-  }
-  const ratio = width / height;
-  if (ratio < MIN_IMAGE_RATIO || ratio > MAX_IMAGE_RATIO) {
-    return false;
-  }
-  return width * height <= MAX_IMAGE_PIXELS;
+  return width * height <= limits.maxPixels;
 }
 
 function resolveImageSizeMode(ratio: string, tier: string, size: string) {
@@ -181,8 +186,8 @@ function resolveImageSizeMode(ratio: string, tier: string, size: string) {
   return { ratio: nextRatio, tier: nextTier };
 }
 
-function normalizeTurnSizeMode(turn: ImageTurn) {
-  const nextSize = safeImageSize(turn.size);
+function normalizeTurnSizeMode(turn: ImageTurn, limits: ImageResizeLimits = resolveImageResizeLimits(null)) {
+  const nextSize = safeImageSize(turn.size, limits);
   const sizeMode = resolveImageSizeMode(turn.ratio, turn.tier, nextSize);
   if (sizeMode.ratio === turn.ratio && sizeMode.tier === turn.tier && nextSize === turn.size) {
     return turn;
@@ -195,8 +200,8 @@ function normalizeTurnSizeMode(turn: ImageTurn) {
   };
 }
 
-function validateImageSize(widthValue: string, heightValue: string) {
-  if (isValidImageSize(widthValue, heightValue)) {
+function validateImageSize(widthValue: string, heightValue: string, limits: ImageResizeLimits = resolveImageResizeLimits(null)) {
+  if (isValidImageSize(widthValue, heightValue, limits)) {
     return "";
   }
   const width = Number(widthValue);
@@ -204,18 +209,11 @@ function validateImageSize(widthValue: string, heightValue: string) {
   if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
     return "图片宽高必须是正整数";
   }
-  if (width > MAX_IMAGE_SIDE || height > MAX_IMAGE_SIDE) {
-    return `图片宽高不能超过 ${MAX_IMAGE_SIDE}`;
+  if (width > limits.maxSide || height > limits.maxSide) {
+    return `图片宽高不能超过 ${limits.maxSide}`;
   }
-  if (width % IMAGE_SIZE_MULTIPLE !== 0 || height % IMAGE_SIZE_MULTIPLE !== 0) {
-    return `图片宽高必须是 ${IMAGE_SIZE_MULTIPLE} 的倍数`;
-  }
-  const ratio = width / height;
-  if (ratio < MIN_IMAGE_RATIO || ratio > MAX_IMAGE_RATIO) {
-    return "图片比例必须在 1:3 到 3:1 之间";
-  }
-  if (width * height > MAX_IMAGE_PIXELS) {
-    return "图片总像素不能超过 3840x2160";
+  if (width * height > limits.maxPixels) {
+    return `图片总像素不能超过 ${limits.maxPixels}`;
   }
   return "图片尺寸不合法";
 }
@@ -511,12 +509,12 @@ async function syncConversationImageTasks(items: ImageConversation[]) {
   return normalized;
 }
 
-async function recoverConversationHistory(items: ImageConversation[]) {
+async function recoverConversationHistory(items: ImageConversation[], limits: ImageResizeLimits = resolveImageResizeLimits(null)) {
   let changed = false;
   const normalized = items.map((conversation) => {
     let shouldTouchUpdatedAt = false;
     const turns = conversation.turns.map((turn) => {
-      const normalizedTurn = normalizeTurnSizeMode(turn);
+      const normalizedTurn = normalizeTurnSizeMode(turn, limits);
       let turnChanged = normalizedTurn !== turn;
       if (turn.status !== "queued" && turn.status !== "generating" && turn.status !== "error") {
         if (!turnChanged) {
@@ -589,6 +587,12 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   const config = useSettingsStore((state) => state.config);
   const imageTimeoutRetrySecs = Number(config?.image_timeout_retry_secs || 30);
+  const [runtimeImageResizeLimits, setRuntimeImageResizeLimits] = useState<ImageResizeLimits | null>(null);
+  const [didLoadImageResizeLimits, setDidLoadImageResizeLimits] = useState(false);
+  const imageResizeLimits = useMemo(
+    () => runtimeImageResizeLimits ?? resolveImageResizeLimits(config),
+    [config, runtimeImageResizeLimits],
+  );
   const didLoadImagePreferencesRef = useRef(false);
 
   const [imagePrompt, setImagePrompt] = useState("");
@@ -661,6 +665,34 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   useEffect(() => {
     conversationsRef.current = conversations;
   }, [conversations]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadResizeLimits = async () => {
+      try {
+        const limits = await fetchImageResizeLimits();
+        if (cancelled) {
+          return;
+        }
+        setRuntimeImageResizeLimits({
+          maxSide: Number(limits.max_side || DEFAULT_MAX_IMAGE_SIDE),
+          maxPixels: Number(limits.max_pixels || DEFAULT_MAX_IMAGE_PIXELS),
+        });
+      } catch {
+        // Keep default limits when runtime limits cannot be loaded.
+      } finally {
+        if (!cancelled) {
+          setDidLoadImageResizeLimits(true);
+        }
+      }
+    };
+
+    void loadResizeLimits();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const scrollResultsToLatest = useCallback((behavior: ScrollBehavior = "smooth") => {
     const element = resultsViewportRef.current;
@@ -768,7 +800,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       didLoadImagePreferencesRef.current = true;
 
       const items = await listImageConversations();
-      const normalizedItems = await recoverConversationHistory(items);
+      const normalizedItems = await recoverConversationHistory(items, imageResizeLimits);
       if (loadCancelledRef.current) {
         return;
       }
@@ -800,20 +832,27 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     setConversations,
     setSelectedConversationId,
     setIsLoadingHistory,
+    imageResizeLimits,
   ]);
 
   // Handle bfcache (back/forward cache) — re-sync task status on page restore
   useEffect(() => {
     const handlePageShow = (event: PageTransitionEvent) => {
       if (event.persisted) {
+        if (!didLoadImageResizeLimits) {
+          return;
+        }
         void loadHistory();
       }
     };
     window.addEventListener("pageshow", handlePageShow);
     return () => window.removeEventListener("pageshow", handlePageShow);
-  }, [loadHistory]);
+  }, [didLoadImageResizeLimits, loadHistory]);
 
   useEffect(() => {
+    if (!didLoadImageResizeLimits) {
+      return;
+    }
     loadCancelledRef.current = false;
     void loadHistory();
     return () => {
@@ -831,7 +870,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         pollAbortController = null;
       }
     };
-  }, [loadHistory]);
+  }, [didLoadImageResizeLimits, loadHistory]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1287,7 +1326,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     setSelectedConversationId(conversationId);
     setImagePrompt(turn.prompt);
     setImageCount(String(Math.max(1, turn.count || turn.images.length || 1)));
-    const safeSize = safeImageSize(turn.size);
+    const safeSize = safeImageSize(turn.size, imageResizeLimits);
     const parsedSize = parseImageSize(safeSize);
     const sizeMode = resolveImageSizeMode(turn.ratio, turn.tier, safeSize);
     setImageRatio(sizeMode.ratio);
@@ -1305,7 +1344,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     }
     textareaRef.current?.focus();
     toast.success("已复用这条提示词配置");
-  }, []);
+  }, [imageResizeLimits]);
 
   const openLightbox = useCallback((images: ImageLightboxItem[], index: number) => {
     if (images.length === 0) {
@@ -1526,7 +1565,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       const now = new Date().toISOString();
       const nextTurnId = createId();
       const count = Math.max(1, sourceTurn.count || sourceTurn.images.length || 1);
-      const imageSize = safeImageSize(sourceTurn.size);
+      const imageSize = safeImageSize(sourceTurn.size, imageResizeLimits);
       const sizeMode = resolveImageSizeMode(sourceTurn.ratio, sourceTurn.tier, imageSize);
       const nextTurn: ImageTurn = {
         id: nextTurnId,
@@ -1554,7 +1593,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       void runConversationQueue(conversationId);
       toast.success("已加入重新生成队列");
     },
-    [runConversationQueue],
+    [imageResizeLimits, runConversationQueue],
   );
 
   const handleRetryImage = useCallback(
@@ -1717,7 +1756,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     }
 
     const effectiveImageMode: ImageConversationMode = referenceImageFiles.length > 0 ? "edit" : "generate";
-    const sizeError = validateImageSize(imageWidth, imageHeight);
+    const sizeError = validateImageSize(imageWidth, imageHeight, imageResizeLimits);
     if (sizeError) {
       toast.error(sizeError);
       return;

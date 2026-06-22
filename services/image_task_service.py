@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import threading
 import time
@@ -109,6 +110,88 @@ def _account_ref_from_token(access_token: str) -> dict[str, str]:
     if account_email:
         ref["account_email"] = account_email
     return ref
+
+
+def _is_image_token_invalid_exception(exc: Exception) -> bool:
+    try:
+        from services.protocol.conversation import is_token_invalid_exception
+
+        return is_token_invalid_exception(exc)
+    except Exception:
+        text = str(exc or "").lower()
+        return (
+            "token_revoked" in text
+            or "token_invalidated" in text
+            or "authentication token has been invalidated" in text
+            or "invalidated oauth token" in text
+        )
+
+
+def _serialize_image_input(item: object) -> dict[str, str] | None:
+    if not isinstance(item, tuple) or len(item) < 3:
+        return None
+    data, filename, mime_type = item[:3]
+    if not isinstance(data, (bytes, bytearray)):
+        return None
+    return {
+        "data_b64": base64.b64encode(bytes(data)).decode("ascii"),
+        "filename": _clean(filename, "image.png"),
+        "mime_type": _clean(mime_type, "image/png"),
+    }
+
+
+def _deserialize_image_input(item: object) -> tuple[bytes, str, str] | None:
+    if not isinstance(item, dict):
+        return None
+    data_b64 = _clean(item.get("data_b64"))
+    if not data_b64:
+        return None
+    try:
+        data = base64.b64decode(data_b64)
+    except Exception:
+        return None
+    return (
+        data,
+        _clean(item.get("filename"), "image.png"),
+        _clean(item.get("mime_type"), "image/png"),
+    )
+
+
+def _serialize_task_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key == "progress_callback":
+            continue
+        if key in {"images", "mask"}:
+            items = [
+                encoded
+                for raw in (value or [])
+                if (encoded := _serialize_image_input(raw)) is not None
+            ]
+            snapshot[key] = items
+            continue
+        try:
+            json.dumps(value)
+            snapshot[key] = value
+        except TypeError:
+            snapshot[key] = str(value)
+    return snapshot
+
+
+def _deserialize_task_payload(snapshot: object) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        return {}
+    payload: dict[str, Any] = {}
+    for key, value in snapshot.items():
+        if key in {"images", "mask"}:
+            payload[key] = [
+                decoded
+                for raw in (value if isinstance(value, list) else [])
+                if (decoded := _deserialize_image_input(raw)) is not None
+            ]
+        else:
+            payload[key] = value
+    return payload
 
 
 def _record_backend_proxy_result(backend: object, ok: bool) -> None:
@@ -340,6 +423,7 @@ class ImageTaskService:
                 "model": _clean(payload.get("model"), "gpt-image-2"),
                 "size": _clean(payload.get("size")),
                 "quality": _clean(payload.get("quality"), "auto"),
+                "payload": _serialize_task_payload(payload),
                 "created_at": now,
                 "updated_at": now,
                 "created_ts": time.time(),
@@ -365,6 +449,8 @@ class ImageTaskService:
                 continue
             runtime = self._runtime.get(key) or {}
             payload = dict(runtime.get("payload") or {})
+            if not payload:
+                payload = _deserialize_task_payload(task.get("payload"))
             identity = dict(runtime.get("identity") or {})
             if not payload:
                 task["status"] = TASK_STATUS_ERROR
@@ -443,16 +529,19 @@ class ImageTaskService:
                 raise error
             usage = result.get("usage")
             duration_ms = int((time.time() - started) * 1000)
+            account_id = account_ref.get("account_id", "")
             self._update_task(
                 key,
                 status=TASK_STATUS_SUCCESS,
                 data=data,
                 usage=usage,
                 error="",
+                progress="",
                 duration_ms=duration_ms,
-                **({"account_email": account_email} if account_email else {}),
-                **({"account_emails": account_emails} if account_emails else {}),
-                **({"account_id": account_ref["account_id"]} if account_ref.get("account_id") else {}),
+                account_email=account_email,
+                account_emails=account_emails,
+                account_id=account_id,
+                conversation_id="",
             )
             self._log_call(
                 identity,
@@ -580,6 +669,7 @@ class ImageTaskService:
                 "model": _clean(item.get("model"), "gpt-image-2"),
                 "size": _clean(item.get("size")),
                 "quality": _clean(item.get("quality"), "auto"),
+                "payload": item.get("payload") if isinstance(item.get("payload"), dict) else {},
                 "created_at": _clean(item.get("created_at"), _now_iso()),
                 "updated_at": _clean(item.get("updated_at"), _clean(item.get("created_at"), _now_iso())),
                 "created_ts": item.get("created_ts"),
@@ -668,7 +758,8 @@ class ImageTaskService:
             if is_codex_image_model(model):
                 raise ValueError("codex image tasks do not support resume poll")
             error_msg = _clean(task.get("error"))
-            if "超时" not in error_msg:
+            error_text = error_msg.lower()
+            if "超时" not in error_msg and "timeout" not in error_text and "timed out" not in error_text:
                 raise ValueError("task error is not a timeout error")
             conversation_id = _clean(task.get("conversation_id"))
             if not conversation_id:
@@ -676,6 +767,10 @@ class ImageTaskService:
             account_id = _clean(task.get("account_id"))
             account_email = _clean(task.get("account_email"))
             mode = task.get("mode", "generate")
+            requested_size = _clean(task.get("size"))
+            payload = _deserialize_task_payload(task.get("payload"))
+            response_format = _clean(payload.get("response_format"), "url")
+            base_url = _clean(payload.get("base_url"))
 
         access_token = _resolve_account_token(account_id, account_email)
         if not access_token:
@@ -693,7 +788,7 @@ class ImageTaskService:
         # 启动新线程继续轮询
         thread = threading.Thread(
             target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model, access_token, account_email),
+            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model, access_token, account_email, requested_size, payload, response_format, base_url),
             name=f"image-resume-{_clean(task_id)[:16]}",
             daemon=True,
         )
@@ -710,6 +805,10 @@ class ImageTaskService:
         model: str,
         access_token: str,
         account_email: str = "",
+        requested_size: str = "",
+        payload: dict[str, Any] | None = None,
+        response_format: str = "url",
+        base_url: str = "",
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
@@ -742,9 +841,10 @@ class ImageTaskService:
             data = format_image_result(
                 image_items,
                 "",  # prompt 已不重要，结果已经拿到了
-                "b64_json",
-                "",
+                response_format,
+                base_url,
                 int(time.time()),
+                requested_size=requested_size,
             )["data"]
             self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
             _record_backend_proxy_result(backend, True)
@@ -763,6 +863,33 @@ class ImageTaskService:
             error_message = str(exc) or "resume poll failed"
             if backend is not None:
                 _record_backend_proxy_result(backend, not _is_proxy_transport_error(error_message))
+            if _is_image_token_invalid_exception(exc):
+                account_service.remove_invalid_token(access_token, "image_resume_poll")
+                if payload:
+                    self._update_task(
+                        key,
+                        status=TASK_STATUS_QUEUED,
+                        error="",
+                        data=[],
+                        progress="retry_after_token_revoked",
+                    )
+                    with self._lock:
+                        self._runtime[key] = {"payload": dict(payload), "identity": dict(identity)}
+                    logger_payload = {
+                        "event": "image_resume_poll_invalid_token_regenerate",
+                        "account_email": account_email,
+                        "conversation_id": conversation_id,
+                        "task_key": key,
+                    }
+                    try:
+                        from utils.log import logger
+
+                        logger.warning(logger_payload)
+                    except Exception:
+                        pass
+                    self._run_task(key, mode, dict(payload), dict(identity), model, "")
+                    return
+                error_message = f"{error_message}; original request payload missing, cannot regenerate"
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[], duration_ms=duration_ms)
             self._log_call(

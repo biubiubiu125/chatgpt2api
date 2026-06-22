@@ -11,7 +11,6 @@ services:
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json
-      - /opt/proxy-checker/repo_data:/opt/proxy-checker/repo_data:ro
     environment:
       # 存储后端配置 (可选值: json, sqlite, postgres, git)
        - STORAGE_BACKEND=json

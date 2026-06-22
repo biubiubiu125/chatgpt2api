@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
-from api.support import require_identity, resolve_image_base_url
+from api.support import require_admin, require_identity, resolve_image_base_url
 from services.content_filter import check_request, request_shape, request_text
 from services.editable_file_task_service import editable_file_task_service
 from services.log_service import LoggedCall
@@ -91,6 +91,11 @@ def create_router() -> APIRouter:
             return await run_in_threadpool(openai_v1_models.list_models)
         except Exception as exc:
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+
+    @router.get("/api/upstream/models/probe")
+    async def probe_upstream_models(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(openai_v1_models.probe_upstream_models)
 
     @router.post("/v1/images/generations")
     async def generate_images(

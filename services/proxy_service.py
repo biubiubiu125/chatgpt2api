@@ -614,14 +614,66 @@ def _redact_url_credentials(text: str) -> str:
     )
 
 
+def _transport_error_text(message: object) -> str:
+    parts = [str(message or "")]
+    for attr in ("body", "task_error"):
+        value = getattr(message, attr, None)
+        if not value:
+            continue
+        if isinstance(value, (dict, list)):
+            try:
+                parts.append(json.dumps(value, ensure_ascii=False))
+            except (TypeError, ValueError):
+                parts.append(repr(value))
+        else:
+            parts.append(str(value))
+    return " ".join(part for part in parts if part).lower()
+
+
+def is_cloudflare_upstream_error(message: object) -> bool:
+    text = _transport_error_text(message)
+    if (
+        "cf-ray" in text
+        or "cf-chl" in text
+        or "just a moment" in text
+        or "origin web server returned" in text
+        or "invalid or incomplete response" in text
+        or "checking your browser" in text
+    ):
+        return True
+    return "cloudflare" in text and (
+        "403" in text
+        or "challenge" in text
+        or "blocked" in text
+        or "attention required" in text
+    )
+
+
+def is_http2_internal_transport_error(message: object) -> bool:
+    text = _transport_error_text(message)
+    return (
+        "internal_error" in text
+        and (
+            "http/2" in text
+            or "http2" in text
+            or "stream" in text
+            or "curl: (92)" in text
+        )
+    )
+
+
 def is_proxy_transport_error(message: object) -> bool:
-    text = str(message or "").lower()
+    text = _transport_error_text(message)
     return (
         "curl: (28)" in text
+        or "curl: (92)" in text
         or "operation timed out" in text
         or "connection timed out" in text
         or "read timed out" in text
         or "connect timeout" in text
+        or "http/2 stream" in text
+        or "stream was not closed cleanly" in text
+        or is_http2_internal_transport_error(text)
         or "curl: (35)" in text
         or "tls connect error" in text
         or "openssl_internal" in text
@@ -640,6 +692,7 @@ def is_proxy_transport_error(message: object) -> bool:
         or "tunnel connection failed" in text
         or "connect error" in text
         or "connection refused" in text
+        or is_cloudflare_upstream_error(text)
     )
 
 
