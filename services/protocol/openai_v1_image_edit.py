@@ -11,7 +11,7 @@ from services.protocol.conversation import (
     collect_image_outputs,
     count_text_tokens,
     encode_images,
-    stream_image_chunks,
+    stream_image_chunks_with_reference_count,
     stream_image_outputs_with_pool,
 )
 from utils.helper import parse_image_count, parse_image_size
@@ -76,8 +76,9 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         progress_callback=progress_callback,
     ))
     if body.get("stream"):
-        return stream_image_chunks(outputs)
+        return stream_image_chunks_with_reference_count(outputs, len(images))
     result = collect_image_outputs(outputs)
+    result["_reference_image_count"] = len(images)
     result["usage"] = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
         input_image_tokens=count_image_inputs_tokens(images, model),

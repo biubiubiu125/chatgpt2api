@@ -265,8 +265,18 @@ def assistant_history_messages(messages: list[dict[str, Any]]) -> list[str]:
     return [str(item.get("content") or "") for item in messages if item.get("role") == "assistant" and item.get("content")]
 
 
-def build_image_prompt(prompt: str, size: str | None, quality: str = "auto") -> str:
+def build_image_prompt(
+    prompt: str,
+    size: str | None,
+    quality: str = "auto",
+    has_reference_images: bool = False,
+) -> str:
     hints = []
+    hints.append(
+        "You must generate the final image directly. Do not answer with text, markdown, JSON, "
+        "tool parameters, referenced_image_ids, analysis, instructions, or a description of the image request. "
+        "Return only the generated image result. "
+    )
     if size:
         hints.append(
             f"Generate the image at exactly {size} pixels. "
@@ -274,6 +284,11 @@ def build_image_prompt(prompt: str, size: str | None, quality: str = "auto") -> 
         )
     if quality:
         hints.append(f"Use image quality: {quality}. ")
+    if has_reference_images:
+        hints.append(
+            "Use every uploaded reference image as visual input. "
+            "Do not ignore, drop, replace, or merely describe any reference image. "
+        )
     hints.append(
         "Render the image with high clarity, rich fine detail, sharp edges, clean textures, "
         "and no low-resolution, blurry, compressed, pixelated, or artifact-heavy appearance. "
@@ -436,8 +451,20 @@ class ImageTokenLeasePool:
 
     def acquire(self, excluded_tokens: set[str] | None = None) -> str:
         while True:
+            resolved_excluded_tokens = {
+                resolved
+                for token in (excluded_tokens or set())
+                if str(token or "").strip()
+                if (resolved := account_service.resolve_access_token(token))
+            }
             with self._lock:
-                combined_excluded_tokens = {*self.excluded_tokens, *(excluded_tokens or set())}
+                self.excluded_tokens = {
+                    resolved
+                    for token in self.excluded_tokens
+                    if str(token or "").strip()
+                    if (resolved := account_service.resolve_access_token(token))
+                }
+                combined_excluded_tokens = {*self.excluded_tokens, *resolved_excluded_tokens}
             try:
                 token = account_service.get_available_access_token(
                     **self._filters(),
@@ -445,7 +472,7 @@ class ImageTokenLeasePool:
                 )
             except RuntimeError as exc:
                 with self._lock:
-                    active_leases = set(self.excluded_tokens) - set(excluded_tokens or set())
+                    active_leases = set(self.excluded_tokens) - resolved_excluded_tokens
                     should_wait = bool(active_leases)
                 if not should_wait:
                     raise exc
@@ -459,25 +486,35 @@ class ImageTokenLeasePool:
             time.sleep(self.wait_interval_seconds)
 
     def acquire_once(self) -> str:
-        with self._lock:
-            excluded_tokens = set(self.excluded_tokens)
-        token = account_service.get_available_access_token(
-            **self._filters(),
-            excluded_tokens=excluded_tokens,
-        )
-        with self._lock:
-            if token in self.excluded_tokens:
-                account_service.release_image_slot(token)
-                raise RuntimeError("image account is already leased")
-            self.excluded_tokens.add(token)
-            return token
+        while True:
+            with self._lock:
+                self.excluded_tokens = {
+                    resolved
+                    for token in self.excluded_tokens
+                    if str(token or "").strip()
+                    if (resolved := account_service.resolve_access_token(token))
+                }
+                excluded_tokens = set(self.excluded_tokens)
+            token = account_service.get_available_access_token(
+                **self._filters(),
+                excluded_tokens=excluded_tokens,
+            )
+            with self._lock:
+                if token not in self.excluded_tokens:
+                    self.excluded_tokens.add(token)
+                    return token
+            account_service.release_image_slot(token)
+            time.sleep(self.wait_interval_seconds)
 
     def release(self, token: str) -> None:
-        token = str(token or "").strip()
-        if not token:
+        raw_token = str(token or "").strip()
+        if not raw_token:
             return
+        resolved_token = account_service.resolve_access_token(raw_token)
         with self._lock:
-            self.excluded_tokens.discard(token)
+            self.excluded_tokens.discard(raw_token)
+            if resolved_token:
+                self.excluded_tokens.discard(resolved_token)
 
 
 def assistant_message_text(message: dict[str, Any]) -> str:
@@ -776,7 +813,7 @@ def conversation_events(
     image_model = is_supported_image_model(model)
     history_text = "" if image_model else assistant_history_text(normalized)
     history_messages = [] if image_model else assistant_history_messages(normalized)
-    final_prompt = prompt_with_global_system(build_image_prompt(prompt, size, quality)) if image_model else prompt
+    final_prompt = prompt_with_global_system(build_image_prompt(prompt, size, quality, bool(images))) if image_model else prompt
     payloads = backend.stream_conversation(
         messages=normalized,
         model=model,
@@ -948,7 +985,8 @@ def stream_image_outputs(
         error_text = detailed_error or message or "Image generation was rejected by upstream policy."
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=error_text, conversation_id=conversation_id)
         return
-    should_poll_for_image = bool(request.images) or last.get("turn_use_case") == "image gen"
+    is_text_reply = bool(message and is_model_text_reply_instead_of_image(message))
+    should_poll_for_image = bool(request.images) or last.get("turn_use_case") == "image gen" or is_text_reply
     if message and not file_ids and not sediment_ids and not should_poll_for_image:
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
         return
@@ -956,7 +994,6 @@ def stream_image_outputs(
     # 检测模型是否返回了文本描述（含 referenced_image_ids）而非实际生成图片
     # 这说明模型已发起图片生成工具调用，但 SSE 在工具完成前断开，
     # 图片可能正在异步生成中。需要使用更积极的轮询策略来获取结果。
-    is_text_reply = bool(message and is_model_text_reply_instead_of_image(message))
     if is_text_reply:
         logger.info({
             "event": "image_detected_text_reply_with_ids",
@@ -1366,8 +1403,9 @@ def stream_codex_image_outputs(
         index: int = 1,
         total: int = 1,
 ) -> Iterator[ImageOutput]:
+    prompt = build_image_prompt(request.prompt, request.size, request.quality, bool(request.images))
     images = _codex_response_images(list(backend.iter_codex_image_response_events(
-        prompt=request.prompt,
+        prompt=prompt,
         images=request.images or [],
         size=request.size,
         quality=request.quality,
@@ -1381,7 +1419,7 @@ def stream_codex_image_outputs(
         image_data = base64.b64decode(item)
         image_items.append({
             "b64_json": base64.b64encode(image_data).decode("ascii"),
-            "revised_prompt": request.prompt,
+            "revised_prompt": prompt,
         })
     data = format_image_result(
         image_items,
@@ -1565,7 +1603,7 @@ def _generate_single_image(
                 "emitted_for_token": emitted_for_token,
                 "error": str(exc)[:200],
             })
-            raise
+            continue
         except ImageContentPolicyError as exc:
             _record_backend_proxy_result(backend, True)
             release_current_token(False)
@@ -1861,6 +1899,17 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
 def stream_image_chunks(outputs: Iterable[ImageOutput]) -> Iterator[dict[str, Any]]:
     for output in outputs:
         yield output.to_chunk()
+
+
+def stream_image_chunks_with_reference_count(
+    outputs: Iterable[ImageOutput],
+    reference_image_count: int,
+) -> Iterator[dict[str, Any]]:
+    for output in outputs:
+        chunk = output.to_chunk()
+        if reference_image_count:
+            chunk["_reference_image_count"] = reference_image_count
+        yield chunk
 
 
 def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:

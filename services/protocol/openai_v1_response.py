@@ -50,6 +50,8 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
 INTERNAL_ACCOUNT_KEYS = ("_account_email", "_account_emails")
 
 RESPONSE_CONTENT_PART_TYPES = {"text", "input_text", "output_text", "image_url", "input_image", "image"}
+RESPONSE_IMAGE_PART_TYPES = {"image_url", "input_image", "image"}
+RESPONSE_IMAGE_PART_KEYS = {"image_url", "url", "b64_json", "base64", "source", "data"}
 
 
 def _append_account_email(account_emails: list[str], account_email: str) -> None:
@@ -92,40 +94,124 @@ def response_image_size(body: dict[str, Any], tool: dict[str, object]) -> str | 
     return parse_image_size(body.get("size"), tool.get("aspect_ratio") or body.get("aspect_ratio"))
 
 
-def extract_response_image(input_value: object) -> tuple[bytes, str] | None:
+def _extract_response_item_images(item: dict[str, Any]) -> list[tuple[bytes, str]]:
+    images = extract_image_from_message_content([item])
+    if images:
+        return images
+    return extract_image_from_message_content(item.get("content"))
+
+
+def extract_response_images(input_value: object) -> list[tuple[bytes, str]]:
     if isinstance(input_value, dict):
-        if str(input_value.get("type") or "").strip() == "input_image":
-            images = extract_image_from_message_content([input_value])
-            return images[0] if images else None
-        images = extract_image_from_message_content(input_value.get("content"))
-        return images[0] if images else None
+        return _extract_response_item_images(input_value)
     if not isinstance(input_value, list):
-        return None
-    for item in reversed(input_value):
+        return []
+    images: list[tuple[bytes, str]] = []
+    for item in input_value:
         if isinstance(item, dict):
-            if str(item.get("type") or "").strip() == "input_image":
-                images = extract_image_from_message_content([item])
-                if images:
-                    return images[0]
-            images = extract_image_from_message_content(item.get("content"))
-            if images:
-                return images[0]
-    return None
+            images.extend(_extract_response_item_images(item))
+    return images
+
+
+def _response_image_input_value(input_value: object) -> object:
+    if not isinstance(input_value, list):
+        return input_value
+    if all(_is_response_content_part(item) for item in input_value):
+        return input_value
+    end_index = len(input_value) - 1
+    while end_index >= 0 and not isinstance(input_value[end_index], dict):
+        end_index -= 1
+    if end_index < 0:
+        return input_value
+    last_item = input_value[end_index]
+    last_role = str(last_item.get("role") or "").strip().lower()
+    if last_role and last_role != "user":
+        return input_value
+    prompt_index = -1
+    for index in range(end_index, -1, -1):
+        item = input_value[index]
+        if not isinstance(item, dict):
+            break
+        role = str(item.get("role") or "").strip().lower()
+        if role and role != "user":
+            break
+        prompt = extract_response_prompt(item)
+        images = _extract_response_item_images(item)
+        if prompt:
+            prompt_index = index
+            break
+        if not images:
+            break
+    if prompt_index < 0:
+        start_index = end_index
+        for index in range(end_index - 1, -1, -1):
+            item = input_value[index]
+            if not isinstance(item, dict):
+                break
+            role = str(item.get("role") or "").strip().lower()
+            if role and role != "user":
+                break
+            if extract_response_prompt(item):
+                break
+            if not _extract_response_item_images(item):
+                break
+            start_index = index
+        return [item for item in input_value[start_index:end_index + 1] if isinstance(item, dict)]
+    start_index = prompt_index
+    for index in range(prompt_index - 1, -1, -1):
+        item = input_value[index]
+        if not isinstance(item, dict):
+            break
+        role = str(item.get("role") or "").strip().lower()
+        if role and role != "user":
+            break
+        if extract_response_prompt(item):
+            break
+        if not _extract_response_item_images(item):
+            break
+        start_index = index
+    return [item for item in input_value[start_index:end_index + 1] if isinstance(item, dict)]
+
+
+def _response_image_prompt_input(input_value: object) -> object:
+    if not isinstance(input_value, list) or all(_is_response_content_part(item) for item in input_value):
+        return input_value
+    for item in reversed(input_value):
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role and role != "user":
+            continue
+        if extract_response_prompt(item):
+            return item
+    return input_value
+
+
+def _is_response_image_part(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    part_type = str(value.get("type") or "").strip()
+    if part_type in RESPONSE_IMAGE_PART_TYPES:
+        return True
+    return not part_type and any(key in value for key in RESPONSE_IMAGE_PART_KEYS)
 
 
 def _input_image_parts(input_value: object) -> list[dict[str, Any]]:
     parts: list[dict[str, Any]] = []
     if isinstance(input_value, dict):
+        if _is_response_image_part(input_value):
+            return [input_value]
         content = input_value.get("content")
         if isinstance(content, list):
             parts.extend(item for item in content if isinstance(item, dict))
         return parts
     if not isinstance(input_value, list):
         return parts
-    if all(isinstance(item, dict) and item.get("type") for item in input_value):
-        return [item for item in input_value if isinstance(item, dict)]
     for item in input_value:
         if isinstance(item, dict):
+            if _is_response_image_part(item):
+                parts.append(item)
+                continue
             content = item.get("content")
             if isinstance(content, list):
                 parts.extend(part for part in content if isinstance(part, dict))
@@ -136,7 +222,7 @@ def _is_response_content_part(value: object) -> bool:
     if not isinstance(value, dict):
         return False
     part_type = str(value.get("type") or "").strip()
-    return part_type in RESPONSE_CONTENT_PART_TYPES or ("image_url" in value and part_type != "message")
+    return part_type in RESPONSE_CONTENT_PART_TYPES or _is_response_image_part(value)
 
 
 def _message_content_from_response_item(item: dict[str, Any]) -> object:
@@ -385,6 +471,7 @@ def stream_image_response(
     input_image_tokens: int = 0,
     size: object = None,
     quality: str = "auto",
+    reference_image_count: int = 0,
 ) -> Iterator[dict[str, Any]]:
     response_id = f"resp_{uuid.uuid4().hex}"
     created = int(time.time())
@@ -392,7 +479,10 @@ def stream_image_response(
     output_image_data: list[dict[str, Any]] = []
     fallback_message = ""
     account_emails: list[str] = []
-    yield response_created(response_id, model, created)
+    event = response_created(response_id, model, created)
+    if reference_image_count:
+        event["_reference_image_count"] = reference_image_count
+    yield event
     for output in image_outputs:
         _append_account_email(account_emails, output.account_email)
         if output.kind == "message":
@@ -414,6 +504,8 @@ def stream_image_response(
             yield {"type": "response.output_item.done", "output_index": output_index, "item": item}
         event = response_completed(response_id, model, created, items, usage)
         _attach_account_context(event, account_emails)
+        if reference_image_count:
+            event["_reference_image_count"] = reference_image_count
         yield event
         return
     if fallback_message:
@@ -428,6 +520,8 @@ def stream_image_response(
         yield {"type": "response.output_item.done", "output_index": 0, "item": item}
         event = response_completed(response_id, model, created, [item], usage)
         _attach_account_context(event, account_emails)
+        if reference_image_count:
+            event["_reference_image_count"] = reference_image_count
         yield event
         return
     raise RuntimeError("image generation failed")
@@ -442,6 +536,9 @@ def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 value = event.get(key)
                 if value:
                     completed[key] = value
+            reference_image_count = event.get("_reference_image_count")
+            if reference_image_count:
+                completed["_reference_image_count"] = reference_image_count
     if not completed:
         raise RuntimeError("response generation failed")
     return completed
@@ -460,17 +557,20 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         )
         return
 
-    prompt = extract_response_prompt(body.get("input"))
+    image_input = _response_image_input_value(body.get("input"))
+    prompt = extract_response_prompt(_response_image_prompt_input(image_input))
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "input text is required"})
     model = str(body.get("model") or "gpt-image-2").strip() or "gpt-image-2"
-    image_info = extract_response_image(body.get("input"))
-    if image_info:
-        image_data, mime_type = image_info
-        images = encode_images([(image_data, "image.png", mime_type)])
+    image_infos = extract_response_images(image_input)
+    if image_infos:
+        images = encode_images([
+            (image_data, f"image_{index}.png", mime_type)
+            for index, (image_data, mime_type) in enumerate(image_infos, start=1)
+        ])
     else:
         images = None
-    input_image_tokens = count_image_content_tokens(_input_image_parts(body.get("input")), model)
+    input_image_tokens = count_image_content_tokens(_input_image_parts(image_input), model)
     tool = response_image_tool(body)
     n = response_image_count(body, tool)
     size = response_image_size(body, tool)
@@ -484,7 +584,15 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         response_format="b64_json",
         images=images,
     ))
-    yield from stream_image_response(image_outputs, prompt, model, input_image_tokens, size, quality)
+    yield from stream_image_response(
+        image_outputs,
+        prompt,
+        model,
+        input_image_tokens,
+        size,
+        quality,
+        reference_image_count=len(image_infos),
+    )
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:

@@ -21,7 +21,13 @@ from utils.helper import anthropic_sse_stream, sse_json_stream
 
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
-INTERNAL_RESPONSE_KEYS = {"_account_email", "_account_emails", "_access_token", "_conversation_id"}
+INTERNAL_RESPONSE_KEYS = {
+    "_account_email",
+    "_account_emails",
+    "_access_token",
+    "_conversation_id",
+    "_reference_image_count",
+}
 
 
 def _exception_log_fields(exc: Exception) -> dict[str, Any]:
@@ -183,6 +189,23 @@ def _collect_conversation_ids(value: object) -> list[str]:
     return ids
 
 
+def _collect_reference_image_counts(value: object) -> list[int]:
+    counts: list[int] = []
+    if isinstance(value, dict):
+        raw = value.get("_reference_image_count")
+        if raw is not None:
+            try:
+                counts.append(max(0, int(raw)))
+            except (TypeError, ValueError):
+                pass
+        for item in value.values():
+            counts.extend(_collect_reference_image_counts(item))
+    elif isinstance(value, list):
+        for item in value:
+            counts.extend(_collect_reference_image_counts(item))
+    return counts
+
+
 def _strip_internal_response_fields(value: object) -> object:
     if isinstance(value, dict):
         return {
@@ -277,6 +300,7 @@ class LoggedCall:
             response.pop("_account_email", None)
             response.pop("_account_emails", None)
             response.pop("_access_token", None)
+            response.pop("_reference_image_count", None)
             return response
 
         sender = anthropic_sse_stream if sse == "anthropic" else sse_json_stream
@@ -306,15 +330,20 @@ class LoggedCall:
         urls: list[str] = []
         account_emails: list[str] = []
         conversation_ids: list[str] = []
+        reference_counts: list[int] = []
         failed = False
         try:
             for item in items:
                 urls.extend(_collect_urls(item))
                 account_emails.extend(_collect_account_emails(item))
                 conversation_ids.extend(_collect_conversation_ids(item))
+                reference_counts.extend(_collect_reference_image_counts(item))
                 yield _strip_internal_response_fields(item)
         except Exception as exc:
             failed = True
+            extra = _exception_log_fields(exc)
+            if reference_counts:
+                extra["reference_image_count"] = max(reference_counts)
             self.log(
                 "流式调用失败",
                 status="failed",
@@ -323,7 +352,7 @@ class LoggedCall:
                 account_email=(account_emails[0] if account_emails else getattr(exc, "account_email", "")),
                 account_emails=[*account_emails, *list(getattr(exc, "account_emails", []) or [])],
                 conversation_id=(conversation_ids[0] if conversation_ids else getattr(exc, "conversation_id", "")),
-                extra=_exception_log_fields(exc),
+                extra=extra,
             )
             if self.endpoint.startswith("/v1/images") and not hasattr(exc, "to_openai_error"):
                 from services.protocol.conversation import ImageGenerationError, public_image_error_message
@@ -332,9 +361,11 @@ class LoggedCall:
             raise
         finally:
             if not failed:
+                extra = {"reference_image_count": max(reference_counts)} if reference_counts else None
                 self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
                          account_emails=account_emails,
-                         conversation_id=conversation_ids[0] if conversation_ids else "")
+                         conversation_id=conversation_ids[0] if conversation_ids else "",
+                         extra=extra)
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
             urls: list[str] | None = None, account_email: str = "", account_emails: list[str] | None = None,
@@ -374,4 +405,7 @@ class LoggedCall:
         collected_urls = [*(urls or []), *_collect_urls(result)]
         if collected_urls and not self.endpoint.startswith("/v1/search"):
             detail["urls"] = list(dict.fromkeys(collected_urls))
+        reference_counts = _collect_reference_image_counts(result)
+        if reference_counts:
+            detail["reference_image_count"] = max(reference_counts)
         log_service.add(LOG_TYPE_CALL, f"{self.summary}{suffix}", detail)

@@ -572,6 +572,8 @@ def _decode_message_image_object(item: dict[str, object]) -> tuple[bytes, str] |
 
 
 def extract_image_from_message_content(content: object) -> list[tuple[bytes, str]]:
+    if isinstance(content, dict):
+        return extract_image_from_message_content([content])
     if not isinstance(content, list):
         return []
     images = []
@@ -583,7 +585,9 @@ def extract_image_from_message_content(content: object) -> list[tuple[bytes, str
             image = _decode_message_image_url(item.get("image_url") or item.get("url") or item)
             if image:
                 images.append(image)
-        elif item_type in {"input_image", "image"}:
+        elif item_type in {"input_image", "image"} or (
+            not item_type and any(key in item for key in ("image_url", "url", "b64_json", "base64", "source", "data"))
+        ):
             image = _decode_message_image_object(item)
             if image:
                 images.append(image)
@@ -591,37 +595,81 @@ def extract_image_from_message_content(content: object) -> list[tuple[bytes, str
 
 
 def extract_chat_image(body: dict[str, object]) -> list[tuple[bytes, str]]:
-    messages = body.get("messages")
+    messages = _current_chat_image_messages(body.get("messages"))
+    if not messages:
+        return []
+    images: list[tuple[bytes, str]] = []
+    for message in messages:
+        images.extend(extract_image_from_message_content(message.get("content")))
+    return images
+
+
+def _current_chat_image_messages(messages: object) -> list[dict[str, object]]:
     if not isinstance(messages, list):
         return []
-    for message in reversed(messages):
+    end_index = len(messages) - 1
+    while end_index >= 0 and not isinstance(messages[end_index], dict):
+        end_index -= 1
+    if end_index < 0:
+        return []
+    last_message = messages[end_index]
+    if str(last_message.get("role") or "").strip().lower() != "user":
+        return []
+    prompt_index = -1
+    for index in range(end_index, -1, -1):
+        message = messages[index]
         if not isinstance(message, dict):
-            continue
+            break
         if str(message.get("role") or "").strip().lower() != "user":
-            continue
+            break
+        prompt = extract_prompt_from_message_content(message.get("content"))
         images = extract_image_from_message_content(message.get("content"))
-        if images:
-            return images
-    return []
+        if prompt:
+            prompt_index = index
+            break
+        if not images:
+            break
+    if prompt_index < 0:
+        start_index = end_index
+        for index in range(end_index - 1, -1, -1):
+            message = messages[index]
+            if not isinstance(message, dict):
+                break
+            if str(message.get("role") or "").strip().lower() != "user":
+                break
+            if extract_prompt_from_message_content(message.get("content")):
+                break
+            if not extract_image_from_message_content(message.get("content")):
+                break
+            start_index = index
+        return [message for message in messages[start_index:end_index + 1] if isinstance(message, dict)]
+    start_index = prompt_index
+    for index in range(prompt_index - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict):
+            break
+        if str(message.get("role") or "").strip().lower() != "user":
+            break
+        if extract_prompt_from_message_content(message.get("content")):
+            break
+        if not extract_image_from_message_content(message.get("content")):
+            break
+        start_index = index
+    return [message for message in messages[start_index:end_index + 1] if isinstance(message, dict)]
 
 
 def extract_chat_prompt(body: dict[str, object]) -> str:
     direct_prompt = str(body.get("prompt") or "").strip()
     if direct_prompt:
         return direct_prompt
-    messages = body.get("messages")
-    if not isinstance(messages, list):
+    messages = _current_chat_image_messages(body.get("messages"))
+    if not messages:
         return ""
-    prompt_parts: list[str] = []
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        if str(message.get("role") or "").strip().lower() != "user":
-            continue
+    for message in reversed(messages):
         prompt = extract_prompt_from_message_content(message.get("content"))
         if prompt:
-            prompt_parts.append(prompt)
-    return "\n".join(prompt_parts).strip()
+            return prompt
+    return ""
 
 
 def parse_image_count(raw_value: object) -> int:

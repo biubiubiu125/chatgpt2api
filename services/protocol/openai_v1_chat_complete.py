@@ -282,6 +282,7 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         response_format="b64_json",
         images=encode_images(images) or None,
     )))
+    result["_reference_image_count"] = len(images)
     response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
     image_metadata = _image_result_metadata(result.get("data"))
     if image_metadata:
@@ -296,6 +297,8 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
     )
     response["usage"] = chat_usage_from_image_usage(usage)
     _copy_account_context(result, response)
+    if images:
+        response["_reference_image_count"] = len(images)
     return response
 
 
@@ -310,10 +313,14 @@ def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         response_format="b64_json",
         images=encode_images(images) or None,
     ))
-    yield from stream_image_chat_completion(image_outputs, model)
+    yield from stream_image_chat_completion(image_outputs, model, reference_image_count=len(images))
 
 
-def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: str) -> Iterator[dict[str, Any]]:
+def stream_image_chat_completion(
+    image_outputs: Iterable[ImageOutput],
+    model: str,
+    reference_image_count: int = 0,
+) -> Iterator[dict[str, Any]]:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     sent_role = False
@@ -345,13 +352,19 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
         if image_metadata:
             _attach_image_metadata(chunk, image_metadata)
         _attach_account_context(chunk, account_emails)
+        if reference_image_count:
+            chunk["_reference_image_count"] = reference_image_count
         yield chunk
     if not sent_role:
         chunk = completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
         _attach_account_context(chunk, account_emails)
+        if reference_image_count:
+            chunk["_reference_image_count"] = reference_image_count
         yield chunk
     chunk = completion_chunk(model, {}, "stop", completion_id, created)
     _attach_account_context(chunk, account_emails)
+    if reference_image_count:
+        chunk["_reference_image_count"] = reference_image_count
     yield chunk
 
 

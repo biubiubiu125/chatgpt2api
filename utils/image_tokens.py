@@ -286,11 +286,20 @@ def _part_size(part: dict[str, Any]) -> tuple[int, int] | None:
     if isinstance(data, (bytes, bytearray)):
         return image_size_from_bytes(bytes(data))
 
-    image_url = part.get("image_url")
+    image_url = part.get("image_url") or part.get("url")
     if isinstance(image_url, dict):
         image_url = image_url.get("url") or image_url.get("image_url")
     if isinstance(image_url, str) and image_url.startswith("data:"):
         return image_size_from_data_url(image_url)
+
+    raw_base64 = part.get("b64_json") or part.get("base64")
+    if isinstance(raw_base64, str) and raw_base64.strip():
+        try:
+            if raw_base64.startswith("data:"):
+                return image_size_from_bytes(_decode_data_url(raw_base64))
+            return image_size_from_bytes(base64.b64decode(raw_base64))
+        except Exception:
+            return None
 
     source = part.get("source")
     if isinstance(source, dict) and str(source.get("type") or "") == "base64":
@@ -309,7 +318,10 @@ def count_image_content_tokens(content: object, model: str, default_detail: str 
         if not isinstance(part, dict):
             continue
         part_type = str(part.get("type") or "").strip()
-        if part_type not in {"image", "image_url", "input_image"} and not part.get("source"):
+        if (
+            part_type not in {"image", "image_url", "input_image"}
+            and not any(key in part for key in ("image_url", "url", "b64_json", "base64", "source", "data"))
+        ):
             continue
         size = _part_size(part)
         if not size:

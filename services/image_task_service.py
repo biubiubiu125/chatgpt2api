@@ -97,6 +97,19 @@ def _collect_account_emails(value: object) -> list[str]:
     return list(dict.fromkeys(emails))
 
 
+def _reference_image_count(payload: dict[str, Any], result: object = None) -> int:
+    if isinstance(result, dict):
+        raw = result.get("_reference_image_count")
+        try:
+            count = int(raw)
+            if count > 0:
+                return count
+        except (TypeError, ValueError):
+            pass
+    images = payload.get("images")
+    return len(images) if isinstance(images, list) else 0
+
+
 def _account_ref_from_token(access_token: str) -> dict[str, str]:
     access_token = _clean(access_token)
     if not access_token:
@@ -273,6 +286,8 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         item["progress"] = task.get("progress")
     if task.get("duration_ms") is not None:
         item["duration_ms"] = task.get("duration_ms")
+    if task.get("reference_image_count") is not None:
+        item["reference_image_count"] = task.get("reference_image_count")
     if task.get("status") in (TASK_STATUS_RUNNING, TASK_STATUS_QUEUED):
         if task.get("status") == TASK_STATUS_RUNNING:
             # RUNNING 状态仅在 started_ts 被设置后（image_stream_resolve_start）才计时
@@ -424,6 +439,7 @@ class ImageTaskService:
                 "size": _clean(payload.get("size")),
                 "quality": _clean(payload.get("quality"), "auto"),
                 "payload": _serialize_task_payload(payload),
+                "reference_image_count": _reference_image_count(payload),
                 "created_at": now,
                 "updated_at": now,
                 "created_ts": time.time(),
@@ -509,6 +525,7 @@ class ImageTaskService:
             account_emails = _collect_account_emails(result)
             access_token = _clean(result.get("_access_token"))
             account_ref = _account_ref_from_token(access_token)
+            reference_image_count = _reference_image_count(payload, result)
             if not account_email and account_ref.get("account_email"):
                 account_email = account_ref["account_email"]
             if account_email and account_email not in account_emails:
@@ -542,6 +559,7 @@ class ImageTaskService:
                 account_emails=account_emails,
                 account_id=account_id,
                 conversation_id="",
+                reference_image_count=reference_image_count,
             )
             self._log_call(
                 identity,
@@ -553,6 +571,7 @@ class ImageTaskService:
                 urls=_collect_image_urls(data),
                 account_email=account_email,
                 account_emails=account_emails,
+                reference_image_count=reference_image_count,
             )
         except Exception as exc:
             error_message = str(exc) or "image task failed"
@@ -560,9 +579,11 @@ class ImageTaskService:
             account_emails = _collect_account_emails({"account_emails": getattr(exc, "account_emails", []), "account_email": account_email})
             account_id = _clean(getattr(exc, "account_id", ""))
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
+            reference_image_count = _reference_image_count(payload)
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
                               duration_ms=duration_ms,
+                              reference_image_count=reference_image_count,
                               **({"conversation_id": conversation_id} if conversation_id else {}),
                               **({"account_email": account_email} if account_email else {}),
                               **({"account_emails": account_emails} if account_emails else {}),
@@ -578,6 +599,7 @@ class ImageTaskService:
                 error=error_message,
                 account_email=account_email,
                 account_emails=account_emails,
+                reference_image_count=reference_image_count,
             )
         finally:
             with self._lock:
@@ -598,6 +620,7 @@ class ImageTaskService:
         urls: list[str] | None = None,
         account_email: str = "",
         account_emails: list[str] | None = None,
+        reference_image_count: int = 0,
     ) -> None:
         endpoint = "/v1/images/edits" if mode == "edit" else "/v1/images/generations"
         summary_prefix = "图生图" if mode == "edit" else "文生图"
@@ -623,6 +646,8 @@ class ImageTaskService:
             detail["account_emails"] = clean_emails
         if urls:
             detail["urls"] = list(dict.fromkeys(urls))
+        if reference_image_count:
+            detail["reference_image_count"] = max(0, int(reference_image_count))
         try:
             log_service.add(LOG_TYPE_CALL, f"{summary_prefix}{suffix}", detail)
         except Exception:
@@ -683,6 +708,12 @@ class ImageTaskService:
             usage = item.get("usage")
             if isinstance(usage, dict):
                 task["usage"] = usage
+            try:
+                reference_image_count = int(item.get("reference_image_count") or 0)
+            except (TypeError, ValueError):
+                reference_image_count = 0
+            if reference_image_count:
+                task["reference_image_count"] = reference_image_count
             error = _clean(item.get("error"))
             if error:
                 task["error"] = error

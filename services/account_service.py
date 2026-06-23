@@ -1047,11 +1047,27 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> list[str]:
         max_concurrency = max(1, int(config.image_account_concurrency or 1))
-        return [
+        candidates = [
             token
             for token in self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
             if int(self._image_inflight.get(token, 0)) < max_concurrency
         ]
+
+        def candidate_priority(token: str) -> tuple[int, int, int, int]:
+            account = self._accounts.get(token) or {}
+            quota = self._log_int(account.get("quota"))
+            if bool(account.get("image_quota_unknown")):
+                quota = 10**9
+            success = self._log_int(account.get("success"))
+            fail = self._log_int(account.get("fail"))
+            return (
+                int(self._image_inflight.get(token, 0)),
+                max(0, success),
+                -max(0, quota),
+                max(0, fail),
+            )
+
+        return sorted(candidates, key=candidate_priority)
 
     def _acquire_next_candidate_token(
             self,
@@ -1069,8 +1085,7 @@ class AccountService:
                     )
                 tokens = self._list_available_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
                 if tokens:
-                    access_token = tokens[self._index % len(tokens)]
-                    self._index += 1
+                    access_token = tokens[0]
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token
                 self._image_slot_condition.wait(timeout=1.0)
@@ -1194,6 +1209,7 @@ class AccountService:
             current = self._accounts.get(access_token)
             if current is None:
                 self._image_inflight.pop(access_token, None)
+                self._image_slot_condition.notify_all()
                 return True
             after = self._normalize_account({
                 **current,
@@ -1214,6 +1230,7 @@ class AccountService:
             else:
                 self._index = 0
             self._save_accounts()
+            self._image_slot_condition.notify_all()
             self._add_account_log(
                 "自动移除生图超时账号",
                 self._account_log_detail(
@@ -1385,6 +1402,8 @@ class AccountService:
                 else:
                     self._index = 0
             self._save_accounts()
+            if removed_tokens:
+                self._image_slot_condition.notify_all()
             items = [dict(item) for item in self._accounts.values()]
             self._add_account_log(
                 f"新增 {added} 个账号，跳过 {skipped} 个，自动移除 {len(auto_removed)} 个",
@@ -1417,6 +1436,7 @@ class AccountService:
                 else:
                     self._index = 0
                 self._save_accounts()
+                self._image_slot_condition.notify_all()
                 self._add_account_log(
                     f"删除 {removed} 个账号",
                     {"event_type": "accounts_deleted", "removed": removed},
@@ -1458,6 +1478,7 @@ class AccountService:
         else:
             self._index = 0
         self._save_accounts()
+        self._image_slot_condition.notify_all()
         self._add_account_log(
             summary,
             self._account_log_detail(event_type, access_token, before=before, after=after),
@@ -1491,6 +1512,7 @@ class AccountService:
             else:
                 self._index = 0
             self._save_accounts()
+            self._image_slot_condition.notify_all()
 
             for token, account, event_type, summary in removed_items:
                 self._add_account_log(
@@ -1529,6 +1551,7 @@ class AccountService:
             else:
                 self._index = 0
             self._save_accounts()
+            self._image_slot_condition.notify_all()
 
             for token, account in removed_items:
                 self._add_account_log(
