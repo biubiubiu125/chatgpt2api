@@ -104,12 +104,12 @@ const docs: ApiDoc[] = [
       ["n", "number", "可选，生成数量，当前限制 1-50。"],
       ["size", "string", "可选，支持 WIDTHxHEIGHT 精确尺寸，或 1k/2k/4k 档位；未传时默认按 2k 和当前比例处理。"],
       ["quality", "string", "可选，默认 auto。"],
-      ["response_format", "string", "可选，默认 b64_json。"],
+      ["response_format", "string", "可选，默认 b64_json；只有传 url 时才返回图片链接。"],
     ],
     output: [
       ["data", "array", "图片结果列表。"],
       ["data[].b64_json", "string", "base64 图片内容。"],
-      ["data[].url", "string", "部分配置下返回图片 URL。"],
+      ["data[].url", "string", "仅 response_format=url 时返回。"],
     ],
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/images/generations \\
   -H "Content-Type: application/json" \\
@@ -125,14 +125,15 @@ const docs: ApiDoc[] = [
       ["image", "file | file[] | URL", "参考图，支持 multipart 上传，也支持 JSON 图片链接。"],
       ["prompt", "string", "编辑提示词。"],
       ["model", "string", "可选，默认 gpt-image-2。"],
-      ["n", "number", "可选，生成数量，当前限制 1-50。"],
+      ["n", "number", "可选，生成数量，当前仅支持 1。"],
       ["size", "string", "可选，支持 WIDTHxHEIGHT 精确尺寸，或 1k/2k/4k 档位；未传时默认按 2k 和当前比例处理。"],
       ["quality", "string", "可选，默认 auto。"],
+      ["response_format", "string", "可选，默认 b64_json；只有传 url 时才返回图片链接。"],
     ],
     output: [
       ["data", "array", "编辑后的图片结果列表。"],
       ["data[].b64_json", "string", "base64 图片内容。"],
-      ["data[].url", "string", "部分配置下返回图片 URL。"],
+      ["data[].url", "string", "仅 response_format=url 时返回。"],
     ],
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/images/edits \\
   -H "Authorization: Bearer ${key}" \\

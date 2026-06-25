@@ -65,7 +65,10 @@ def _editable_access_token() -> str:
         raise RuntimeError("no available plus/team/pro account")
     accounts.sort(key=lambda item: _clean(item.get("last_used_at")))
     token = _clean(accounts[0].get("access_token"))
-    return account_service.refresh_access_token(token, event="editable_file_task") or token
+    refreshed_token = account_service.refresh_access_token(token, event="editable_file_task")
+    if not refreshed_token:
+        raise RuntimeError("account token invalid, account removed")
+    return refreshed_token
 
 
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:

@@ -259,7 +259,8 @@ curl http://localhost:8000/v1/images/edits \
 |:------------|:----------------------------------------------|
 | `model`     | 图片模型， `gpt-image-2`                           |
 | `prompt`    | 图片编辑提示词                                       |
-| `n`         | 生成数量，当前后端限制为 `1-50`                           |
+| `n`         | 生成数量，当前仅支持 `1`                                |
+| `response_format` | 可选，默认 `b64_json`；只有传 `url` 时才返回图片链接        |
 | `image`     | 需要编辑的图片文件，使用 multipart/form-data 上传           |
 | `images`    | JSON 图片引用数组，支持 `{"image_url": "https://..."}` |
 | `image_url` | 表单模式下也可直接传图片链接，支持重复字段传多张图                     |

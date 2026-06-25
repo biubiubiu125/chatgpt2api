@@ -466,6 +466,13 @@ class ConfigStore:
             return 3
 
     @property
+    def image_account_fallback_limit(self) -> int:
+        try:
+            return min(1, max(0, int(self.data.get("image_account_fallback_limit", 1))))
+        except (TypeError, ValueError):
+            return 1
+
+    @property
     def image_resize_max_side(self) -> int:
         return get_image_resize_limits()[0]
 
@@ -580,6 +587,7 @@ class ConfigStore:
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency
+        data["image_account_fallback_limit"] = self.image_account_fallback_limit
         data["image_parallel_generation"] = self.image_parallel_generation
         data["image_resize_max_side"] = self.image_resize_max_side
         data["image_resize_max_pixels"] = self.image_resize_max_pixels
@@ -642,6 +650,11 @@ class ConfigStore:
                     next_data[key] = max(0 if key != "image_retention_days" else 1, int(next_data[key]))
                 except (TypeError, ValueError):
                     next_data.pop(key, None)
+        if "image_account_fallback_limit" in next_data:
+            try:
+                next_data["image_account_fallback_limit"] = min(1, max(0, int(next_data["image_account_fallback_limit"])))
+            except (TypeError, ValueError):
+                next_data["image_account_fallback_limit"] = 1
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:

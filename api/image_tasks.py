@@ -19,6 +19,7 @@ class ImageGenerationTaskRequest(BaseModel):
     size: str | None = None
     aspect_ratio: str | None = None
     quality: str = "auto"
+    response_format: str = "b64_json"
 
 
 class ResumePollRequest(BaseModel):
@@ -43,10 +44,11 @@ def create_router() -> APIRouter:
     @router.get("/api/image-tasks")
     async def list_image_tasks(
         ids: str = Query(default=""),
+        include_image_data: bool = Query(default=True),
         authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
-        return await run_in_threadpool(image_task_service.list_tasks, identity, _parse_task_ids(ids))
+        return await run_in_threadpool(image_task_service.list_tasks, identity, _parse_task_ids(ids), include_image_data)
 
     @router.post("/api/image-tasks/generations")
     async def create_generation_task(
@@ -67,6 +69,7 @@ def create_router() -> APIRouter:
                 size=body.size,
                 aspect_ratio=body.aspect_ratio,
                 quality=body.quality,
+                response_format=body.response_format,
                 base_url=resolve_image_base_url(request),
             )
         except ValueError as exc:
@@ -99,6 +102,7 @@ def create_router() -> APIRouter:
                 size=payload["size"],
                 aspect_ratio=payload.get("aspect_ratio"),
                 quality=payload["quality"],
+                response_format=payload["response_format"],
                 base_url=resolve_image_base_url(request),
                 images=images,
                 masks=masks,

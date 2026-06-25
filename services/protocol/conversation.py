@@ -5,6 +5,7 @@ import json
 import re
 import threading
 import time
+from collections.abc import Iterable as IterableABC
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
@@ -31,6 +32,79 @@ from utils.image_tokens import count_image_content_tokens
 from utils.log import logger
 
 
+@dataclass
+class ImageFallbackTracker:
+    limit: int = field(default_factory=lambda: config.image_account_fallback_limit)
+    count: int = 0
+    events: list[dict[str, Any]] = field(default_factory=list)
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @staticmethod
+    def _normalize_limit(value: object) -> int:
+        try:
+            return min(1, max(0, int(value)))
+        except (TypeError, ValueError):
+            return 1
+
+    def __post_init__(self) -> None:
+        self.limit = self._normalize_limit(self.limit)
+        try:
+            self.count = max(0, int(self.count))
+        except (TypeError, ValueError):
+            self.count = 0
+
+    def snapshot(self) -> tuple[int, int, list[dict[str, Any]]]:
+        with self.lock:
+            self.limit = self._normalize_limit(self.limit)
+            return self.count, self.limit, [dict(item) for item in self.events]
+
+    def use(
+            self,
+            reason: str,
+            *,
+            account_email: str = "",
+            account_id: str = "",
+            conversation_id: str = "",
+            error_text: str = "",
+    ) -> tuple[bool, int, int, list[dict[str, Any]]]:
+        with self.lock:
+            self.limit = self._normalize_limit(self.limit)
+            if self.count >= self.limit:
+                self.events.append({
+                    "reason": reason,
+                    "account_email": account_email,
+                    "account_id": account_id,
+                    "conversation_id": conversation_id,
+                    "error": str(error_text or "")[:200],
+                    "limit_reached": True,
+                    "fallback_count": self.count,
+                })
+                return False, self.count, self.limit, [dict(item) for item in self.events]
+            self.count += 1
+            self.events.append({
+                "reason": reason,
+                "account_email": account_email,
+                "account_id": account_id,
+                "conversation_id": conversation_id,
+                "error": str(error_text or "")[:200],
+                "fallback_count": self.count,
+            })
+            return True, self.count, self.limit, [dict(item) for item in self.events]
+
+
+def _unique_nonempty_strings(values: Iterable[object] | object | None) -> list[str]:
+    result: list[str] = []
+    if values is None:
+        return result
+    if isinstance(values, (str, bytes)) or not isinstance(values, IterableABC):
+        values = [values]
+    for value in values or []:
+        text = str(value or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
 class ImageGenerationError(Exception):
     def __init__(
         self,
@@ -42,6 +116,13 @@ class ImageGenerationError(Exception):
         account_email: str = "",
         account_id: str = "",
         conversation_id: str = "",
+        account_emails: Iterable[object] | None = None,
+        tried_account_emails: Iterable[object] | None = None,
+        tried_account_ids: Iterable[object] | None = None,
+        fallback_count: int | None = None,
+        fallback_limit: int | None = None,
+        fallback_reason: str = "",
+        fallback_events: list[dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -51,14 +132,39 @@ class ImageGenerationError(Exception):
         self.account_email = account_email
         self.account_id = account_id
         self.conversation_id = conversation_id
+        emails = _unique_nonempty_strings(account_emails)
+        if account_email and account_email not in emails:
+            emails.insert(0, account_email)
+        self.account_emails = emails
+        self.tried_account_emails = _unique_nonempty_strings(tried_account_emails)
+        self.tried_account_ids = _unique_nonempty_strings(tried_account_ids)
+        try:
+            self.fallback_count = None if fallback_count is None else max(0, int(fallback_count))
+        except (TypeError, ValueError):
+            self.fallback_count = None
+        try:
+            self.fallback_limit = None if fallback_limit is None else max(0, int(fallback_limit))
+        except (TypeError, ValueError):
+            self.fallback_limit = None
+        self.fallback_reason = str(fallback_reason or "").strip()
+        self.fallback_events = [
+            dict(item)
+            for item in (fallback_events or [])
+            if isinstance(item, dict)
+        ]
 
     def to_openai_error(self) -> dict[str, Any]:
+        public_code = self.code
+        if public_code == "image_account_fallback_limit_reached":
+            public_code = "upstream_error"
+        elif public_code == "insufficient_image_accounts":
+            public_code = "insufficient_quota"
         error_dict = {
             "error": {
                 "message": public_image_error_message(str(self)),
                 "type": self.error_type,
                 "param": self.param,
-                "code": self.code,
+                "code": public_code,
             }
         }
         return error_dict
@@ -72,7 +178,28 @@ def public_image_error_message(message: str) -> str:
             "The upstream model returned a text/tool description instead of an image. "
             "Please retry later."
         )
-    if any(item in lower for item in ("backend-api/", "status=", "body=", "chatgpt.com", "upstreamhttperror")):
+    if any(item in lower for item in (
+        "image account fallback",
+        "fallback limit",
+        "account_id",
+        "account_email",
+    )):
+        return "The image generation request failed. Please try again later."
+    if any(item in lower for item in (
+        "available image account",
+        "different available image accounts",
+        "insufficient_image_accounts",
+    )):
+        return "no available image quota"
+    if "no available" in lower and "image quota" in lower:
+        return "no available image quota"
+    if any(item in lower for item in (
+        "backend-api/",
+        "status=",
+        "body=",
+        "chatgpt.com",
+        "upstreamhttperror",
+    )):
         return "The image generation request failed. Please try again later."
     return text or "The image generation request failed. Please try again later."
 
@@ -94,6 +221,108 @@ def _exception_text(exc: Exception) -> str:
 
 def is_token_invalid_exception(exc: Exception) -> bool:
     return is_token_invalid_error(_exception_text(exc))
+
+
+def is_image_policy_rejection_error(message: str) -> bool:
+    text = str(message or "").lower()
+    return (
+        "content_policy" in text
+        or "content policy" in text
+        or "content policy violation" in text
+        or "moderation" in text
+        or "safety system" in text
+        or "safety policy" in text
+        or "violates our policy" in text
+    )
+
+
+def is_image_account_unusable_error(message: str) -> bool:
+    text = str(message or "").lower()
+    if not text:
+        return False
+    if is_token_invalid_error(text):
+        return True
+    if is_upstream_connection_error(text):
+        return False
+    policy_rejection = is_image_policy_rejection_error(text)
+    direct_markers = (
+        "account_deactivated",
+        "account deactivated",
+        "deactivated account",
+        "account disabled",
+        "account suspended",
+        "account banned",
+        "account locked",
+        "not eligible",
+        "not entitled",
+        "missing entitlement",
+        "no entitlement",
+        "does not have access",
+        "do not have access",
+        "feature not available",
+        "subscription required",
+        "subscription inactive",
+        "subscription expired",
+        "subscription unavailable",
+        "plan required",
+    )
+    if any(marker in text for marker in direct_markers):
+        return True
+    if policy_rejection:
+        return False
+    if "permission denied" in text or "access denied" in text:
+        return True
+    generic_auth_markers = ("not authorized", "unauthorized", "forbidden")
+    account_context_markers = ("account", "access", "permission", "entitlement", "subscription", "plan", "workspace", "user")
+    if any(marker in text for marker in generic_auth_markers) and any(marker in text for marker in account_context_markers):
+        return True
+    has_auth_status = (
+        "status=401" in text
+        or "status_code=401" in text
+        or "http 401" in text
+        or "401 unauthorized" in text
+    )
+    if has_auth_status:
+        return True
+    has_forbidden_status = (
+        "status=403" in text
+        or "status_code=403" in text
+        or "http 403" in text
+        or "403 forbidden" in text
+    )
+    if has_forbidden_status and any(marker in text for marker in ("account", "access", "permission", "entitlement", "subscription")):
+        return True
+    return False
+
+
+def is_image_account_unusable_exception(exc: Exception) -> bool:
+    return is_image_account_unusable_error(_exception_text(exc))
+
+
+def is_non_account_image_generation_error(exc: Exception, message: str = "") -> bool:
+    text = str(message or "") or _exception_text(exc)
+    if is_image_account_unusable_error(text):
+        return False
+    if is_image_policy_rejection_error(text):
+        return True
+    code = str(getattr(exc, "code", "") or "").strip()
+    error_type = str(getattr(exc, "error_type", "") or "").strip()
+    if code in {"content_policy_violation", "no_image_generated"}:
+        return True
+    if error_type == "invalid_request_error" and not is_token_invalid_exception(exc):
+        return True
+    return False
+
+
+def should_use_image_account_fallback(exc: Exception, message: str = "") -> bool:
+    if is_token_invalid_exception(exc):
+        return True
+    text = str(message or "") or _exception_text(exc)
+    if is_image_account_unusable_error(text):
+        return True
+    if is_non_account_image_generation_error(exc, text):
+        return False
+    return False
 
 
 def raise_token_invalid_generation_error(exc: Exception, conversation_id: str = "") -> None:
@@ -162,6 +391,10 @@ def image_stream_error_message(message: str) -> str:
 
 def is_image_account_exhausted_error(exc: Exception) -> bool:
     return isinstance(exc, ImageGenerationError) and exc.code == "insufficient_image_accounts"
+
+
+def is_image_account_fallback_limit_error(exc: Exception) -> bool:
+    return isinstance(exc, ImageGenerationError) and exc.code == "image_account_fallback_limit_reached"
 
 
 REFERENCED_IMAGE_IDS_RE = re.compile(r'"referenced_image_ids"\s*:\s*\[([^\]]+)\]')
@@ -369,6 +602,7 @@ class ConversationRequest:
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
+    fallback_tracker: Any = None
 
 
 @dataclass
@@ -396,6 +630,12 @@ class ImageOutput:
     account_email: str = ""
     access_token: str = ""
     conversation_id: str = ""
+    tried_account_emails: list[str] = field(default_factory=list)
+    tried_account_ids: list[str] = field(default_factory=list)
+    fallback_count: int | None = None
+    fallback_limit: int | None = None
+    fallback_reason: str = ""
+    fallback_events: list[dict[str, Any]] = field(default_factory=list)
 
     def to_chunk(self) -> dict[str, Any]:
         chunk: dict[str, Any] = {
@@ -412,6 +652,19 @@ class ImageOutput:
             chunk["_account_email"] = self.account_email
         if self.conversation_id:
             chunk["_conversation_id"] = self.conversation_id
+        if self.tried_account_emails:
+            chunk["_tried_account_emails"] = self.tried_account_emails
+        if self.tried_account_ids:
+            chunk["_tried_account_ids"] = self.tried_account_ids
+        if self.fallback_count is not None:
+            chunk["_fallback_count"] = self.fallback_count
+            chunk["_fallback_index"] = self.index
+        if self.fallback_limit is not None:
+            chunk["_fallback_limit"] = self.fallback_limit
+        if self.fallback_reason:
+            chunk["_fallback_reason"] = self.fallback_reason
+        if self.fallback_events:
+            chunk["_fallback_events"] = self.fallback_events
         if self.kind == "message":
             chunk.update({
                 "object": "image.generation.message",
@@ -437,6 +690,7 @@ class ImageOutput:
 class ImageTokenLeasePool:
     request: ConversationRequest
     excluded_tokens: set[str] = field(default_factory=set)
+    fallback_tracker: ImageFallbackTracker | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock)
     wait_interval_seconds: float = 0.25
 
@@ -469,6 +723,7 @@ class ImageTokenLeasePool:
                 token = account_service.get_available_access_token(
                     **self._filters(),
                     excluded_tokens=combined_excluded_tokens,
+                    on_candidate_failed=self._on_candidate_failed,
                 )
             except RuntimeError as exc:
                 with self._lock:
@@ -498,12 +753,13 @@ class ImageTokenLeasePool:
             token = account_service.get_available_access_token(
                 **self._filters(),
                 excluded_tokens=excluded_tokens,
+                on_candidate_failed=self._on_candidate_failed,
             )
             with self._lock:
                 if token not in self.excluded_tokens:
                     self.excluded_tokens.add(token)
                     return token
-            account_service.release_image_slot(token)
+                account_service.release_image_slot(token)
             time.sleep(self.wait_interval_seconds)
 
     def release(self, token: str) -> None:
@@ -515,6 +771,48 @@ class ImageTokenLeasePool:
             self.excluded_tokens.discard(raw_token)
             if resolved_token:
                 self.excluded_tokens.discard(resolved_token)
+
+    def _on_candidate_failed(self, access_token: str, exc: Exception) -> None:
+        if self.fallback_tracker is None:
+            return
+        account = account_service.get_account(access_token) or {}
+        account_email = str(account.get("email") or "").strip()
+        account_id = str(account.get("account_id") or account.get("user_id") or "").strip()
+        allowed, used_count, limit, events = self.fallback_tracker.use(
+            "account_preflight_failed",
+            account_email=account_email,
+            account_id=account_id,
+            error_text=_exception_text(exc),
+        )
+        if allowed:
+            logger.warning({
+                "event": "image_account_preflight_fallback_used",
+                "fallback_count": used_count,
+                "fallback_limit": limit,
+                "account_email": account_email,
+                "error": _exception_text(exc)[:200],
+            })
+            return
+        error = ImageGenerationError(
+            "image account fallback limit reached: account_preflight_failed",
+            status_code=502,
+            error_type="server_error",
+            code="image_account_fallback_limit_reached",
+            account_email=account_email,
+            account_id=account_id,
+            fallback_count=used_count,
+            fallback_limit=limit,
+            fallback_reason="account_preflight_failed",
+            fallback_events=events,
+        )
+        logger.warning({
+            "event": "image_account_preflight_fallback_limit_reached",
+            "fallback_count": used_count,
+            "fallback_limit": limit,
+            "account_email": account_email,
+            "error": _exception_text(exc)[:200],
+        })
+        raise error from exc
 
 
 def assistant_message_text(message: dict[str, Any]) -> str:
@@ -860,6 +1158,8 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
                 if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
                     token = refreshed_token
+                elif not refreshed_token:
+                    token = account_service.get_text_access_token(attempted_tokens)
                 else:
                     account_service.remove_invalid_token(token, "text_stream")
                     token = account_service.get_text_access_token(attempted_tokens)
@@ -1441,6 +1741,7 @@ def _generate_single_image(
         total: int,
         access_token: str = "",
         token_pool: ImageTokenLeasePool | None = None,
+        fallback_tracker: ImageFallbackTracker | None = None,
 ) -> list[ImageOutput]:
     """Run generation for one image, preserving account leases across retries."""
     MAX_TEXT_REPLY_RETRIES = 3
@@ -1448,11 +1749,30 @@ def _generate_single_image(
 
     text_reply_retry_count = 0
     upstream_connection_retries_by_token: dict[str, int] = {}
+    fallback_tracker = fallback_tracker or ImageFallbackTracker()
+    account_fallback_count, account_fallback_limit, fallback_events = fallback_tracker.snapshot()
     account_email = ""
+    account_id = ""
+    tried_account_emails: list[str] = []
+    tried_account_ids: list[str] = []
     current_token = str(access_token or "").strip()
     attempted_tokens: set[str] = {current_token} if current_token else set()
     if token_pool is None and current_token:
-        token_pool = ImageTokenLeasePool(request, {current_token})
+        token_pool = ImageTokenLeasePool(request, {current_token}, fallback_tracker=fallback_tracker)
+
+    def annotate_outputs(outputs: list[ImageOutput]) -> list[ImageOutput]:
+        for output in outputs:
+            if tried_account_emails:
+                output.tried_account_emails = list(tried_account_emails)
+            if tried_account_ids:
+                output.tried_account_ids = list(tried_account_ids)
+            if account_fallback_count:
+                output.fallback_count = account_fallback_count
+                output.fallback_limit = account_fallback_limit
+            if fallback_events:
+                output.fallback_events = [dict(item) for item in fallback_events]
+                output.fallback_reason = str(fallback_events[-1].get("reason") or "")
+        return outputs
 
     def acquire_token() -> str:
         if current_token:
@@ -1466,6 +1786,7 @@ def _generate_single_image(
             source_type="codex" if codex_model else None,
             plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
             excluded_tokens=attempted_tokens,
+            on_candidate_failed=on_candidate_failed,
         )
 
     def release_current_token(success: bool) -> None:
@@ -1487,6 +1808,10 @@ def _generate_single_image(
         try:
             current_token = token_pool.acquire(attempted_tokens)
             return True
+        except ImageGenerationError as exc:
+            if is_image_account_fallback_limit_error(exc):
+                raise
+            return False
         except Exception:
             return False
 
@@ -1499,6 +1824,170 @@ def _generate_single_image(
         if current_token == invalid_token:
             current_token = ""
 
+    def remember_current_account() -> None:
+        if account_email and account_email not in tried_account_emails:
+            tried_account_emails.append(account_email)
+        if account_id and account_id not in tried_account_ids:
+            tried_account_ids.append(account_id)
+
+    def on_candidate_failed(candidate_token: str, exc: Exception) -> None:
+        account = account_service.get_account(candidate_token) or {}
+        candidate_email = str(account.get("email") or "").strip()
+        candidate_id = str(account.get("account_id") or account.get("user_id") or "").strip()
+        if candidate_email and candidate_email not in tried_account_emails:
+            tried_account_emails.append(candidate_email)
+        if candidate_id and candidate_id not in tried_account_ids:
+            tried_account_ids.append(candidate_id)
+        allowed, used_count, limit, events = fallback_tracker.use(
+            "account_preflight_failed",
+            account_email=candidate_email,
+            account_id=candidate_id,
+            error_text=_exception_text(exc),
+        )
+        nonlocal account_fallback_count, account_fallback_limit, fallback_events
+        account_fallback_count = used_count
+        account_fallback_limit = limit
+        fallback_events = events
+        if allowed:
+            logger.warning({
+                "event": "image_account_preflight_fallback_used",
+                "account_email": candidate_email,
+                "index": index,
+                "fallback_count": account_fallback_count,
+                "fallback_limit": account_fallback_limit,
+                "error": _exception_text(exc)[:200],
+            })
+            return
+        error = ImageGenerationError(
+            "image account fallback limit reached: account_preflight_failed",
+            status_code=502,
+            error_type="server_error",
+            code="image_account_fallback_limit_reached",
+            account_email=candidate_email,
+            account_id=candidate_id,
+            account_emails=tried_account_emails,
+            tried_account_emails=tried_account_emails,
+            tried_account_ids=tried_account_ids,
+            fallback_count=account_fallback_count,
+            fallback_limit=account_fallback_limit,
+            fallback_reason="account_preflight_failed",
+            fallback_events=fallback_events,
+        )
+        raise error from exc
+
+    def attach_fallback_context(exc: Exception, fallback_reason: str = "") -> None:
+        existing_emails = _unique_nonempty_strings([
+            getattr(exc, "account_email", ""),
+            *_unique_nonempty_strings(getattr(exc, "account_emails", [])),
+        ])
+        if account_email and account_email not in existing_emails:
+            existing_emails.append(account_email)
+        tried_emails = _unique_nonempty_strings([
+            *_unique_nonempty_strings(getattr(exc, "tried_account_emails", [])),
+            *tried_account_emails,
+            *existing_emails,
+        ])
+        tried_ids = _unique_nonempty_strings([
+            getattr(exc, "account_id", ""),
+            *_unique_nonempty_strings(getattr(exc, "tried_account_ids", [])),
+            *tried_account_ids,
+            account_id,
+        ])
+        if account_email and not getattr(exc, "account_email", ""):
+            setattr(exc, "account_email", account_email)
+        if account_id and not getattr(exc, "account_id", ""):
+            setattr(exc, "account_id", account_id)
+        if existing_emails:
+            setattr(exc, "account_emails", existing_emails)
+        setattr(exc, "tried_account_emails", tried_emails)
+        setattr(exc, "tried_account_ids", tried_ids)
+        if account_fallback_count or fallback_events:
+            setattr(exc, "fallback_count", account_fallback_count)
+            setattr(exc, "fallback_limit", account_fallback_limit)
+            if fallback_reason and not getattr(exc, "fallback_reason", ""):
+                setattr(exc, "fallback_reason", fallback_reason)
+            setattr(exc, "fallback_events", [dict(item) for item in fallback_events])
+
+    def use_account_fallback(reason: str, error_text: str = "", conversation_id: str = "") -> None:
+        nonlocal account_fallback_count, account_fallback_limit, fallback_events
+        remember_current_account()
+        allowed, used_count, limit, events = fallback_tracker.use(
+            reason,
+            account_email=account_email,
+            account_id=account_id,
+            conversation_id=conversation_id,
+            error_text=error_text,
+        )
+        account_fallback_count = used_count
+        account_fallback_limit = limit
+        fallback_events = events
+        if not allowed:
+            logger.warning({
+                "event": "image_account_fallback_limit_reached",
+                "request_token": token,
+                "account_email": account_email,
+                "index": index,
+                "fallback_count": account_fallback_count,
+                "fallback_limit": account_fallback_limit,
+                "reason": reason,
+                "error": error_text[:200],
+            })
+            error = ImageGenerationError(
+                f"image account fallback limit reached: {reason}",
+                status_code=502,
+                error_type="server_error",
+                code="image_account_fallback_limit_reached",
+                account_email=account_email,
+                account_id=account_id,
+                conversation_id=conversation_id,
+                account_emails=tried_account_emails,
+                tried_account_emails=tried_account_emails,
+                tried_account_ids=tried_account_ids,
+                fallback_count=account_fallback_count,
+                fallback_limit=account_fallback_limit,
+                fallback_reason=reason,
+                fallback_events=fallback_events,
+            )
+            attach_fallback_context(error, reason)
+            raise error
+        logger.warning({
+            "event": "image_account_fallback_used",
+            "request_token": token,
+            "account_email": account_email,
+            "index": index,
+            "fallback_count": account_fallback_count,
+            "fallback_limit": account_fallback_limit,
+            "reason": reason,
+            "error": error_text[:200],
+        })
+
+    def use_account_fallback_after_current_released(reason: str, error_text: str = "", conversation_id: str = "") -> None:
+        try:
+            use_account_fallback(reason, error_text, conversation_id)
+        except Exception:
+            if current_token:
+                release_current_token(False)
+            raise
+
+    def switch_token_with_fallback_limit(reason: str, error_text: str = "", conversation_id: str = "") -> bool:
+        use_account_fallback_after_current_released(reason, error_text, conversation_id)
+        return switch_token(False)
+
+    def remove_current_image_account(reason: str, error_text: str = "") -> None:
+        if not token:
+            return
+        try:
+            account_service.remove_abnormal_image_account(token, reason, error_text)
+        except Exception as cleanup_exc:
+            logger.warning({
+                "event": "image_account_unusable_remove_failed",
+                "request_token": token,
+                "account_email": account_email,
+                "index": index,
+                "reason": reason,
+                "error": str(cleanup_exc)[:200],
+            })
+
     while True:
         try:
             if request.progress_callback:
@@ -1507,14 +1996,16 @@ def _generate_single_image(
             current_token = token
             attempted_tokens.add(token)
         except RuntimeError as exc:
-            raise ImageGenerationError(
+            error = ImageGenerationError(
                 str(exc) or "no available image quota",
                 status_code=429,
                 error_type="rate_limit_error",
                 code="insufficient_image_accounts",
                 param="n",
                 account_email=account_email,
-            ) from exc
+            )
+            attach_fallback_context(error, "insufficient_image_accounts")
+            raise error from exc
 
         emitted_for_token = False
         returned_message = False
@@ -1522,6 +2013,7 @@ def _generate_single_image(
         account = account_service.get_account(token) or {}
         account_email = str(account.get("email") or "").strip()
         account_id = str(account.get("account_id") or account.get("user_id") or "").strip()
+        remember_current_account()
         backend: object | None = None
 
         def attach_account_context(exc: Exception) -> None:
@@ -1529,6 +2021,7 @@ def _generate_single_image(
                 setattr(exc, "account_email", account_email)
             if account_id and not getattr(exc, "account_id", ""):
                 setattr(exc, "account_id", account_id)
+            attach_fallback_context(exc)
 
         logger.debug({
             "event": "image_account_lookup",
@@ -1550,11 +2043,14 @@ def _generate_single_image(
                 if token and not output.access_token:
                     output.access_token = token
                 if output.kind == "message" and request.message_as_error:
+                    message_text = output.text or "Image generation was rejected by upstream policy."
+                    is_account_error = is_image_account_unusable_error(message_text)
+                    is_text_reply = is_model_text_reply_instead_of_image(message_text)
                     raise ImageGenerationError(
-                        output.text or "Image generation was rejected by upstream policy.",
-                        status_code=400,
-                        error_type="invalid_request_error",
-                        code="content_policy_violation",
+                        message_text,
+                        status_code=403 if is_account_error else (502 if is_text_reply else 400),
+                        error_type="authentication_error" if is_account_error else ("server_error" if is_text_reply else "invalid_request_error"),
+                        code="account_unusable" if is_account_error else ("upstream_text_reply" if is_text_reply else "content_policy_violation"),
                         account_email=account_email,
                         account_id=account_id,
                         conversation_id=output.conversation_id,
@@ -1566,13 +2062,13 @@ def _generate_single_image(
             if returned_message:
                 _record_backend_proxy_result(backend, True)
                 release_current_token(False)
-                return outputs
+                return annotate_outputs(outputs)
             if not returned_result:
                 _record_backend_proxy_result(backend, True)
                 release_current_token(False)
                 if emitted_for_token:
                     conv_id = outputs[-1].conversation_id if outputs else ""
-                    raise ImageGenerationError(
+                    error = ImageGenerationError(
                         "upstream completed without generating images",
                         status_code=400,
                         error_type="invalid_request_error",
@@ -1581,10 +2077,12 @@ def _generate_single_image(
                         account_id=account_id,
                         conversation_id=conv_id,
                     )
+                    attach_fallback_context(error)
+                    raise error
                 return outputs
             _record_backend_proxy_result(backend, True)
             release_current_token(True)
-            return outputs
+            return annotate_outputs(outputs)
         except ImagePollTimeoutError as exc:
             attach_account_context(exc)
             account_service.remove_abnormal_image_timeout_account(
@@ -1603,6 +2101,7 @@ def _generate_single_image(
                 "emitted_for_token": emitted_for_token,
                 "error": str(exc)[:200],
             })
+            use_account_fallback_after_current_released("image_poll_timeout", str(exc), getattr(exc, "conversation_id", ""))
             continue
         except ImageContentPolicyError as exc:
             _record_backend_proxy_result(backend, True)
@@ -1614,7 +2113,7 @@ def _generate_single_image(
                 "error": str(exc),
                 "index": index,
             })
-            raise ImageGenerationError(
+            error = ImageGenerationError(
                 str(exc) or "Image generation was rejected by upstream policy.",
                 status_code=400,
                 error_type="invalid_request_error",
@@ -1622,7 +2121,9 @@ def _generate_single_image(
                 account_email=account_email,
                 account_id=account_id,
                 conversation_id=getattr(exc, "conversation_id", ""),
-            ) from exc
+            )
+            attach_fallback_context(error)
+            raise error from exc
         except ImageGenerationError as exc:
             attach_account_context(exc)
             error_text = _exception_text(exc)
@@ -1637,11 +2138,16 @@ def _generate_single_image(
                     "error": error_text[:200],
                 })
                 remove_invalid_current_token(token, "image_stream")
+                use_account_fallback_after_current_released("token_invalid", error_text, getattr(exc, "conversation_id", ""))
                 continue
-            if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
+            if (
+                is_model_text_reply_instead_of_image(error_text)
+                and not emitted_for_token
+                and not is_non_account_image_generation_error(exc, error_text)
+            ):
                 text_reply_retry_count += 1
                 if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
-                    if switch_token(False):
+                    if switch_token_with_fallback_limit("upstream_text_reply", error_text, getattr(exc, "conversation_id", "")):
                         logger.warning({
                             "event": "image_model_text_reply_retry",
                             "request_token": token,
@@ -1661,7 +2167,7 @@ def _generate_single_image(
                     "index": index,
                 })
                 release_current_token(False)
-                raise ImageGenerationError(
+                error = ImageGenerationError(
                     "Image generation failed: the upstream model returned a text description "
                     "instead of generating an image. Please try again later.",
                     status_code=502,
@@ -1670,7 +2176,21 @@ def _generate_single_image(
                     account_email=account_email,
                     account_id=account_id,
                     conversation_id=getattr(exc, "conversation_id", ""),
-                ) from exc
+                )
+                attach_fallback_context(error, "upstream_text_reply")
+                raise error from exc
+            if should_use_image_account_fallback(exc, error_text):
+                logger.warning({
+                    "event": "image_stream_account_unusable_retry",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "emitted_for_token": emitted_for_token,
+                    "index": index,
+                    "error": error_text[:200],
+                })
+                remove_current_image_account("image_account_unusable", error_text)
+                if switch_token_with_fallback_limit("account_unusable", error_text, getattr(exc, "conversation_id", "")):
+                    continue
             logger.warning({
                 "event": "image_stream_generation_error",
                 "request_token": token,
@@ -1679,6 +2199,7 @@ def _generate_single_image(
                 "index": index,
             })
             release_current_token(False)
+            attach_fallback_context(exc)
             raise
         except Exception as exc:
             last_error = _exception_text(exc)
@@ -1700,7 +2221,20 @@ def _generate_single_image(
                     "error": last_error[:200],
                 })
                 remove_invalid_current_token(token, "image_stream")
+                use_account_fallback_after_current_released("token_invalid", last_error, "")
                 continue
+            if should_use_image_account_fallback(exc, last_error):
+                logger.warning({
+                    "event": "image_stream_account_unusable_retry",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "emitted_for_token": emitted_for_token,
+                    "index": index,
+                    "error": last_error[:200],
+                })
+                remove_current_image_account("image_account_unusable", last_error)
+                if switch_token_with_fallback_limit("account_unusable", last_error, ""):
+                    continue
             if is_upstream_connection_error(last_error):
                 retry_count = upstream_connection_retries_by_token.get(token, 0) + 1
                 upstream_connection_retries_by_token[token] = retry_count
@@ -1723,14 +2257,25 @@ def _generate_single_image(
                     "index": index,
                     "error": last_error[:200],
                 })
-                if switch_token(False):
+                if switch_token_with_fallback_limit("transport_error", last_error, ""):
                     continue
             release_current_token(False)
-            raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, account_id=account_id, conversation_id="") from exc
+            error = ImageGenerationError(
+                image_stream_error_message(last_error),
+                account_email=account_email,
+                account_id=account_id,
+                conversation_id="",
+            )
+            attach_fallback_context(error)
+            raise error from exc
 
 
-def _acquire_unique_image_tokens(request: ConversationRequest, count: int) -> tuple[list[str], ImageTokenLeasePool]:
-    token_pool = ImageTokenLeasePool(request)
+def _acquire_unique_image_tokens(
+        request: ConversationRequest,
+        count: int,
+        fallback_tracker: ImageFallbackTracker | None = None,
+) -> tuple[list[str], ImageTokenLeasePool]:
+    token_pool = ImageTokenLeasePool(request, fallback_tracker=fallback_tracker)
     tokens: list[str] = []
     try:
         for _ in range(count):
@@ -1750,25 +2295,64 @@ def _acquire_unique_image_tokens(request: ConversationRequest, count: int) -> tu
     return tokens, token_pool
 
 
-def _collect_error_account_context(errors: dict[int, Exception]) -> tuple[str, str, list[str], str]:
-    account_id = ""
-    account_email = ""
-    account_emails: list[str] = []
-    conversation_id = ""
+def _collect_error_account_context(errors: dict[int, Exception]) -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "account_id": "",
+        "account_email": "",
+        "account_emails": [],
+        "conversation_id": "",
+        "tried_account_emails": [],
+        "tried_account_ids": [],
+        "fallback_count": None,
+        "fallback_limit": None,
+        "fallback_reason": "",
+        "fallback_events": [],
+    }
     for index in sorted(errors):
         error = errors[index]
-        error_email = str(getattr(error, "account_email", "") or "").strip()
-        if error_email and error_email not in account_emails:
-            account_emails.append(error_email)
-        if error_email and not account_email:
-            account_email = error_email
-        error_id = str(getattr(error, "account_id", "") or "").strip()
-        if error_id and not account_id:
-            account_id = error_id
+        error_emails = _unique_nonempty_strings([
+            getattr(error, "account_email", ""),
+            *_unique_nonempty_strings(getattr(error, "account_emails", [])),
+            *_unique_nonempty_strings(getattr(error, "tried_account_emails", [])),
+        ])
+        for error_email in error_emails:
+            if error_email not in context["account_emails"]:
+                context["account_emails"].append(error_email)
+            if error_email not in context["tried_account_emails"]:
+                context["tried_account_emails"].append(error_email)
+        if error_emails and not context["account_email"]:
+            context["account_email"] = error_emails[0]
+        error_ids = _unique_nonempty_strings([
+            getattr(error, "account_id", ""),
+            *_unique_nonempty_strings(getattr(error, "tried_account_ids", [])),
+        ])
+        for error_id in error_ids:
+            if error_id not in context["tried_account_ids"]:
+                context["tried_account_ids"].append(error_id)
+        if error_ids and not context["account_id"]:
+            context["account_id"] = error_ids[0]
         error_conversation_id = str(getattr(error, "conversation_id", "") or "").strip()
-        if error_conversation_id and not conversation_id:
-            conversation_id = error_conversation_id
-    return account_id, account_email, account_emails, conversation_id
+        if error_conversation_id and not context["conversation_id"]:
+            context["conversation_id"] = error_conversation_id
+        try:
+            fallback_count = getattr(error, "fallback_count", None)
+            if fallback_count is not None:
+                context["fallback_count"] = max(context["fallback_count"] or 0, max(0, int(fallback_count)))
+        except (TypeError, ValueError):
+            pass
+        try:
+            fallback_limit = getattr(error, "fallback_limit", None)
+            if fallback_limit is not None:
+                context["fallback_limit"] = max(context["fallback_limit"] or 0, int(fallback_limit))
+        except (TypeError, ValueError):
+            pass
+        fallback_reason = str(getattr(error, "fallback_reason", "") or "").strip()
+        if fallback_reason and not context["fallback_reason"]:
+            context["fallback_reason"] = fallback_reason
+        for event in getattr(error, "fallback_events", []) or []:
+            if isinstance(event, dict):
+                context["fallback_events"].append(dict(event))
+    return context
 
 
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
@@ -1776,14 +2360,97 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     if not is_supported_image_model(request.model):
         raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
 
+    fallback_tracker = request.fallback_tracker if isinstance(request.fallback_tracker, ImageFallbackTracker) else ImageFallbackTracker()
+
+    def max_nonnegative_int(*values: object) -> int | None:
+        result: int | None = None
+        for value in values:
+            if value is None:
+                continue
+            try:
+                number = max(0, int(value))
+            except (TypeError, ValueError):
+                continue
+            result = number if result is None else max(result, number)
+        return result
+
+    def attach_request_fallback_context(
+            outputs: list[ImageOutput],
+            account_context: dict[str, Any] | None = None,
+    ) -> list[ImageOutput]:
+        fallback_count, fallback_limit, fallback_events = fallback_tracker.snapshot()
+        account_context = account_context or {}
+        context_emails = _unique_nonempty_strings([
+            account_context.get("account_email"),
+            *_unique_nonempty_strings(account_context.get("account_emails")),
+            *_unique_nonempty_strings(account_context.get("tried_account_emails")),
+        ])
+        context_ids = _unique_nonempty_strings([
+            account_context.get("account_id"),
+            *_unique_nonempty_strings(account_context.get("tried_account_ids")),
+        ])
+        context_fallback_count = account_context.get("fallback_count")
+        context_fallback_limit = account_context.get("fallback_limit")
+        context_fallback_reason = str(account_context.get("fallback_reason") or "").strip()
+        context_fallback_events = [
+            dict(item)
+            for item in (account_context.get("fallback_events") or [])
+            if isinstance(item, dict)
+        ]
+        has_context = bool(
+            context_emails
+            or context_ids
+            or context_fallback_count is not None
+            or context_fallback_limit is not None
+            or context_fallback_reason
+            or context_fallback_events
+        )
+        if not fallback_count and not fallback_events and not has_context:
+            return outputs
+        for output in outputs:
+            output.tried_account_emails = _unique_nonempty_strings([
+                *output.tried_account_emails,
+                *context_emails,
+            ])
+            output.tried_account_ids = _unique_nonempty_strings([
+                *output.tried_account_ids,
+                *context_ids,
+            ])
+            merged_count = max_nonnegative_int(output.fallback_count, context_fallback_count, fallback_count)
+            if merged_count is not None:
+                output.fallback_count = merged_count
+            merged_limit = max_nonnegative_int(output.fallback_limit, context_fallback_limit, fallback_limit)
+            if merged_limit is not None:
+                output.fallback_limit = merged_limit
+            merged_events = [
+                *[dict(item) for item in output.fallback_events if isinstance(item, dict)],
+                *context_fallback_events,
+                *[dict(item) for item in fallback_events if isinstance(item, dict)],
+            ]
+            if merged_events:
+                seen_events: set[str] = set()
+                deduped_events: list[dict[str, Any]] = []
+                for event in merged_events:
+                    marker = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str)
+                    if marker in seen_events:
+                        continue
+                    seen_events.add(marker)
+                    deduped_events.append(event)
+                output.fallback_events = deduped_events
+            if context_fallback_reason and not output.fallback_reason:
+                output.fallback_reason = context_fallback_reason
+            elif output.fallback_events and not output.fallback_reason:
+                output.fallback_reason = str(output.fallback_events[-1].get("reason") or "")
+        return outputs
+
     if request.n <= 1:
         # 单张图片，直接执行（无需线程池开销）
-        outputs = _generate_single_image(request, 1, 1)
-        for output in outputs:
+        outputs = _generate_single_image(request, 1, 1, fallback_tracker=fallback_tracker)
+        for output in attach_request_fallback_context(outputs):
             yield output
         return
 
-    token_pool = ImageTokenLeasePool(request)
+    token_pool = ImageTokenLeasePool(request, fallback_tracker=fallback_tracker)
 
     # 多张图片：根据配置选择并行或串行执行
     if not config.image_parallel_generation:
@@ -1793,8 +2460,8 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
             "model": request.model,
         })
         for index in range(1, request.n + 1):
-            outputs = _generate_single_image(request, index, request.n, token_pool=token_pool)
-            for output in outputs:
+            outputs = _generate_single_image(request, index, request.n, token_pool=token_pool, fallback_tracker=fallback_tracker)
+            for output in attach_request_fallback_context(outputs):
                 yield output
         return
 
@@ -1814,7 +2481,7 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
 
     def submit_next(executor: ThreadPoolExecutor) -> None:
         nonlocal next_index
-        future = executor.submit(_generate_single_image, request, next_index, request.n, "", token_pool)
+        future = executor.submit(_generate_single_image, request, next_index, request.n, "", token_pool, fallback_tracker)
         futures[future] = next_index
         next_index += 1
 
@@ -1831,7 +2498,7 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                     results[index] = future.result()
                 except Exception as exc:
                     errors[index] = exc
-                    if is_image_account_exhausted_error(exc):
+                    if is_image_account_exhausted_error(exc) or is_image_account_fallback_limit_error(exc):
                         stop_submitting = True
                     logger.warning({
                         "event": "image_parallel_generation_error",
@@ -1841,13 +2508,15 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                     })
                 if not stop_submitting and next_index <= request.n:
                     submit_next(executor)
+    partial_error_context = _collect_error_account_context(errors) if errors else None
+
     # yield 结果：跳过索引顺序限制，不再让低索引失败阻塞高索引成功结果
     emitted = False
     last_error = ""
     # 先 yield 所有成功的结果
     for index in range(1, request.n + 1):
         if index in results:
-            for output in results[index]:
+            for output in attach_request_fallback_context(results[index], partial_error_context):
                 emitted = True
                 yield output
         elif index in errors:
@@ -1872,7 +2541,17 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     if not emitted:
         if not last_error:
             last_error = "no account in the pool could generate images — check account quota and rate-limit status"
-        account_id, account_email, account_emails, conversation_id = _collect_error_account_context(errors)
+        account_context = partial_error_context or _collect_error_account_context(errors)
+        account_id = account_context["account_id"]
+        account_email = account_context["account_email"]
+        account_emails = account_context["account_emails"]
+        conversation_id = account_context["conversation_id"]
+        tried_account_emails = account_context["tried_account_emails"]
+        tried_account_ids = account_context["tried_account_ids"]
+        fallback_count = account_context["fallback_count"]
+        fallback_limit = account_context["fallback_limit"]
+        fallback_reason = account_context["fallback_reason"]
+        fallback_events = account_context["fallback_events"]
         for index in range(1, request.n + 1):
             error = errors.get(index)
             if isinstance(error, ImageGenerationError):
@@ -1884,15 +2563,32 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                     error.conversation_id = conversation_id
                 if account_emails:
                     setattr(error, "account_emails", account_emails)
+                if tried_account_emails:
+                    setattr(error, "tried_account_emails", tried_account_emails)
+                if tried_account_ids:
+                    setattr(error, "tried_account_ids", tried_account_ids)
+                if fallback_count is not None:
+                    setattr(error, "fallback_count", fallback_count)
+                if fallback_limit is not None:
+                    setattr(error, "fallback_limit", fallback_limit)
+                if fallback_reason and not getattr(error, "fallback_reason", ""):
+                    setattr(error, "fallback_reason", fallback_reason)
+                if fallback_events:
+                    setattr(error, "fallback_events", fallback_events)
                 raise error
         wrapped = ImageGenerationError(
             image_stream_error_message(last_error),
             account_email=account_email,
             account_id=account_id,
             conversation_id=conversation_id,
+            account_emails=account_emails,
+            tried_account_emails=tried_account_emails,
+            tried_account_ids=tried_account_ids,
+            fallback_count=fallback_count,
+            fallback_limit=fallback_limit,
+            fallback_reason=fallback_reason,
+            fallback_events=fallback_events,
         )
-        if account_emails:
-            setattr(wrapped, "account_emails", account_emails)
         raise wrapped
 
 
@@ -1919,11 +2615,39 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
     progress_parts: list[str] = []
     account_email = ""
     account_emails: list[str] = []
+    tried_account_emails: list[str] = []
+    tried_account_ids: list[str] = []
+    fallback_count: int | None = None
+    fallback_limit: int | None = None
+    fallback_reason = ""
+    fallback_events: list[dict[str, Any]] = []
+    fallback_event_markers: set[str] = set()
     access_token = ""
     for output in outputs:
         created = created or output.created
         if output.account_email and output.account_email not in account_emails:
             account_emails.append(output.account_email)
+        for email in output.tried_account_emails:
+            if email and email not in tried_account_emails:
+                tried_account_emails.append(email)
+        for account_id in output.tried_account_ids:
+            if account_id and account_id not in tried_account_ids:
+                tried_account_ids.append(account_id)
+        if output.fallback_count is not None:
+            try:
+                fallback_count = max(fallback_count or 0, max(0, int(output.fallback_count)))
+            except (TypeError, ValueError):
+                pass
+        if output.fallback_limit is not None:
+            fallback_limit = max(fallback_limit or 0, output.fallback_limit)
+        if output.fallback_reason and not fallback_reason:
+            fallback_reason = output.fallback_reason
+        for event in output.fallback_events:
+            if isinstance(event, dict):
+                marker = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str)
+                if marker not in fallback_event_markers:
+                    fallback_event_markers.add(marker)
+                    fallback_events.append(dict(event))
         if output.account_email and not account_email:
             account_email = output.account_email
         if output.access_token and not access_token:
@@ -1948,6 +2672,18 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
         result["_account_email"] = account_email
     if account_emails:
         result["_account_emails"] = account_emails
+    if tried_account_emails:
+        result["_tried_account_emails"] = tried_account_emails
+    if tried_account_ids:
+        result["_tried_account_ids"] = tried_account_ids
+    if fallback_count is not None:
+        result["_fallback_count"] = fallback_count
+    if fallback_limit is not None:
+        result["_fallback_limit"] = fallback_limit
+    if fallback_reason:
+        result["_fallback_reason"] = fallback_reason
+    if fallback_events:
+        result["_fallback_events"] = fallback_events
     if access_token:
         result["_access_token"] = access_token
     return result

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from typing import Any, Iterable, Iterator
@@ -49,11 +50,21 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
     "or file operations. Do not claim to have run tools or inspected external resources. "
     "If a user asks you to use a tool, say that tool execution is unavailable through this backend."
 )
-INTERNAL_ACCOUNT_KEYS = ("_account_email", "_account_emails")
+INTERNAL_IMAGE_CONTEXT_KEYS = (
+    "_account_email",
+    "_account_emails",
+    "_tried_account_emails",
+    "_tried_account_ids",
+    "_fallback_count",
+    "_fallback_limit",
+    "_fallback_reason",
+    "_fallback_events",
+    "_reference_image_count",
+)
 
 
 def _copy_account_context(source: dict[str, Any], target: dict[str, Any]) -> None:
-    for key in INTERNAL_ACCOUNT_KEYS:
+    for key in INTERNAL_IMAGE_CONTEXT_KEYS:
         value = source.get(key)
         if value:
             target[key] = value
@@ -70,6 +81,60 @@ def _attach_account_context(target: dict[str, Any], account_emails: list[str]) -
         return
     target["_account_email"] = account_emails[0]
     target["_account_emails"] = list(account_emails)
+
+
+def _merge_output_context(context: dict[str, Any], output: ImageOutput) -> None:
+    for email in output.tried_account_emails:
+        email = str(email or "").strip()
+        if email and email not in context.setdefault("_tried_account_emails", []):
+            context["_tried_account_emails"].append(email)
+    for account_id in output.tried_account_ids:
+        account_id = str(account_id or "").strip()
+        if account_id and account_id not in context.setdefault("_tried_account_ids", []):
+            context["_tried_account_ids"].append(account_id)
+    if output.fallback_count is not None:
+        try:
+            context["_fallback_count"] = max(
+                int(context.get("_fallback_count") or 0),
+                max(0, int(output.fallback_count)),
+            )
+        except (TypeError, ValueError):
+            pass
+    if output.fallback_limit is not None:
+        try:
+            context["_fallback_limit"] = max(
+                int(context.get("_fallback_limit") or 0),
+                max(0, int(output.fallback_limit)),
+            )
+        except (TypeError, ValueError):
+            pass
+    if output.fallback_reason and not context.get("_fallback_reason"):
+        context["_fallback_reason"] = output.fallback_reason
+    for event in output.fallback_events:
+        if not isinstance(event, dict):
+            continue
+        marker = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str)
+        seen = context.setdefault("_fallback_event_markers", set())
+        if marker in seen:
+            continue
+        seen.add(marker)
+        context.setdefault("_fallback_events", []).append(dict(event))
+
+
+def _attach_image_context(target: dict[str, Any], context: dict[str, Any]) -> None:
+    _attach_account_context(target, context.get("_account_emails") or [])
+    for key in (
+        "_tried_account_emails",
+        "_tried_account_ids",
+        "_fallback_limit",
+        "_fallback_reason",
+        "_fallback_events",
+    ):
+        value = context.get(key)
+        if value:
+            target[key] = value
+    if context.get("_fallback_count") is not None:
+        target["_fallback_count"] = context["_fallback_count"]
 
 
 def _image_result_metadata(data: object) -> list[dict[str, Any]]:
@@ -281,6 +346,8 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         quality=quality,
         response_format="b64_json",
         images=encode_images(images) or None,
+        message_as_error=True,
+        fallback_tracker=body.get("fallback_tracker"),
     )))
     result["_reference_image_count"] = len(images)
     response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
@@ -312,6 +379,8 @@ def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         quality=quality,
         response_format="b64_json",
         images=encode_images(images) or None,
+        message_as_error=True,
+        fallback_tracker=body.get("fallback_tracker"),
     ))
     yield from stream_image_chat_completion(image_outputs, model, reference_image_count=len(images))
 
@@ -325,9 +394,10 @@ def stream_image_chat_completion(
     created = int(time.time())
     sent_role = False
     sent_text = ""
-    account_emails: list[str] = []
+    image_context: dict[str, Any] = {"_account_emails": []}
     for output in image_outputs:
-        _append_account_email(account_emails, output.account_email)
+        _append_account_email(image_context["_account_emails"], output.account_email)
+        _merge_output_context(image_context, output)
         content = ""
         image_metadata: list[dict[str, Any]] = []
         if output.kind == "progress":
@@ -351,18 +421,18 @@ def stream_image_chat_completion(
         chunk = completion_chunk(model, delta, None, completion_id, created)
         if image_metadata:
             _attach_image_metadata(chunk, image_metadata)
-        _attach_account_context(chunk, account_emails)
+        _attach_image_context(chunk, image_context)
         if reference_image_count:
             chunk["_reference_image_count"] = reference_image_count
         yield chunk
     if not sent_role:
         chunk = completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
-        _attach_account_context(chunk, account_emails)
+        _attach_image_context(chunk, image_context)
         if reference_image_count:
             chunk["_reference_image_count"] = reference_image_count
         yield chunk
     chunk = completion_chunk(model, {}, "stop", completion_id, created)
-    _attach_account_context(chunk, account_emails)
+    _attach_image_context(chunk, image_context)
     if reference_image_count:
         chunk["_reference_image_count"] = reference_image_count
     yield chunk

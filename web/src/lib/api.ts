@@ -36,6 +36,8 @@ export type Account = {
   fail: number;
   /** 当前图片在途数(正在生成、尚未结束的图片数)。号池空闲时持续 > 0 表示并发槽位泄漏。 */
   image_inflight?: number;
+  last_refresh_error?: string | null;
+  last_refresh_error_at?: string | null;
   last_used_at?: string | null;
   proxy?: string | null;
 };
@@ -190,6 +192,7 @@ export type SettingsConfig = {
   image_max_storage_mb?: number | string;
   image_poll_timeout_secs?: number | string;
   image_account_concurrency?: number | string;
+  image_account_fallback_limit?: number | string;
   image_parallel_generation?: boolean;
   image_resize_max_side?: number | string;
   image_resize_max_pixels?: number | string;
@@ -319,7 +322,7 @@ export type ImageTask = {
   quality?: string;
   created_at: string;
   updated_at: string;
-  conversation_id?: string;
+  can_resume_poll?: boolean;
   data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string; width?: number; height?: number; size?: string }>;
   error?: string;
   progress?: string;
@@ -584,6 +587,7 @@ export async function createImageGenerationTask(
       ...(size ? { size } : {}),
       ...(aspectRatio ? { aspect_ratio: aspectRatio } : {}),
       quality,
+      response_format: "b64_json",
     },
   });
 }
@@ -619,6 +623,7 @@ export async function createImageEditTask(
     formData.append("aspect_ratio", aspectRatio);
   }
   formData.append("quality", quality);
+  formData.append("response_format", "b64_json");
 
   return httpRequest<ImageTask>("/api/image-tasks/edits", {
     method: "POST",
@@ -626,10 +631,13 @@ export async function createImageEditTask(
   });
 }
 
-export async function fetchImageTasks(ids: string[]) {
+export async function fetchImageTasks(ids: string[], includeImageData = true) {
   const params = new URLSearchParams();
   if (ids.length > 0) {
     params.set("ids", ids.join(","));
+  }
+  if (!includeImageData) {
+    params.set("include_image_data", "false");
   }
   params.set("_t", String(Date.now()));
   return httpRequest<ImageTaskListResponse>(`/api/image-tasks?${params.toString()}`);

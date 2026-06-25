@@ -310,8 +310,8 @@ class OpenAIBackendAPI:
         return 0, None, True
 
     def _raise_on_error(self, response: Any, path: str) -> None:
-        if response.status_code == 401:
-            raise InvalidAccessTokenError(f"token invalidated ({path})")
+        if response.status_code in {401, 403}:
+            raise InvalidAccessTokenError(f"token invalidated ({path}, status={response.status_code})")
         raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
 
     def record_proxy_result(self, ok: bool) -> None:
@@ -384,6 +384,14 @@ class OpenAIBackendAPI:
         limits_progress = init_payload.get("limits_progress")
         limits_progress = limits_progress if isinstance(limits_progress, list) else []
         quota, restore_at, image_quota_unknown = self._extract_quota_and_restore_at(limits_progress)
+        deactivated_value = default_account.get("is_deactivated")
+        is_deactivated = (
+            deactivated_value is True
+            or str(deactivated_value).strip().lower() in {"1", "true", "yes"}
+        )
+        if is_deactivated:
+            quota = 0
+            image_quota_unknown = False
         result = {
             "email": me_payload.get("email"),
             "user_id": me_payload.get("id"),
@@ -393,8 +401,12 @@ class OpenAIBackendAPI:
             "limits_progress": limits_progress,
             "default_model_slug": init_payload.get("default_model_slug"),
             "restore_at": restore_at,
-            "status": "正常" if image_quota_unknown and plan_type.lower() != "free" else ("限流" if quota == 0 else "正常"),
+            "status": "异常" if is_deactivated else (
+                "正常" if image_quota_unknown and plan_type.lower() != "free" else ("限流" if quota == 0 else "正常")
+            ),
         }
+        if is_deactivated:
+            result["image_disabled"] = True
         logger.debug({
             "event": "backend_user_info_result",
             "email": result.get("email"),
@@ -2306,7 +2318,21 @@ class OpenAIBackendAPI:
                           "file_ids": file_ids, "sediment_ids": sediment_ids})
             if file_ids or sediment_ids:
                 if not config.image_check_before_hit_enabled:
-                    # 先check再hit 机制关闭：直接返回首次发现的 file_ids
+                    if config.image_settle_enabled:
+                        hit_key = (tuple(file_ids), tuple(sediment_ids))
+                        if last_hit_key == hit_key:
+                            logger.info({"event": "image_poll_hit", "conversation_id": conversation_id, "file_ids": file_ids,
+                                         "sediment_ids": sediment_ids})
+                            return file_ids, sediment_ids
+                        last_hit_key = hit_key
+                        logger.info({"event": "image_poll_hit_pending_settle", "conversation_id": conversation_id,
+                                     "file_ids": file_ids, "sediment_ids": sediment_ids,
+                                     "settle_secs": config.image_settle_secs})
+                        wait = min(config.image_settle_secs, max(0.0, _remaining()))
+                        if wait > 0:
+                            time.sleep(wait)
+                            continue
+                    # 先check再hit和settle均关闭：直接返回首次发现的 file_ids
                     logger.info({"event": "image_poll_hit_no_settle", "conversation_id": conversation_id,
                                  "file_ids": file_ids, "sediment_ids": sediment_ids})
                     return file_ids, sediment_ids

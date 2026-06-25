@@ -27,6 +27,14 @@ INTERNAL_RESPONSE_KEYS = {
     "_access_token",
     "_conversation_id",
     "_reference_image_count",
+    "_tried_account_emails",
+    "_tried_account_ids",
+    "_fallback_count",
+    "_fallback_index",
+    "_fallback_counts_by_index",
+    "_fallback_limit",
+    "_fallback_reason",
+    "_fallback_events",
 }
 
 
@@ -42,6 +50,7 @@ def _exception_log_fields(exc: Exception) -> dict[str, Any]:
         value = getattr(exc, attr, None)
         if value is not None and value != "":
             fields[key] = value
+    fields = _merge_fallback_context(fields, _collect_fallback_context(exc))
     return fields
 
 
@@ -175,6 +184,178 @@ def _dedupe_strings(values: list[str]) -> list[str]:
     return list(dict.fromkeys(str(value).strip() for value in values if str(value or "").strip()))
 
 
+def _string_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)):
+        values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        values = [value]
+    return _dedupe_strings([str(item or "") for item in values])
+
+
+def _safe_nonnegative_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_positive_int(value: object) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _fallback_events(value: object) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        return [dict(value)]
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def _merge_fallback_context(base: dict[str, Any], incoming: dict[str, Any] | None) -> dict[str, Any]:
+    if not incoming:
+        return base
+    merged = dict(base)
+    for key in ("tried_account_emails", "tried_account_ids"):
+        values = _dedupe_strings([*_string_list(merged.get(key)), *_string_list(incoming.get(key))])
+        if values:
+            merged[key] = values
+    incoming_counts = incoming.get("_fallback_counts_by_index")
+    if isinstance(incoming_counts, dict):
+        merged_counts = dict(merged.get("_fallback_counts_by_index") or {})
+        for raw_index, raw_count in incoming_counts.items():
+            index = _safe_positive_int(raw_index)
+            count = _safe_nonnegative_int(raw_count)
+            if index is None or count is None:
+                continue
+            key = str(index)
+            merged_counts[key] = max(_safe_nonnegative_int(merged_counts.get(key)) or 0, count)
+        if merged_counts:
+            existing_count = _safe_nonnegative_int(merged.get("fallback_count")) or 0
+            indexed_count = max(_safe_nonnegative_int(value) or 0 for value in merged_counts.values())
+            merged["_fallback_counts_by_index"] = merged_counts
+            merged["fallback_count"] = max(existing_count, indexed_count)
+    for key in ("fallback_count", "fallback_limit"):
+        incoming_value = _safe_nonnegative_int(incoming.get(key))
+        if incoming_value is None:
+            continue
+        existing_value = _safe_nonnegative_int(merged.get(key))
+        if key == "fallback_count" and merged.get("_fallback_counts_by_index"):
+            merged[key] = max(existing_value or 0, incoming_value)
+        else:
+            merged[key] = max(existing_value or 0, incoming_value)
+    reason = str(incoming.get("fallback_reason") or "").strip()
+    if reason and not str(merged.get("fallback_reason") or "").strip():
+        merged["fallback_reason"] = reason
+    events = [*_fallback_events(merged.get("fallback_events")), *_fallback_events(incoming.get("fallback_events"))]
+    if events:
+        seen: set[str] = set()
+        deduped: list[dict[str, Any]] = []
+        for event in events:
+            marker = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            deduped.append(event)
+        merged["fallback_events"] = deduped
+    return merged
+
+
+def _finalize_fallback_context(context: dict[str, Any]) -> dict[str, Any]:
+    finalized = dict(context)
+    existing_count = _safe_nonnegative_int(finalized.get("fallback_count"))
+    counts = finalized.pop("_fallback_counts_by_index", None)
+    if isinstance(counts, dict) and counts:
+        indexed_count = max(_safe_nonnegative_int(value) or 0 for value in counts.values())
+        finalized["fallback_count"] = max(existing_count or 0, indexed_count)
+    elif existing_count is not None:
+        finalized["fallback_count"] = existing_count
+    finalized.pop("_fallback_index", None)
+    return finalized
+
+
+def _collect_fallback_context(value: object) -> dict[str, Any]:
+    context: dict[str, Any] = {}
+
+    def merge_value(key: str, item: object) -> None:
+        nonlocal context
+        if key in {"_tried_account_emails", "tried_account_emails"}:
+            context = _merge_fallback_context(context, {"tried_account_emails": _string_list(item)})
+            return
+        if key in {"_tried_account_ids", "tried_account_ids"}:
+            context = _merge_fallback_context(context, {"tried_account_ids": _string_list(item)})
+            return
+        if key in {"_fallback_count", "fallback_count"}:
+            context = _merge_fallback_context(context, {"fallback_count": _safe_nonnegative_int(item)})
+            return
+        if key == "_fallback_counts_by_index" and isinstance(item, dict):
+            context = _merge_fallback_context(context, {"_fallback_counts_by_index": item})
+            return
+        if key in {"_fallback_limit", "fallback_limit"}:
+            context = _merge_fallback_context(context, {"fallback_limit": _safe_nonnegative_int(item)})
+            return
+        if key in {"_fallback_reason", "fallback_reason"}:
+            context = _merge_fallback_context(context, {"fallback_reason": str(item or "").strip()})
+            return
+        if key in {"_fallback_events", "fallback_events"}:
+            context = _merge_fallback_context(context, {"fallback_events": _fallback_events(item)})
+
+    def visit(item: object) -> None:
+        if isinstance(item, dict):
+            fallback_count = _safe_nonnegative_int(item.get("_fallback_count", item.get("fallback_count")))
+            fallback_index = _safe_positive_int(item.get("_fallback_index", item.get("index")))
+            if fallback_count is not None and fallback_index is not None:
+                merge_value("_fallback_counts_by_index", {str(fallback_index): fallback_count})
+            for key, nested in item.items():
+                if key in {
+                    "_tried_account_emails",
+                    "tried_account_emails",
+                    "_tried_account_ids",
+                    "tried_account_ids",
+                    "_fallback_count",
+                    "_fallback_index",
+                    "_fallback_counts_by_index",
+                    "fallback_count",
+                    "_fallback_limit",
+                    "fallback_limit",
+                    "_fallback_reason",
+                    "fallback_reason",
+                    "_fallback_events",
+                    "fallback_events",
+                }:
+                    merge_value(key, nested)
+                else:
+                    visit(nested)
+            return
+        if isinstance(item, list):
+            for nested in item:
+                visit(nested)
+            return
+        for attr in (
+            "tried_account_emails",
+            "tried_account_ids",
+            "fallback_count",
+            "fallback_index",
+            "fallback_limit",
+            "fallback_reason",
+            "fallback_events",
+        ):
+            if hasattr(item, attr):
+                merge_value(attr, getattr(item, attr, None))
+
+    visit(value)
+    return context
+
+
 def _collect_conversation_ids(value: object) -> list[str]:
     ids: list[str] = []
     if isinstance(value, dict):
@@ -296,12 +477,7 @@ class LoggedCall:
 
         if isinstance(result, dict):
             self.log("调用完成", result)
-            response = dict(result)
-            response.pop("_account_email", None)
-            response.pop("_account_emails", None)
-            response.pop("_access_token", None)
-            response.pop("_reference_image_count", None)
-            return response
+            return _strip_internal_response_fields(dict(result))
 
         sender = anthropic_sse_stream if sse == "anthropic" else sse_json_stream
         try:
@@ -331,6 +507,7 @@ class LoggedCall:
         account_emails: list[str] = []
         conversation_ids: list[str] = []
         reference_counts: list[int] = []
+        fallback_context: dict[str, Any] = {}
         failed = False
         try:
             for item in items:
@@ -338,10 +515,11 @@ class LoggedCall:
                 account_emails.extend(_collect_account_emails(item))
                 conversation_ids.extend(_collect_conversation_ids(item))
                 reference_counts.extend(_collect_reference_image_counts(item))
+                fallback_context = _merge_fallback_context(fallback_context, _collect_fallback_context(item))
                 yield _strip_internal_response_fields(item)
         except Exception as exc:
             failed = True
-            extra = _exception_log_fields(exc)
+            extra = _finalize_fallback_context(_merge_fallback_context(dict(fallback_context), _exception_log_fields(exc)))
             if reference_counts:
                 extra["reference_image_count"] = max(reference_counts)
             self.log(
@@ -361,11 +539,13 @@ class LoggedCall:
             raise
         finally:
             if not failed:
-                extra = {"reference_image_count": max(reference_counts)} if reference_counts else None
+                extra = _finalize_fallback_context(fallback_context)
+                if reference_counts:
+                    extra["reference_image_count"] = max(reference_counts)
                 self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
                          account_emails=account_emails,
                          conversation_id=conversation_ids[0] if conversation_ids else "",
-                         extra=extra)
+                         extra=extra or None)
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
             urls: list[str] | None = None, account_email: str = "", account_emails: list[str] | None = None,
@@ -408,4 +588,6 @@ class LoggedCall:
         reference_counts = _collect_reference_image_counts(result)
         if reference_counts:
             detail["reference_image_count"] = max(reference_counts)
+        detail = _merge_fallback_context(detail, _collect_fallback_context(result))
+        detail = _finalize_fallback_context(detail)
         log_service.add(LOG_TYPE_CALL, f"{self.summary}{suffix}", detail)

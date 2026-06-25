@@ -6,6 +6,7 @@ import secrets
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Condition, Lock, Thread
@@ -25,8 +26,6 @@ from utils.log import logger
 class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
-    _NEW_ACCOUNT_INVALID_GRACE_SECONDS = 10 * 60
-    _INVALID_CONFIRM_SECONDS = 30
     _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 24 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_SECONDS = 3 * 24 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS = 6 * 60 * 60
@@ -133,6 +132,8 @@ class AccountService:
     def _is_image_account_available(account: dict) -> bool:
         if not isinstance(account, dict):
             return False
+        if bool(account.get("image_disabled")):
+            return False
         if account.get("status") in {"禁用", "限流", "异常"}:
             return False
         if bool(account.get("image_quota_unknown")):
@@ -222,6 +223,7 @@ class AccountService:
         normalized["status"] = normalized.get("status") or "正常"
         normalized["quota"] = max(0, int(normalized.get("quota") if normalized.get("quota") is not None else 0))
         normalized["image_quota_unknown"] = bool(normalized.get("image_quota_unknown"))
+        normalized["image_disabled"] = bool(normalized.get("image_disabled"))
         if (
             normalized["status"] == "正常"
             and not normalized["image_quota_unknown"]
@@ -325,6 +327,7 @@ class AccountService:
             "status": account.get("status"),
             "quota": max(0, cls._log_int(account.get("quota"))),
             "image_quota_unknown": bool(account.get("image_quota_unknown")),
+            "image_disabled": bool(account.get("image_disabled")),
             "success": cls._log_int(account.get("success")),
             "fail": cls._log_int(account.get("fail")),
         }
@@ -376,7 +379,7 @@ class AccountService:
         if before_state and after_state:
             changes = {
                 key: {"from": before_state.get(key), "to": after_state.get(key)}
-                for key in ("status", "quota", "image_quota_unknown", "success", "fail")
+                for key in ("status", "quota", "image_quota_unknown", "image_disabled", "success", "fail")
                 if before_state.get(key) != after_state.get(key)
             }
             if changes:
@@ -481,7 +484,10 @@ class AccountService:
                 },
                 timeout=60,
             )
-            data = response.json() if response.text else {}
+            try:
+                data = response.json() if response.text else {}
+            except Exception:
+                data = {}
             if response.status_code != 200 or not isinstance(data, dict) or not data.get("access_token"):
                 detail = ""
                 if isinstance(data, dict):
@@ -496,16 +502,42 @@ class AccountService:
         finally:
             session.close()
 
+    @staticmethod
+    def _is_token_refresh_invalid_error(error: str) -> bool:
+        text = str(error or "").lower()
+        if not text:
+            return False
+        invalid_markers = (
+            "invalid_grant",
+            "invalid_refresh_token",
+            "invalid refresh token",
+            "refresh_token_invalid",
+            "refresh token expired",
+            "refresh_token_expired",
+            "expired refresh token",
+            "expired_refresh_token",
+            "token_revoked",
+            "token revoked",
+            "revoked token",
+            "app_session_terminated",
+            "session terminated",
+            "account_deactivated",
+            "account deactivated",
+            "oauth_refresh_http_401",
+            "oauth_refresh_http_403",
+        )
+        return any(marker in text for marker in invalid_markers)
+
     def _apply_refreshed_tokens(self, old_access_token: str, token_data: dict, event: str) -> str:
         now = datetime.now(timezone.utc).isoformat()
         with self._image_slot_condition:
             old_token = self._resolve_access_token_locked(old_access_token)
             current = self._accounts.get(old_token)
             if current is None:
-                return old_token
+                return ""
             new_token = str(token_data.get("access_token") or old_token).strip()
             if not new_token:
-                return old_token
+                return ""
 
             next_item = dict(current)
             next_item["access_token"] = new_token
@@ -520,10 +552,11 @@ class AccountService:
             next_item["last_invalid_at"] = None
             next_item["last_refresh_error"] = None
             next_item["last_refresh_error_at"] = None
+            next_item["image_disabled"] = False
 
             account = self._normalize_account(next_item)
             if account is None:
-                return old_token
+                return ""
 
             rotated = new_token != old_token
             if rotated:
@@ -555,19 +588,30 @@ class AccountService:
         with self._token_refresh_lock:
             resolved_token, account = self._get_account_for_token(access_token)
             if not account:
-                return access_token
+                return ""
             active_token = str(account.get("access_token") or resolved_token or access_token)
+            if bool(account.get("image_disabled")) or str(account.get("status") or "").strip() == "异常":
+                self.remove_invalid_token(active_token, f"{event}:account_abnormal", quiet=True)
+                return ""
             if not self._token_needs_refresh(active_token, force=force):
                 return active_token
             refresh_token = str(account.get("refresh_token") or "").strip()
             if not refresh_token:
-                return active_token
+                self.remove_invalid_token(active_token, f"{event}:missing_refresh_token", quiet=True)
+                return ""
             if not force and self._recent_token_refresh_error(account):
+                recent_error = str(account.get("last_token_refresh_error") or "")
+                if self._is_token_refresh_invalid_error(recent_error):
+                    self.remove_invalid_token(active_token, f"{event}:token_refresh_invalid", quiet=True)
+                    return ""
                 return active_token
             try:
                 token_data = self._request_access_token_refresh(refresh_token, account)
             except Exception as exc:
                 error_str = str(exc or "")
+                if self._is_token_refresh_invalid_error(error_str):
+                    self.remove_invalid_token(active_token, f"{event}:token_refresh_invalid", quiet=True)
+                    return ""
                 self._record_token_refresh_error(active_token, event, error_str)
                 # 如果是 app_session_terminated 错误，尝试密码重新登录
                 if "app_session_terminated" in error_str.lower():
@@ -644,11 +688,9 @@ class AccountService:
                     )
                     detail_error = result["detail"].get("error", {})
                     if isinstance(detail_error, dict) and detail_error.get("code") == "account_deactivated":
-                        # 账号已删除/停用 → 标记为禁用
-                        self.update_account(access_token, {"status": "禁用", "quota": 0}, quiet=True)
-                        account = self.get_account(access_token) or {}
+                        self.remove_invalid_token(access_token, f"{event}:account_deactivated", quiet=True)
                         self._add_account_log(
-                            "账号已停用-标记禁用",
+                            "账号已停用-自动移除",
                             {
                                 "event_type": "password_relogin_account_deactivated",
                                 "source": event,
@@ -658,12 +700,11 @@ class AccountService:
                             },
                         )
                         if progress_id:
-                            self.update_relogin_progress(progress_id, access_token, "禁用")
+                            self.update_relogin_progress(progress_id, access_token, "已删除")
                     else:
-                        # 永久故障：将账号标记为异常（或自动移除）
                         self.remove_invalid_token(access_token, f"{event}:password_relogin_failed", quiet=True)
                         if progress_id:
-                            self.update_relogin_progress(progress_id, access_token, "异常", error_type)
+                            self.update_relogin_progress(progress_id, access_token, "已删除", error_type)
                 else:
                     self._add_account_log(
                         "更新账号",
@@ -677,10 +718,9 @@ class AccountService:
                             "detail": result.get("detail", {}),
                         },
                     )
-                    # 永久故障：将账号标记为异常（或自动移除）
                     self.remove_invalid_token(access_token, f"{event}:password_relogin_failed", quiet=True)
                     if progress_id:
-                        self.update_relogin_progress(progress_id, access_token, "异常", error_type)
+                        self.update_relogin_progress(progress_id, access_token, "已删除", error_type)
         except Exception as exc:
             self._add_account_log(
                 "更新账号",
@@ -693,10 +733,9 @@ class AccountService:
                     "error": str(exc),
                 },
             )
-            # 将账号标记为异常（或自动移除）
             self.remove_invalid_token(access_token, f"{event}:password_relogin_exception", quiet=True)
             if progress_id:
-                self.update_relogin_progress(progress_id, access_token, "异常", str(exc))
+                self.update_relogin_progress(progress_id, access_token, "已删除", str(exc))
 
     def _login_with_password(self, email: str, password: str, account: dict | None = None) -> dict:
         """通过邮箱+密码登录，返回 {access_token, refresh_token, id_token, ...}"""
@@ -983,6 +1022,12 @@ class AccountService:
         for access_token in access_tokens:
             before = self.resolve_access_token(access_token)
             after = self.refresh_access_token(before, force=True, event="refresh_token_keepalive")
+            if not after:
+                errors.append({
+                    "token": anonymize_token(before),
+                    "error": "token invalid, account removed",
+                })
+                continue
             account = self.get_account(after)
             if account and str(account.get("last_token_refresh_error") or "").strip():
                 errors.append({
@@ -1108,6 +1153,7 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
             excluded_tokens: set[str] | None = None,
+            on_candidate_failed: Callable[[str, Exception], None] | None = None,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -1133,8 +1179,10 @@ class AccountService:
             attempted_tokens.add(access_token)
             try:
                 account = self.fetch_remote_info(access_token, "get_available_access_token")
-            except Exception:
+            except Exception as exc:
                 self.release_image_slot(access_token)
+                if on_candidate_failed is not None:
+                    on_candidate_failed(access_token, exc)
                 continue
             # fetch_remote_info 内部可能因 token rotation 导致 access_token 变化，
             # 把新 token 也加入排除列表，防止重复尝试
@@ -1149,6 +1197,8 @@ class AccountService:
             ):
                 return str((account or {}).get("access_token") or access_token)
             self.release_image_slot(access_token)
+            if on_candidate_failed is not None:
+                on_candidate_failed(access_token, RuntimeError("image account preflight returned unavailable account"))
         raise RuntimeError(
             f"no available {plan_type or source_type or ''} image quota (tried {len(attempted_tokens)} tokens)".replace("  ", " ").strip()
             if plan_type or source_type else f"no available image quota (tried {len(attempted_tokens)} tokens)"
@@ -1156,19 +1206,23 @@ class AccountService:
 
     def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
         excluded = set(excluded_tokens or set())
-        with self._lock:
-            candidates = [
-                token
-                for account in self._accounts.values()
-                if account.get("status") not in {"禁用", "异常"}
-                   and (token := account.get("access_token") or "")
-                   and token not in excluded
-            ]
-            if not candidates:
-                return ""
-            access_token = candidates[self._index % len(candidates)]
-            self._index += 1
-        return self.refresh_access_token(access_token, event="get_text_access_token") or access_token
+        while True:
+            with self._lock:
+                candidates = [
+                    token
+                    for account in self._accounts.values()
+                    if account.get("status") not in {"禁用", "异常"}
+                       and (token := account.get("access_token") or "")
+                       and token not in excluded
+                ]
+                if not candidates:
+                    return ""
+                access_token = candidates[self._index % len(candidates)]
+                self._index += 1
+            refreshed_token = self.refresh_access_token(access_token, event="get_text_access_token")
+            if refreshed_token:
+                return refreshed_token
+            excluded.add(access_token)
 
     def mark_text_used(self, access_token: str) -> None:
         if not access_token:
@@ -1197,11 +1251,17 @@ class AccountService:
                     "token": anonymize_token(access_token),
                 },
             )
-        elif access_token:
-            self.update_account(access_token, {"status": "异常", "quota": 0}, quiet=quiet)
         return removed
 
-    def remove_abnormal_image_timeout_account(self, access_token: str, event: str, error: str = "") -> bool:
+    def remove_abnormal_image_account(
+            self,
+            access_token: str,
+            event: str,
+            error: str = "",
+            *,
+            log_summary: str = "自动移除异常生图账号",
+            log_event_type: str = "account_auto_removed_image_abnormal",
+    ) -> bool:
         if not access_token:
             return False
         with self._lock:
@@ -1232,9 +1292,9 @@ class AccountService:
             self._save_accounts()
             self._image_slot_condition.notify_all()
             self._add_account_log(
-                "自动移除生图超时账号",
+                log_summary,
                 self._account_log_detail(
-                    "account_auto_removed_image_timeout",
+                    log_event_type,
                     access_token,
                     before=current,
                     after=after,
@@ -1243,6 +1303,15 @@ class AccountService:
                 ),
             )
             return True
+
+    def remove_abnormal_image_timeout_account(self, access_token: str, event: str, error: str = "") -> bool:
+        return self.remove_abnormal_image_account(
+            access_token,
+            event,
+            error,
+            log_summary="自动移除生图超时账号",
+            log_event_type="account_auto_removed_image_timeout",
+        )
 
     def get_account(self, access_token: str) -> dict | None:
         if not access_token:
@@ -1364,7 +1433,8 @@ class AccountService:
                     except (TypeError, ValueError):
                         explicit_quota_zero = True
                 explicit_unusable = (
-                    status == "异常"
+                    bool(incoming.get("image_disabled"))
+                    or status == "异常"
                     or status == "限流"
                     or (explicit_quota_zero and not bool(incoming.get("image_quota_unknown")))
                 )
@@ -1380,7 +1450,11 @@ class AccountService:
                 )
                 if account is not None:
                     normalized_status = str(account.get("status") or "").strip()
-                    if explicit_unusable and normalized_status == "异常":
+                    if explicit_unusable and bool(account.get("image_disabled")):
+                        auto_removed.append((access_token, before_account, account, "account_auto_removed_image_abnormal", "自动移除异常生图账号"))
+                        self._accounts.pop(access_token, None)
+                        self._image_inflight.pop(access_token, None)
+                    elif explicit_unusable and normalized_status == "异常":
                         auto_removed.append((access_token, before_account, account, "account_auto_removed_abnormal", "自动移除异常账号"))
                         self._accounts.pop(access_token, None)
                         self._image_inflight.pop(access_token, None)
@@ -1446,6 +1520,8 @@ class AccountService:
 
     @staticmethod
     def _is_rate_limited_account(account: dict) -> bool:
+        if bool(account.get("image_disabled")):
+            return False
         if account.get("status") == "限流":
             return True
         if bool(account.get("image_quota_unknown")):
@@ -1458,7 +1534,10 @@ class AccountService:
 
     def _auto_remove_account_if_needed_locked(self, access_token: str, before: dict, after: dict) -> bool:
         status = str(after.get("status") or "").strip()
-        if status == "异常":
+        if bool(after.get("image_disabled")):
+            event_type = "account_auto_removed_image_abnormal"
+            summary = "自动移除异常生图账号"
+        elif status == "异常":
             event_type = "account_auto_removed_abnormal"
             summary = "自动移除异常账号"
         elif self._is_rate_limited_account(after):
@@ -1491,7 +1570,9 @@ class AccountService:
             for token, account in self._accounts.items():
                 snapshot = dict(account)
                 status = str(snapshot.get("status") or "").strip()
-                if status == "异常":
+                if bool(snapshot.get("image_disabled")):
+                    removed_items.append((token, snapshot, "account_auto_removed_image_abnormal", "自动移除异常生图账号"))
+                elif status == "异常":
                     removed_items.append((token, snapshot, "account_auto_removed_abnormal", "自动移除异常账号"))
                 elif self._is_rate_limited_account(snapshot):
                     removed_items.append((token, snapshot, "account_auto_removed_rate_limited", "自动移除限流账号"))
@@ -1529,15 +1610,17 @@ class AccountService:
 
     def cleanup_abnormal_accounts(self, event: str = "account_auto_refresh") -> dict[str, Any]:
         with self._lock:
-            removed_items = [
-                (token, dict(account))
-                for token, account in self._accounts.items()
-                if str(account.get("status") or "").strip() == "异常"
-            ]
+            removed_items: list[tuple[str, dict, str, str]] = []
+            for token, account in self._accounts.items():
+                snapshot = dict(account)
+                if bool(snapshot.get("image_disabled")):
+                    removed_items.append((token, snapshot, "account_auto_removed_image_abnormal", "自动移除异常生图账号"))
+                elif str(snapshot.get("status") or "").strip() == "异常":
+                    removed_items.append((token, snapshot, "account_auto_removed_abnormal", "自动移除异常账号"))
             if not removed_items:
                 return {"removed": 0, "items": [dict(item) for item in self._accounts.values()]}
 
-            target_tokens = {token for token, _account in removed_items}
+            target_tokens = {token for token, _account, _event_type, _summary in removed_items}
             for token in target_tokens:
                 self._accounts.pop(token, None)
                 self._image_inflight.pop(token, None)
@@ -1553,11 +1636,11 @@ class AccountService:
             self._save_accounts()
             self._image_slot_condition.notify_all()
 
-            for token, account in removed_items:
+            for token, account, event_type, summary in removed_items:
                 self._add_account_log(
-                    "自动移除异常账号",
+                    summary,
                     self._account_log_detail(
-                        "account_auto_removed_abnormal",
+                        event_type,
                         token,
                         before=account,
                         after=None,
@@ -1610,20 +1693,6 @@ class AccountService:
             if account is not None:
                 self._accounts[access_token] = account
 
-    def _should_defer_invalid_token(self, account: dict | None, now: datetime) -> bool:
-        if not isinstance(account, dict):
-            return False
-        created_at = self._parse_time(account.get("created_at"))
-        if created_at is not None and (now - created_at).total_seconds() < self._NEW_ACCOUNT_INVALID_GRACE_SECONDS:
-            return True
-        last_invalid_at = self._parse_time(account.get("last_invalid_at"))
-        invalid_count = int(account.get("invalid_count") or 0)
-        if invalid_count <= 1:
-            return True
-        if last_invalid_at is not None and (now - last_invalid_at).total_seconds() < self._INVALID_CONFIRM_SECONDS:
-            return True
-        return False
-
     def _record_invalid_token_seen(
         self,
         access_token: str,
@@ -1631,35 +1700,6 @@ class AccountService:
         error: str,
         defer_invalid_removal: bool = True,
     ) -> bool:
-        now = datetime.now(timezone.utc)
-        with self._lock:
-            access_token = self._resolve_access_token_locked(access_token)
-            current = self._accounts.get(access_token)
-            if current is None:
-                return True
-            should_defer = defer_invalid_removal and self._should_defer_invalid_token(current, now)
-            next_item = dict(current)
-            next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
-            next_item["last_invalid_at"] = now.isoformat()
-            next_item["last_refresh_error"] = str(error or "invalid access token")
-            next_item["last_refresh_error_at"] = now.isoformat()
-            account = self._normalize_account(next_item)
-            if account is not None:
-                self._accounts[access_token] = account
-                self._save_accounts()
-            if should_defer:
-                self._add_account_log(
-                    "暂缓标记异常账号",
-                    self._account_log_detail(
-                        "invalid_token_deferred",
-                        access_token,
-                        before=current,
-                        after=account,
-                        source=event,
-                        error=str(error or ""),
-                    ),
-                )
-                return False
         return True
 
     def mark_image_result(self, access_token: str, success: bool) -> dict | None:
@@ -1715,7 +1755,9 @@ class AccountService:
 
         from services.proxy_service import is_proxy_transport_error, record_backend_proxy_result
 
-        active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
+        active_token = self.refresh_access_token(access_token, event=f"{event}:preflight")
+        if not active_token:
+            raise RuntimeError("access token removed because token refresh failed")
         backend = None
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
@@ -1763,6 +1805,8 @@ class AccountService:
                 record_backend_proxy_result(backend, not is_proxy_transport_error(error))
             raise
         self._record_refresh_success(active_token)
+        result = dict(result)
+        result.setdefault("image_disabled", False)
         return self.update_account(active_token, result)
 
     # ---- 刷新进度追踪 ----
@@ -1946,11 +1990,7 @@ class AccountService:
         else:
             executor.shutdown(wait=True, cancel_futures=True)
 
-        cleanup = (
-            {"removed": 0, "items": self.list_accounts()}
-            if defer_invalid_removal
-            else self.cleanup_unusable_accounts("refresh_accounts")
-        )
+        cleanup = self.cleanup_unusable_accounts("refresh_accounts")
         removed_unusable = int(cleanup.get("removed") or 0)
         if progress_id and removed_unusable:
             with self._refresh_progress_lock:

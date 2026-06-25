@@ -53,6 +53,14 @@ def _parse_count(value: object) -> int:
     return parse_image_count(value)
 
 
+def _parse_edit_count(value: object) -> int:
+    """图片编辑当前只支持单张输出，避免任务链路和前端只取首图时静默丢图。"""
+    count = parse_image_count(value)
+    if count != 1:
+        raise HTTPException(status_code=400, detail={"error": "n must be 1 for image edits"})
+    return count
+
+
 def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
     """构造图片编辑载荷：从表单或 JSON 字段提取通用参数。"""
     prompt = _clean(fields.get("prompt"))
@@ -61,7 +69,7 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
     payload = {
         "prompt": prompt,
         "model": _clean(fields.get("model"), "gpt-image-2"),
-        "n": _parse_count(fields.get("n")),
+        "n": _parse_edit_count(fields.get("n")),
         "size": parse_image_size(fields.get("size"), fields.get("aspect_ratio")),
         "aspect_ratio": _clean(fields.get("aspect_ratio")),
         "quality": _clean(fields.get("quality"), "auto"),

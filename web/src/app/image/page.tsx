@@ -456,7 +456,18 @@ async function syncConversationImageTasks(items: ImageConversation[]) {
 
   let taskList: Awaited<ReturnType<typeof fetchImageTasks>>;
   try {
-    taskList = await fetchImageTasks(taskIds);
+    taskList = await fetchImageTasks(taskIds, false);
+    const successIds = taskList.items
+      .filter((task) => task.status === "success" && !task.data?.some((item) => item.b64_json || item.url))
+      .map((task) => task.id);
+    if (successIds.length > 0) {
+      const fullTaskList = await fetchImageTasks(successIds);
+      const fullTaskMap = new Map(fullTaskList.items.map((task) => [task.id, task]));
+      taskList = {
+        ...taskList,
+        items: taskList.items.map((task) => fullTaskMap.get(task.id) || task),
+      };
+    }
   } catch {
     return items;
   }
@@ -1447,21 +1458,31 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
           await sleep(2000);
           try {
-            const taskList = await fetchImageTasks(loadingTaskIds);
+            let taskList = await fetchImageTasks(loadingTaskIds, false);
+            const successIds = taskList.items
+              .filter((task) => task.status === "success" && !task.data?.some((item) => item.b64_json || item.url))
+              .map((task) => task.id);
+            if (successIds.length > 0) {
+              const fullTaskList = await fetchImageTasks(successIds);
+              const fullTaskMap = new Map(fullTaskList.items.map((task) => [task.id, task]));
+              taskList = {
+                ...taskList,
+                items: taskList.items.map((task) => fullTaskMap.get(task.id) || task),
+              };
+            }
             consecutiveErrors = 0;
             if (taskList.items.length > 0) {
               // 检测是否有超时错误且需要显示重试按钮
               const timeoutTask = taskList.items.find(
                 (task) =>
                   task.status === "error" &&
-                  task.error?.includes("超时") &&
-                  task.conversation_id &&
+                  task.can_resume_poll &&
                   !retryingTaskIdsRef.has(task.id),
               );
-              if (timeoutTask && timeoutTask.conversation_id) {
+              if (timeoutTask && timeoutTask.can_resume_poll) {
                 retryingTaskIdsRef.add(timeoutTask.id);
                 setTimeoutRetry({
-                  conversationId: timeoutTask.conversation_id,
+                  conversationId,
                   taskId: timeoutTask.id,
                   taskError: timeoutTask.error || "生图超时",
                 });

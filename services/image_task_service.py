@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import threading
 import time
@@ -22,6 +23,8 @@ TASK_STATUS_ERROR = "error"
 TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
 MAX_TASK_GROUP_WORKERS = 20
+TASK_RESULT_DIR = DATA_DIR / "image_task_results"
+TASK_RESULT_PATH_KEY = "_b64_path"
 
 
 def _default_generation_handler(payload: dict[str, Any]) -> dict[str, Any]:
@@ -34,6 +37,21 @@ def _default_edit_handler(payload: dict[str, Any]) -> dict[str, Any]:
     from services.protocol import openai_v1_image_edit
 
     return openai_v1_image_edit.handle(payload)
+
+
+def _public_image_error(message: object) -> str:
+    from services.protocol.conversation import public_image_error_message
+
+    return public_image_error_message(str(message or ""))
+
+
+def _normalize_fallback_limit(value: object = None) -> int:
+    if value is None:
+        value = config.image_account_fallback_limit
+    try:
+        return min(1, max(0, int(value)))
+    except (TypeError, ValueError):
+        return 1
 
 
 def _now_iso() -> str:
@@ -56,6 +74,95 @@ def _timestamp(value: object) -> float:
 
 def _clean(value: object, default: str = "") -> str:
     return str(value or default).strip()
+
+
+def _normalize_response_format(value: object, default: str = "b64_json") -> str:
+    text = _clean(value, default).lower()
+    return "url" if text == "url" else "b64_json"
+
+
+def _task_result_rel(key: str, index: int) -> str:
+    digest = hashlib.sha256(_clean(key).encode("utf-8", errors="ignore")).hexdigest()
+    return f"{digest}_{max(0, int(index))}.bin"
+
+
+def _task_result_path(rel: object, result_dir: Path = TASK_RESULT_DIR) -> Path:
+    name = Path(_clean(rel)).name
+    return result_dir / name
+
+
+def _task_data_result_paths(data: object) -> set[str]:
+    paths: set[str] = set()
+    if not isinstance(data, list):
+        return paths
+    for item in data:
+        if isinstance(item, dict):
+            rel = _clean(item.get(TASK_RESULT_PATH_KEY))
+            if rel:
+                paths.add(rel)
+    return paths
+
+
+def _delete_task_result_files(data: object, keep_paths: set[str] | None = None, result_dir: Path = TASK_RESULT_DIR) -> None:
+    keep = keep_paths or set()
+    for rel in _task_data_result_paths(data):
+        if rel in keep:
+            continue
+        try:
+            _task_result_path(rel, result_dir).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _store_task_data(key: str, data: list[Any], result_dir: Path = TASK_RESULT_DIR) -> list[Any]:
+    stored: list[Any] = []
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            stored.append(item)
+            continue
+        next_item = dict(item)
+        b64_json = _clean(next_item.get("b64_json"))
+        if b64_json:
+            result_dir.mkdir(parents=True, exist_ok=True)
+            rel = _clean(next_item.get(TASK_RESULT_PATH_KEY)) or _task_result_rel(key, index)
+            _task_result_path(rel, result_dir).write_bytes(base64.b64decode(b64_json))
+            next_item.pop("b64_json", None)
+            next_item[TASK_RESULT_PATH_KEY] = rel
+        stored.append(next_item)
+    return stored
+
+
+def _hydrate_task_data(
+    data: object,
+    *,
+    include_image_data: bool,
+    result_dir: Path = TASK_RESULT_DIR,
+) -> tuple[list[Any] | None, bool]:
+    if not isinstance(data, list):
+        return None, False
+    hydrated: list[Any] = []
+    missing_result_file = False
+    for item in data:
+        if not isinstance(item, dict):
+            hydrated.append(item)
+            continue
+        next_item = {
+            key: value
+            for key, value in item.items()
+            if key != TASK_RESULT_PATH_KEY
+        }
+        if include_image_data:
+            b64_json = _clean(item.get("b64_json"))
+            rel = _clean(item.get(TASK_RESULT_PATH_KEY))
+            if b64_json:
+                next_item["b64_json"] = b64_json
+            elif rel:
+                try:
+                    next_item["b64_json"] = base64.b64encode(_task_result_path(rel, result_dir).read_bytes()).decode("ascii")
+                except Exception:
+                    missing_result_file = True
+        hydrated.append(next_item)
+    return hydrated, missing_result_file
 
 
 def _owner_id(identity: dict[str, object]) -> str:
@@ -87,7 +194,7 @@ def _collect_account_emails(value: object) -> list[str]:
         for key, item in value.items():
             if key in {"_account_email", "account_email"} and isinstance(item, str) and item.strip():
                 emails.append(item.strip())
-            elif key in {"_account_emails", "account_emails"} and isinstance(item, list):
+            elif key in {"_account_emails", "account_emails", "tried_account_emails"} and isinstance(item, list):
                 emails.extend(str(email).strip() for email in item if str(email or "").strip())
             else:
                 emails.extend(_collect_account_emails(item))
@@ -95,6 +202,20 @@ def _collect_account_emails(value: object) -> list[str]:
         for item in value:
             emails.extend(_collect_account_emails(item))
     return list(dict.fromkeys(emails))
+
+
+def _collect_clean_strings(value: object) -> list[str]:
+    items: list[str] = []
+    if isinstance(value, list):
+        for item in value:
+            text = _clean(item)
+            if text:
+                items.append(text)
+    else:
+        text = _clean(value)
+        if text:
+            items.append(text)
+    return list(dict.fromkeys(items))
 
 
 def _reference_image_count(payload: dict[str, Any], result: object = None) -> int:
@@ -244,25 +365,30 @@ def _openai_backend_api_class() -> type:
     return OpenAIBackendAPI
 
 
-def _resolve_account_token(account_id: str = "", account_email: str = "") -> str:
+def _find_account_for_resume(account_id: str = "", account_email: str = "") -> dict[str, Any] | None:
     normalized_id = _clean(account_id)
     normalized_email = _clean(account_email).lower()
     if not normalized_id and not normalized_email:
-        return ""
+        return None
     for account in account_service.list_accounts():
         token = _clean(account.get("access_token"))
         if not token:
             continue
         candidate_id = _clean(account.get("account_id") or account.get("user_id"))
         if normalized_id and candidate_id == normalized_id:
-            return account_service.refresh_access_token(token, event="image_resume_poll") or token
+            return dict(account)
         candidate_email = _clean(account.get("email")).lower()
         if normalized_email and candidate_email == normalized_email:
-            return account_service.refresh_access_token(token, event="image_resume_poll") or token
-    return ""
+            return dict(account)
+    return None
 
 
-def _public_task(task: dict[str, Any]) -> dict[str, Any]:
+def _public_task(
+    task: dict[str, Any],
+    *,
+    include_image_data: bool = True,
+    result_dir: Path = TASK_RESULT_DIR,
+) -> dict[str, Any]:
     item = {
         "id": task.get("id"),
         "status": task.get("status"),
@@ -274,14 +400,28 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
     }
-    if task.get("conversation_id"):
-        item["conversation_id"] = task.get("conversation_id")
+    if task.get("conversation_id") and task.get("status") == TASK_STATUS_ERROR:
+        error_message = _clean(task.get("error"))
+        error_text = error_message.lower()
+        item["can_resume_poll"] = (
+            "瓒呮椂" in error_message
+            or "timeout" in error_text
+            or "timed out" in error_text
+        )
     if task.get("data") is not None:
-        item["data"] = task.get("data")
+        data, missing_result_file = _hydrate_task_data(
+            task.get("data"),
+            include_image_data=include_image_data,
+            result_dir=result_dir,
+        )
+        item["data"] = data
+        if missing_result_file:
+            item["status"] = TASK_STATUS_ERROR
+            item["error"] = "图片任务结果文件缺失，请重新生成"
     if task.get("usage") is not None:
         item["usage"] = task.get("usage")
     if task.get("error"):
-        item["error"] = task.get("error")
+        item["error"] = _public_image_error(task.get("error"))
     if task.get("progress"):
         item["progress"] = task.get("progress")
     if task.get("duration_ms") is not None:
@@ -308,8 +448,10 @@ class ImageTaskService:
         generation_handler: Callable[[dict[str, Any]], dict[str, Any]] = _default_generation_handler,
         edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = _default_edit_handler,
         retention_days_getter: Callable[[], int] | None = None,
+        result_dir: Path | None = None,
     ):
         self.path = path
+        self.result_dir = result_dir or TASK_RESULT_DIR
         self.generation_handler = generation_handler
         self.edit_handler = edit_handler
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
@@ -321,7 +463,8 @@ class ImageTaskService:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._tasks = self._load_locked()
-            changed = self._recover_unfinished_locked()
+            changed = self._compact_embedded_task_data_locked()
+            changed = self._recover_unfinished_locked() or changed
             changed = self._cleanup_locked() or changed
             if changed:
                 self._save_locked()
@@ -337,6 +480,7 @@ class ImageTaskService:
         size: str | None,
         aspect_ratio: str | None = None,
         quality: str = "auto",
+        response_format: str = "b64_json",
         base_url: str = "",
     ) -> dict[str, Any]:
         normalized_size = parse_image_size(size, aspect_ratio)
@@ -346,7 +490,7 @@ class ImageTaskService:
             "n": 1,
             "size": normalized_size,
             "quality": quality,
-            "response_format": "url",
+            "response_format": _normalize_response_format(response_format),
             "base_url": base_url,
         }
         return self._submit(identity, client_task_id=client_task_id, group_id=group_id, mode="generate", payload=payload)
@@ -362,6 +506,7 @@ class ImageTaskService:
         size: str | None,
         aspect_ratio: str | None = None,
         quality: str = "auto",
+        response_format: str = "b64_json",
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
@@ -375,12 +520,12 @@ class ImageTaskService:
             "n": 1,
             "size": normalized_size,
             "quality": quality,
-            "response_format": "url",
+            "response_format": _normalize_response_format(response_format),
             "base_url": base_url,
         }
         return self._submit(identity, client_task_id=client_task_id, group_id=group_id, mode="edit", payload=payload)
 
-    def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
+    def list_tasks(self, identity: dict[str, object], task_ids: list[str], include_image_data: bool = True) -> dict[str, Any]:
         owner = _owner_id(identity)
         requested_ids = [_clean(task_id) for task_id in task_ids if _clean(task_id)]
         with self._lock:
@@ -393,10 +538,10 @@ class ImageTaskService:
                 if task is None:
                     missing_ids.append(task_id)
                 else:
-                    items.append(_public_task(task))
+                    items.append(_public_task(task, include_image_data=include_image_data, result_dir=self.result_dir))
             if not requested_ids:
                 items = [
-                    _public_task(task)
+                    _public_task(task, include_image_data=include_image_data, result_dir=self.result_dir)
                     for task in self._tasks.values()
                     if task.get("owner_id") == owner
                 ]
@@ -427,7 +572,7 @@ class ImageTaskService:
             if task is not None:
                 if cleaned:
                     self._save_locked()
-                return _public_task(task)
+                return _public_task(task, result_dir=self.result_dir)
             task = {
                 "id": task_id,
                 "owner_id": owner,
@@ -449,7 +594,7 @@ class ImageTaskService:
             self._save_locked()
             self._enqueue_task_locked(group_key, key)
             self._schedule_group_locked(group_key)
-        return _public_task(task)
+        return _public_task(task, result_dir=self.result_dir)
 
     def _enqueue_task_locked(self, group_key: str, key: str) -> None:
         queue = self._group_queues.setdefault(group_key, [])
@@ -514,7 +659,19 @@ class ImageTaskService:
                 self._update_task(key, started_ts=time.time())
             self._update_task(key, progress=step)
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
-        payload_with_progress = {**payload, "progress_callback": progress_callback}
+        with self._lock:
+            runtime = self._runtime.setdefault(key, {"payload": dict(payload), "identity": dict(identity)})
+            fallback_tracker = runtime.get("fallback_tracker")
+            if fallback_tracker is None:
+                from services.protocol.conversation import ImageFallbackTracker
+
+                fallback_tracker = ImageFallbackTracker()
+                runtime["fallback_tracker"] = fallback_tracker
+        payload_with_progress = {
+            **payload,
+            "progress_callback": progress_callback,
+            "fallback_tracker": fallback_tracker,
+        }
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
             result = handler(payload_with_progress)
@@ -523,13 +680,21 @@ class ImageTaskService:
             data = result.get("data")
             account_email = _clean(result.get("_account_email") or result.get("account_email"))
             account_emails = _collect_account_emails(result)
+            tried_account_emails = _collect_clean_strings(result.get("tried_account_emails") or result.get("_tried_account_emails"))
+            tried_account_ids = _collect_clean_strings(result.get("tried_account_ids") or result.get("_tried_account_ids"))
             access_token = _clean(result.get("_access_token"))
             account_ref = _account_ref_from_token(access_token)
             reference_image_count = _reference_image_count(payload, result)
+            fallback_reason = _clean(result.get("fallback_reason") or result.get("_fallback_reason"))
+            fallback_events = result.get("fallback_events") or result.get("_fallback_events")
+            fallback_count = result.get("fallback_count", result.get("_fallback_count"))
+            fallback_limit = result.get("fallback_limit", result.get("_fallback_limit"))
             if not account_email and account_ref.get("account_email"):
                 account_email = account_ref["account_email"]
             if account_email and account_email not in account_emails:
                 account_emails.insert(0, account_email)
+            if account_emails:
+                tried_account_emails = list(dict.fromkeys([*tried_account_emails, *account_emails]))
             if not isinstance(data, list) or not data:
                 upstream = _clean(result.get("message"))
                 if upstream:
@@ -541,12 +706,25 @@ class ImageTaskService:
                     setattr(error, "account_email", account_email)
                 if account_emails:
                     setattr(error, "account_emails", account_emails)
+                    setattr(error, "tried_account_emails", tried_account_emails or account_emails)
+                if tried_account_ids:
+                    setattr(error, "tried_account_ids", tried_account_ids)
+                if fallback_count is not None:
+                    setattr(error, "fallback_count", fallback_count)
+                if fallback_limit is not None:
+                    setattr(error, "fallback_limit", fallback_limit)
+                if fallback_reason:
+                    setattr(error, "fallback_reason", fallback_reason)
+                if isinstance(fallback_events, list) and fallback_events:
+                    setattr(error, "fallback_events", fallback_events)
                 if account_ref.get("account_id"):
                     setattr(error, "account_id", account_ref["account_id"])
                 raise error
             usage = result.get("usage")
             duration_ms = int((time.time() - started) * 1000)
             account_id = account_ref.get("account_id", "")
+            if account_id and account_id not in tried_account_ids:
+                tried_account_ids.append(account_id)
             self._update_task(
                 key,
                 status=TASK_STATUS_SUCCESS,
@@ -558,6 +736,12 @@ class ImageTaskService:
                 account_email=account_email,
                 account_emails=account_emails,
                 account_id=account_id,
+                tried_account_emails=tried_account_emails,
+                tried_account_ids=tried_account_ids,
+                **({"fallback_count": fallback_count} if fallback_count is not None else {}),
+                **({"fallback_limit": fallback_limit} if fallback_limit is not None else {}),
+                **({"fallback_reason": fallback_reason} if fallback_reason else {}),
+                **({"fallback_events": fallback_events} if isinstance(fallback_events, list) and fallback_events else {}),
                 conversation_id="",
                 reference_image_count=reference_image_count,
             )
@@ -571,14 +755,34 @@ class ImageTaskService:
                 urls=_collect_image_urls(data),
                 account_email=account_email,
                 account_emails=account_emails,
+                tried_account_emails=tried_account_emails,
+                tried_account_ids=tried_account_ids,
                 reference_image_count=reference_image_count,
+                fallback_reason=fallback_reason,
+                fallback_count=fallback_count,
+                fallback_limit=fallback_limit,
+                fallback_events=fallback_events,
             )
         except Exception as exc:
             error_message = str(exc) or "image task failed"
             account_email = _clean(getattr(exc, "account_email", ""))
-            account_emails = _collect_account_emails({"account_emails": getattr(exc, "account_emails", []), "account_email": account_email})
+            account_emails = _collect_account_emails({
+                "account_emails": getattr(exc, "account_emails", []),
+                "tried_account_emails": getattr(exc, "tried_account_emails", []),
+                "account_email": account_email,
+            })
+            tried_account_emails = _collect_clean_strings(getattr(exc, "tried_account_emails", []))
+            if account_emails:
+                tried_account_emails = list(dict.fromkeys([*tried_account_emails, *account_emails]))
+            tried_account_ids = _collect_clean_strings(getattr(exc, "tried_account_ids", []))
             account_id = _clean(getattr(exc, "account_id", ""))
+            if account_id and account_id not in tried_account_ids:
+                tried_account_ids.append(account_id)
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
+            fallback_reason = _clean(getattr(exc, "fallback_reason", ""))
+            fallback_events = getattr(exc, "fallback_events", [])
+            fallback_count = getattr(exc, "fallback_count", None)
+            fallback_limit = getattr(exc, "fallback_limit", None)
             reference_image_count = _reference_image_count(payload)
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
@@ -587,7 +791,13 @@ class ImageTaskService:
                               **({"conversation_id": conversation_id} if conversation_id else {}),
                               **({"account_email": account_email} if account_email else {}),
                               **({"account_emails": account_emails} if account_emails else {}),
-                              **({"account_id": account_id} if account_id else {}))
+                              **({"account_id": account_id} if account_id else {}),
+                              **({"tried_account_emails": tried_account_emails} if tried_account_emails else {}),
+                              **({"tried_account_ids": tried_account_ids} if tried_account_ids else {}),
+                              **({"fallback_count": fallback_count} if fallback_count is not None else {}),
+                              **({"fallback_limit": fallback_limit} if fallback_limit is not None else {}),
+                              **({"fallback_reason": fallback_reason} if fallback_reason else {}),
+                              **({"fallback_events": fallback_events} if isinstance(fallback_events, list) and fallback_events else {}))
             self._log_call(
                 identity,
                 mode,
@@ -599,7 +809,13 @@ class ImageTaskService:
                 error=error_message,
                 account_email=account_email,
                 account_emails=account_emails,
+                tried_account_emails=tried_account_emails,
+                tried_account_ids=tried_account_ids,
                 reference_image_count=reference_image_count,
+                fallback_reason=fallback_reason,
+                fallback_count=fallback_count,
+                fallback_limit=fallback_limit,
+                fallback_events=fallback_events,
             )
         finally:
             with self._lock:
@@ -620,7 +836,13 @@ class ImageTaskService:
         urls: list[str] | None = None,
         account_email: str = "",
         account_emails: list[str] | None = None,
+        tried_account_emails: list[str] | None = None,
+        tried_account_ids: list[str] | None = None,
         reference_image_count: int = 0,
+        fallback_reason: str = "",
+        fallback_count: object = None,
+        fallback_limit: object = None,
+        fallback_events: object = None,
     ) -> None:
         endpoint = "/v1/images/edits" if mode == "edit" else "/v1/images/generations"
         summary_prefix = "图生图" if mode == "edit" else "文生图"
@@ -644,10 +866,24 @@ class ImageTaskService:
         clean_emails = _collect_account_emails({"account_emails": account_emails or [], "account_email": account_email})
         if clean_emails:
             detail["account_emails"] = clean_emails
+        clean_tried_emails = _collect_clean_strings(tried_account_emails or [])
+        if clean_tried_emails:
+            detail["tried_account_emails"] = clean_tried_emails
+        clean_tried_ids = _collect_clean_strings(tried_account_ids or [])
+        if clean_tried_ids:
+            detail["tried_account_ids"] = clean_tried_ids
         if urls:
             detail["urls"] = list(dict.fromkeys(urls))
         if reference_image_count:
             detail["reference_image_count"] = max(0, int(reference_image_count))
+        if fallback_reason:
+            detail["fallback_reason"] = fallback_reason
+        if fallback_count is not None:
+            detail["fallback_count"] = fallback_count
+        if fallback_limit is not None:
+            detail["fallback_limit"] = fallback_limit
+        if isinstance(fallback_events, list) and fallback_events:
+            detail["fallback_events"] = [event for event in fallback_events if isinstance(event, dict)]
         try:
             log_service.add(LOG_TYPE_CALL, f"{summary_prefix}{suffix}", detail)
         except Exception:
@@ -658,10 +894,191 @@ class ImageTaskService:
             task = self._tasks.get(key)
             if task is None:
                 return
+            if "data" in updates:
+                updates["data"] = _store_task_data(key, updates.get("data") or [], result_dir=self.result_dir)
+                new_paths = _task_data_result_paths(updates.get("data"))
+                _delete_task_result_files(task.get("data"), keep_paths=new_paths, result_dir=self.result_dir)
             task.update(updates)
             task["updated_at"] = _now_iso()
             task["updated_ts"] = time.time()
             self._save_locked()
+
+    def _task_fallback_context(self, key: str) -> dict[str, Any]:
+        with self._lock:
+            task = dict(self._tasks.get(key) or {})
+        return {
+            "tried_account_emails": _collect_clean_strings(task.get("tried_account_emails")),
+            "tried_account_ids": _collect_clean_strings(task.get("tried_account_ids")),
+            "fallback_count": task.get("fallback_count"),
+            "fallback_limit": _normalize_fallback_limit(task.get("fallback_limit", config.image_account_fallback_limit)),
+            "fallback_reason": _clean(task.get("fallback_reason")),
+            "fallback_events": [
+                dict(event)
+                for event in (task.get("fallback_events") or [])
+                if isinstance(event, dict)
+            ],
+        }
+
+    def _consume_resume_fallback_and_regenerate(
+        self,
+        key: str,
+        mode: str,
+        payload: dict[str, Any],
+        identity: dict[str, object],
+        model: str,
+        account_email: str,
+        conversation_id: str,
+        error_message: str,
+        *,
+        reason: str = "token_invalid",
+        run_async: bool = False,
+        allowed_statuses: set[str] | tuple[str, ...] | None = None,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        expected_statuses = set(allowed_statuses or (TASK_STATUS_ERROR,))
+
+        from services.protocol.conversation import ImageFallbackTracker
+
+        scheduled = False
+        fallback_count = 0
+        fallback_limit = _normalize_fallback_limit()
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None:
+                return False, "task not found", {}
+            current_status = _clean(task.get("status"))
+            fallback_context = {
+                "tried_account_emails": _collect_clean_strings(task.get("tried_account_emails")),
+                "tried_account_ids": _collect_clean_strings(task.get("tried_account_ids")),
+                "fallback_count": task.get("fallback_count"),
+                "fallback_limit": _normalize_fallback_limit(task.get("fallback_limit", config.image_account_fallback_limit)),
+                "fallback_reason": _clean(task.get("fallback_reason")),
+                "fallback_events": [
+                    dict(event)
+                    for event in (task.get("fallback_events") or [])
+                    if isinstance(event, dict)
+                ],
+            }
+            if current_status not in expected_statuses:
+                return True, "", fallback_context
+
+            if not payload:
+                final_error = f"{error_message}; original request payload missing, cannot regenerate"
+                _delete_task_result_files(task.get("data"), result_dir=self.result_dir)
+                task.update({
+                    "status": TASK_STATUS_ERROR,
+                    "error": final_error,
+                    "data": [],
+                    "progress": "",
+                })
+                task["updated_at"] = _now_iso()
+                task["updated_ts"] = time.time()
+                self._save_locked()
+                return False, final_error, fallback_context
+
+            try:
+                fallback_count = max(0, int(fallback_context.get("fallback_count") or 0))
+            except (TypeError, ValueError):
+                fallback_count = 0
+            fallback_limit = _normalize_fallback_limit(fallback_context.get("fallback_limit"))
+            fallback_events = [
+                dict(event)
+                for event in (fallback_context.get("fallback_events") or [])
+                if isinstance(event, dict)
+            ]
+            if fallback_count >= fallback_limit:
+                fallback_events.append({
+                    "reason": reason,
+                    "account_email": account_email,
+                    "conversation_id": conversation_id,
+                    "error": error_message[:200],
+                    "limit_reached": True,
+                    "fallback_count": fallback_count,
+                })
+                final_error = f"image account fallback limit reached: {reason}"
+                _delete_task_result_files(task.get("data"), result_dir=self.result_dir)
+                task.update({
+                    "status": TASK_STATUS_ERROR,
+                    "error": final_error,
+                    "data": [],
+                    "progress": "",
+                    "fallback_count": fallback_count,
+                    "fallback_limit": fallback_limit,
+                    "fallback_reason": reason,
+                    "fallback_events": fallback_events,
+                })
+                task["updated_at"] = _now_iso()
+                task["updated_ts"] = time.time()
+                self._save_locked()
+                fallback_context["fallback_count"] = fallback_count
+                fallback_context["fallback_limit"] = fallback_limit
+                fallback_context["fallback_reason"] = reason
+                fallback_context["fallback_events"] = fallback_events
+                return False, final_error, fallback_context
+
+            fallback_count += 1
+            fallback_events.append({
+                "reason": reason,
+                "account_email": account_email,
+                "conversation_id": conversation_id,
+                "error": error_message[:200],
+                "fallback_count": fallback_count,
+            })
+            _delete_task_result_files(task.get("data"), result_dir=self.result_dir)
+            task.update({
+                "status": TASK_STATUS_QUEUED,
+                "error": "",
+                "data": [],
+                "progress": "retry_after_token_revoked",
+                "fallback_count": fallback_count,
+                "fallback_limit": fallback_limit,
+                "fallback_reason": reason,
+                "fallback_events": fallback_events,
+            })
+            task["updated_at"] = _now_iso()
+            task["updated_ts"] = time.time()
+            fallback_context["fallback_count"] = fallback_count
+            fallback_context["fallback_limit"] = fallback_limit
+            fallback_context["fallback_reason"] = reason
+            fallback_context["fallback_events"] = fallback_events
+
+            fallback_tracker = ImageFallbackTracker(
+                limit=fallback_limit,
+                count=fallback_count,
+                events=fallback_events,
+            )
+            self._runtime[key] = {
+                "payload": dict(payload),
+                "identity": dict(identity),
+                "fallback_tracker": fallback_tracker,
+            }
+            task_id = _clean(task.get("id")) or _clean(key).split(":")[-1]
+            owner_id = _clean(task.get("owner_id")) or _owner_id(identity)
+            group_id = _clean(task.get("group_id")) or task_id
+            group_key = _clean(task.get("group_key")) or _task_group_key(owner_id, group_id, task_id)
+            task["group_key"] = group_key
+            self._save_locked()
+            self._enqueue_task_locked(group_key, key)
+            self._schedule_group_locked(group_key)
+            scheduled = True
+
+        logger_payload = {
+            "event": "image_resume_poll_invalid_token_regenerate",
+            "account_email": account_email,
+            "conversation_id": conversation_id,
+            "task_key": key,
+            "fallback_count": fallback_count,
+            "fallback_limit": fallback_limit,
+        }
+        try:
+            from utils.log import logger
+
+            logger.warning(logger_payload)
+        except Exception:
+            pass
+
+        if run_async and not scheduled:
+            return False, "resume fallback was not scheduled", fallback_context
+        return True, "", fallback_context
 
     def _load_locked(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
@@ -723,12 +1140,30 @@ class ImageTaskService:
             account_emails = _collect_account_emails(item.get("account_emails"))
             if account_emails:
                 task["account_emails"] = account_emails
+            tried_account_emails = _collect_clean_strings(item.get("tried_account_emails"))
+            if tried_account_emails:
+                task["tried_account_emails"] = tried_account_emails
+            tried_account_ids = _collect_clean_strings(item.get("tried_account_ids"))
+            if tried_account_ids:
+                task["tried_account_ids"] = tried_account_ids
             account_id = _clean(item.get("account_id"))
             if account_id:
                 task["account_id"] = account_id
             conversation_id = _clean(item.get("conversation_id"))
             if conversation_id:
                 task["conversation_id"] = conversation_id
+            for int_key in ("fallback_count", "fallback_limit"):
+                try:
+                    if item.get(int_key) is not None:
+                        task[int_key] = max(0, int(item.get(int_key)))
+                except (TypeError, ValueError):
+                    pass
+            fallback_reason = _clean(item.get("fallback_reason"))
+            if fallback_reason:
+                task["fallback_reason"] = fallback_reason
+            fallback_events = item.get("fallback_events")
+            if isinstance(fallback_events, list):
+                task["fallback_events"] = [event for event in fallback_events if isinstance(event, dict)]
             access_token = _clean(item.get("access_token"))
             if access_token:
                 account_ref = _account_ref_from_token(access_token)
@@ -738,6 +1173,18 @@ class ImageTaskService:
                     task["account_email"] = account_ref["account_email"]
             tasks[_task_key(owner, task_id)] = task
         return tasks
+
+    def _compact_embedded_task_data_locked(self) -> bool:
+        changed = False
+        for key, task in self._tasks.items():
+            data = task.get("data")
+            if not isinstance(data, list):
+                continue
+            if not any(isinstance(item, dict) and _clean(item.get("b64_json")) for item in data):
+                continue
+            task["data"] = _store_task_data(key, data, result_dir=self.result_dir)
+            changed = True
+        return changed
 
     def _save_locked(self) -> None:
         items = sorted(self._tasks.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
@@ -767,7 +1214,9 @@ class ImageTaskService:
             if task.get("status") in TERMINAL_STATUSES and _timestamp(task.get("updated_at")) < cutoff
         ]
         for key in removed_keys:
-            self._tasks.pop(key, None)
+            task = self._tasks.pop(key, None)
+            if task is not None:
+                _delete_task_result_files(task.get("data"), result_dir=self.result_dir)
         return bool(removed_keys)
 
     def resume_poll(
@@ -800,12 +1249,47 @@ class ImageTaskService:
             mode = task.get("mode", "generate")
             requested_size = _clean(task.get("size"))
             payload = _deserialize_task_payload(task.get("payload"))
-            response_format = _clean(payload.get("response_format"), "url")
+            response_format = _normalize_response_format(payload.get("response_format"))
             base_url = _clean(payload.get("base_url"))
 
-        access_token = _resolve_account_token(account_id, account_email)
-        if not access_token:
-            raise ValueError("task account is not available for resume poll")
+        account = _find_account_for_resume(account_id, account_email)
+        if account is None:
+            regenerated, error_message, _fallback_context = self._consume_resume_fallback_and_regenerate(
+                key,
+                mode,
+                payload,
+                dict(identity),
+                model,
+                account_email,
+                conversation_id,
+                "image resume poll account is no longer available",
+                run_async=True,
+            )
+            if regenerated:
+                with self._lock:
+                    task = dict(self._tasks.get(key) or {})
+                return _public_task(task, result_dir=self.result_dir)
+            raise ValueError(_public_image_error(error_message))
+        access_token = _clean(account.get("access_token"))
+        refreshed_token = account_service.refresh_access_token(access_token, event="image_resume_poll")
+        if not refreshed_token:
+            regenerated, error_message, _fallback_context = self._consume_resume_fallback_and_regenerate(
+                key,
+                mode,
+                payload,
+                dict(identity),
+                model,
+                account_email,
+                conversation_id,
+                "image resume poll account token is invalid",
+                run_async=True,
+            )
+            if regenerated:
+                with self._lock:
+                    task = dict(self._tasks.get(key) or {})
+                return _public_task(task, result_dir=self.result_dir)
+            raise ValueError(_public_image_error(error_message))
+        access_token = refreshed_token
 
         with self._lock:
             task = self._tasks.get(key)
@@ -824,7 +1308,7 @@ class ImageTaskService:
             daemon=True,
         )
         thread.start()
-        return _public_task(task)
+        return _public_task(task, result_dir=self.result_dir)
 
     def _run_resume_poll(
         self,
@@ -838,12 +1322,13 @@ class ImageTaskService:
         account_email: str = "",
         requested_size: str = "",
         payload: dict[str, Any] | None = None,
-        response_format: str = "url",
+        response_format: str = "b64_json",
         base_url: str = "",
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
         backend = None
+        fallback_context = self._task_fallback_context(key)
         try:
             from utils.image_result import format_image_result
 
@@ -889,6 +1374,12 @@ class ImageTaskService:
                 urls=_collect_image_urls(data),
                 account_email=account_email,
                 account_emails=[account_email] if account_email else [],
+                tried_account_emails=fallback_context["tried_account_emails"],
+                tried_account_ids=fallback_context["tried_account_ids"],
+                fallback_reason=fallback_context["fallback_reason"],
+                fallback_count=fallback_context["fallback_count"],
+                fallback_limit=fallback_context["fallback_limit"],
+                fallback_events=fallback_context["fallback_events"],
             )
         except Exception as exc:
             error_message = str(exc) or "resume poll failed"
@@ -896,31 +1387,19 @@ class ImageTaskService:
                 _record_backend_proxy_result(backend, not _is_proxy_transport_error(error_message))
             if _is_image_token_invalid_exception(exc):
                 account_service.remove_invalid_token(access_token, "image_resume_poll")
-                if payload:
-                    self._update_task(
-                        key,
-                        status=TASK_STATUS_QUEUED,
-                        error="",
-                        data=[],
-                        progress="retry_after_token_revoked",
-                    )
-                    with self._lock:
-                        self._runtime[key] = {"payload": dict(payload), "identity": dict(identity)}
-                    logger_payload = {
-                        "event": "image_resume_poll_invalid_token_regenerate",
-                        "account_email": account_email,
-                        "conversation_id": conversation_id,
-                        "task_key": key,
-                    }
-                    try:
-                        from utils.log import logger
-
-                        logger.warning(logger_payload)
-                    except Exception:
-                        pass
-                    self._run_task(key, mode, dict(payload), dict(identity), model, "")
+                regenerated, error_message, fallback_context = self._consume_resume_fallback_and_regenerate(
+                    key,
+                    mode,
+                    payload or {},
+                    dict(identity),
+                    model,
+                    account_email,
+                    conversation_id,
+                    error_message,
+                    allowed_statuses=(TASK_STATUS_RUNNING,),
+                )
+                if regenerated:
                     return
-                error_message = f"{error_message}; original request payload missing, cannot regenerate"
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[], duration_ms=duration_ms)
             self._log_call(
@@ -933,6 +1412,12 @@ class ImageTaskService:
                 error=error_message,
                 account_email=account_email,
                 account_emails=[account_email] if account_email else [],
+                tried_account_emails=fallback_context["tried_account_emails"],
+                tried_account_ids=fallback_context["tried_account_ids"],
+                fallback_reason=fallback_context["fallback_reason"],
+                fallback_count=fallback_context["fallback_count"],
+                fallback_limit=fallback_context["fallback_limit"],
+                fallback_events=fallback_context["fallback_events"],
             )
 
 

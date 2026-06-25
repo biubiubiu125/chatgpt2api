@@ -97,15 +97,15 @@ def format_image_result(
                 f"image size mismatch after resize: expected {target_size[0]}x{target_size[1]}, got {actual}"
             )
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
-        if response_format == "b64_json":
+        response_format_normalized = str(response_format or "").strip().lower()
+        if response_format_normalized == "url":
             result_item = {
-                "b64_json": b64_json,
                 "url": save(image_bytes, base_url),
                 "revised_prompt": revised_prompt,
             }
         else:
             result_item = {
-                "url": save(image_bytes, base_url),
+                "b64_json": b64_json,
                 "revised_prompt": revised_prompt,
             }
         if image_size:

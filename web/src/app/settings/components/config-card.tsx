@@ -27,6 +27,7 @@ export function ConfigCard() {
   const setImageMaxStorageMb = useSettingsStore((state) => state.setImageMaxStorageMb);
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
+  const setImageAccountFallbackLimit = useSettingsStore((state) => state.setImageAccountFallbackLimit);
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
   const setImageSettleSecs = useSettingsStore((state) => state.setImageSettleSecs);
   const setImageTimeoutRetrySecs = useSettingsStore((state) => state.setImageTimeoutRetrySecs);
@@ -201,6 +202,19 @@ export function ConfigCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs text-stone-500">限制每个账号同时处理的图片请求数量，默认 3。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">生图账号兜底次数</label>
+            <Input
+              type="number"
+              min={0}
+              max={1}
+              value={String(config?.image_account_fallback_limit ?? "")}
+              onChange={(event) => setImageAccountFallbackLimit(event.target.value)}
+              placeholder="1"
+              className="h-10 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs text-stone-500">整个生图请求内最多只换一次账号；填 0 表示不兜底，文生图和图生图一致。</p>
           </div>
           <div className="space-y-2">
             <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from typing import Any, Iterable, Iterator
@@ -47,7 +48,17 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
     "or file operations. Do not claim to have run tools or inspected external resources. "
     "If a user asks you to use a tool, say that tool execution is unavailable through this backend."
 )
-INTERNAL_ACCOUNT_KEYS = ("_account_email", "_account_emails")
+INTERNAL_IMAGE_CONTEXT_KEYS = (
+    "_account_email",
+    "_account_emails",
+    "_tried_account_emails",
+    "_tried_account_ids",
+    "_fallback_count",
+    "_fallback_limit",
+    "_fallback_reason",
+    "_fallback_events",
+    "_reference_image_count",
+)
 
 RESPONSE_CONTENT_PART_TYPES = {"text", "input_text", "output_text", "image_url", "input_image", "image"}
 RESPONSE_IMAGE_PART_TYPES = {"image_url", "input_image", "image"}
@@ -60,11 +71,65 @@ def _append_account_email(account_emails: list[str], account_email: str) -> None
         account_emails.append(email)
 
 
+def _merge_output_context(context: dict[str, Any], output: ImageOutput) -> None:
+    for email in output.tried_account_emails:
+        email = str(email or "").strip()
+        if email and email not in context.setdefault("_tried_account_emails", []):
+            context["_tried_account_emails"].append(email)
+    for account_id in output.tried_account_ids:
+        account_id = str(account_id or "").strip()
+        if account_id and account_id not in context.setdefault("_tried_account_ids", []):
+            context["_tried_account_ids"].append(account_id)
+    if output.fallback_count is not None:
+        try:
+            context["_fallback_count"] = max(
+                int(context.get("_fallback_count") or 0),
+                max(0, int(output.fallback_count)),
+            )
+        except (TypeError, ValueError):
+            pass
+    if output.fallback_limit is not None:
+        try:
+            context["_fallback_limit"] = max(
+                int(context.get("_fallback_limit") or 0),
+                max(0, int(output.fallback_limit)),
+            )
+        except (TypeError, ValueError):
+            pass
+    if output.fallback_reason and not context.get("_fallback_reason"):
+        context["_fallback_reason"] = output.fallback_reason
+    for event in output.fallback_events:
+        if not isinstance(event, dict):
+            continue
+        marker = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str)
+        seen = context.setdefault("_fallback_event_markers", set())
+        if marker in seen:
+            continue
+        seen.add(marker)
+        context.setdefault("_fallback_events", []).append(dict(event))
+
+
 def _attach_account_context(target: dict[str, Any], account_emails: list[str]) -> None:
     if not account_emails:
         return
     target["_account_email"] = account_emails[0]
     target["_account_emails"] = list(account_emails)
+
+
+def _attach_image_context(target: dict[str, Any], context: dict[str, Any]) -> None:
+    _attach_account_context(target, context.get("_account_emails") or [])
+    for key in (
+        "_tried_account_emails",
+        "_tried_account_ids",
+        "_fallback_limit",
+        "_fallback_reason",
+        "_fallback_events",
+    ):
+        value = context.get(key)
+        if value:
+            target[key] = value
+    if context.get("_fallback_count") is not None:
+        target["_fallback_count"] = context["_fallback_count"]
 
 
 def is_text_response_request(body: dict[str, Any]) -> bool:
@@ -478,13 +543,14 @@ def stream_image_response(
     items: list[dict[str, Any]] = []
     output_image_data: list[dict[str, Any]] = []
     fallback_message = ""
-    account_emails: list[str] = []
+    image_context: dict[str, Any] = {"_account_emails": []}
     event = response_created(response_id, model, created)
     if reference_image_count:
         event["_reference_image_count"] = reference_image_count
     yield event
     for output in image_outputs:
-        _append_account_email(account_emails, output.account_email)
+        _append_account_email(image_context["_account_emails"], output.account_email)
+        _merge_output_context(image_context, output)
         if output.kind == "message":
             fallback_message = output.text or fallback_message
             continue
@@ -503,7 +569,7 @@ def stream_image_response(
         for output_index, item in enumerate(items):
             yield {"type": "response.output_item.done", "output_index": output_index, "item": item}
         event = response_completed(response_id, model, created, items, usage)
-        _attach_account_context(event, account_emails)
+        _attach_image_context(event, image_context)
         if reference_image_count:
             event["_reference_image_count"] = reference_image_count
         yield event
@@ -519,7 +585,7 @@ def stream_image_response(
         yield {"type": "response.output_text.done", "item_id": item["id"], "output_index": 0, "content_index": 0, "text": fallback_message}
         yield {"type": "response.output_item.done", "output_index": 0, "item": item}
         event = response_completed(response_id, model, created, [item], usage)
-        _attach_account_context(event, account_emails)
+        _attach_image_context(event, image_context)
         if reference_image_count:
             event["_reference_image_count"] = reference_image_count
         yield event
@@ -532,13 +598,10 @@ def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     for event in events:
         if event.get("type") == "response.completed":
             completed = event.get("response") if isinstance(event.get("response"), dict) else {}
-            for key in INTERNAL_ACCOUNT_KEYS:
+            for key in INTERNAL_IMAGE_CONTEXT_KEYS:
                 value = event.get(key)
                 if value:
                     completed[key] = value
-            reference_image_count = event.get("_reference_image_count")
-            if reference_image_count:
-                completed["_reference_image_count"] = reference_image_count
     if not completed:
         raise RuntimeError("response generation failed")
     return completed
@@ -583,6 +646,8 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         quality=quality,
         response_format="b64_json",
         images=images,
+        message_as_error=True,
+        fallback_tracker=body.get("fallback_tracker"),
     ))
     yield from stream_image_response(
         image_outputs,
