@@ -76,8 +76,10 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         progress_callback=progress_callback,
         fallback_tracker=body.get("fallback_tracker"),
     ))
-    if body.get("stream"):
+    if body.get("stream") and n <= 1:
         return stream_image_chunks_with_reference_count(outputs, len(images))
+    if body.get("stream"):
+        return stream_image_chunks_with_reference_count(list(outputs), len(images))
     result = collect_image_outputs(outputs)
     result["_reference_image_count"] = len(images)
     result["usage"] = image_usage(

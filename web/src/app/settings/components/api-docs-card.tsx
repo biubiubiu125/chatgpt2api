@@ -101,7 +101,7 @@ const docs: ApiDoc[] = [
     input: [
       ["prompt", "string", "图片生成提示词。"],
       ["model", "string", "可选，默认 gpt-image-2。"],
-      ["n", "number", "可选，生成数量，当前仅支持 1。"],
+      ["n", "number", "可选，生成数量，范围 1-10，默认 1。"],
       ["size", "string", "可选，支持 WIDTHxHEIGHT 精确尺寸，或 1k/2k/4k 档位；未传时默认按 2k 和当前比例处理。"],
       ["quality", "string", "可选，默认 auto。"],
       ["response_format", "string", "可选，默认 b64_json；只有传 url 时才返回图片链接。"],
@@ -125,7 +125,7 @@ const docs: ApiDoc[] = [
       ["image", "file | file[] | URL", "参考图，支持 multipart 上传，也支持 JSON 图片链接。"],
       ["prompt", "string", "编辑提示词。"],
       ["model", "string", "可选，默认 gpt-image-2。"],
-      ["n", "number", "可选，生成数量，当前仅支持 1。"],
+      ["n", "number", "可选，生成数量，范围 1-10，默认 1。"],
       ["size", "string", "可选，支持 WIDTHxHEIGHT 精确尺寸，或 1k/2k/4k 档位；未传时默认按 2k 和当前比例处理。"],
       ["quality", "string", "可选，默认 auto。"],
       ["response_format", "string", "可选，默认 b64_json；只有传 url 时才返回图片链接。"],

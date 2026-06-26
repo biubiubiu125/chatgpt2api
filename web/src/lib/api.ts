@@ -525,7 +525,7 @@ export async function updateAccount(
   });
 }
 
-export async function generateImage(prompt: string, model?: ImageModel, size?: string, quality = "auto") {
+export async function generateImage(prompt: string, model?: ImageModel, size?: string, quality = "auto", n = 1) {
   return httpRequest<ImageResponse>(
     "/v1/images/generations",
     {
@@ -535,14 +535,14 @@ export async function generateImage(prompt: string, model?: ImageModel, size?: s
         ...(model ? { model } : {}),
         ...(size ? { size } : {}),
         quality,
-        n: 1,
+        n,
         response_format: "b64_json",
       },
     },
   );
 }
 
-export async function editImage(files: File | File[], prompt: string, model?: ImageModel, size?: string, quality = "auto") {
+export async function editImage(files: File | File[], prompt: string, model?: ImageModel, size?: string, quality = "auto", n = 1) {
   const formData = new FormData();
   const uploadFiles = Array.isArray(files) ? files : [files];
 
@@ -557,7 +557,7 @@ export async function editImage(files: File | File[], prompt: string, model?: Im
     formData.append("size", size);
   }
   formData.append("quality", quality);
-  formData.append("n", "1");
+  formData.append("n", String(n));
 
   return httpRequest<ImageResponse>(
     "/v1/images/edits",

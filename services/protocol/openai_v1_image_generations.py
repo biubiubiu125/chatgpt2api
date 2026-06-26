@@ -34,8 +34,10 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         progress_callback=progress_callback,
         fallback_tracker=body.get("fallback_tracker"),
     ))
-    if body.get("stream"):
+    if body.get("stream") and n <= 1:
         return stream_image_chunks(outputs)
+    if body.get("stream"):
+        return stream_image_chunks(list(outputs))
     result = collect_image_outputs(outputs)
     result["usage"] = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),

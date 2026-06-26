@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
@@ -16,6 +18,7 @@ class ImageGenerationTaskRequest(BaseModel):
     group_id: str | None = None
     prompt: str = Field(..., min_length=1)
     model: str = "gpt-image-2"
+    n: Any = 1
     size: str | None = None
     aspect_ratio: str | None = None
     quality: str = "auto"
@@ -66,6 +69,7 @@ def create_router() -> APIRouter:
                 group_id=body.group_id,
                 prompt=body.prompt,
                 model=body.model,
+                n=body.n,
                 size=body.size,
                 aspect_ratio=body.aspect_ratio,
                 quality=body.quality,
@@ -82,6 +86,8 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
+        if payload["n"] != 1:
+            raise HTTPException(status_code=400, detail={"error": "image task n must be 1"})
         client_task_id = str(payload.get("client_task_id") or "").strip()
         if not client_task_id:
             raise HTTPException(status_code=400, detail={"error": "client_task_id is required"})
@@ -99,6 +105,7 @@ def create_router() -> APIRouter:
                 group_id=group_id,
                 prompt=prompt,
                 model=model,
+                n=payload["n"],
                 size=payload["size"],
                 aspect_ratio=payload.get("aspect_ratio"),
                 quality=payload["quality"],

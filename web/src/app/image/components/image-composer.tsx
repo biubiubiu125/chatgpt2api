@@ -74,7 +74,7 @@ const aspectOptions = IMAGE_SIZE_PRESETS.map((preset) => ({
         ? RectangleHorizontal
         : RectangleVertical,
 }));
-const MAX_IMAGE_COUNT = 50;
+const MAX_IMAGE_COUNT = 10;
 const countOptions = Array.from({ length: MAX_IMAGE_COUNT }, (_, index) => String(index + 1));
 
 export function ImageComposer({

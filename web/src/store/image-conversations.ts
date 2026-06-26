@@ -71,7 +71,12 @@ const imageConversationStorage = localforage.createInstance({
 });
 
 const IMAGE_CONVERSATIONS_KEY = "items";
+const MAX_IMAGE_COUNT = 10;
 let imageConversationWriteQueue: Promise<void> = Promise.resolve();
+
+function normalizeImageCount(value: unknown) {
+  return Math.min(MAX_IMAGE_COUNT, Math.max(1, Math.floor(Number(value) || 1)));
+}
 
 function normalizeStoredImage(image: StoredImage): StoredImage {
   const normalized = {
@@ -154,7 +159,7 @@ function normalizeTurn(turn: ImageTurn & Record<string, unknown>): ImageTurn {
     model: (turn.model as ImageModel) || "gpt-image-2",
     mode: turn.mode === "edit" ? "edit" : "generate",
     referenceImages: getLegacyReferenceImages(turn),
-    count: Math.max(1, Number(turn.count || normalizedImages.length || 1)),
+    count: normalizeImageCount(turn.count || normalizedImages.length || 1),
     size: typeof turn.size === "string" ? turn.size : "",
     ratio: typeof turn.ratio === "string" && turn.ratio ? turn.ratio : "1:1",
     tier: typeof turn.tier === "string" && turn.tier ? turn.tier : "2k",
@@ -184,7 +189,7 @@ function normalizeConversation(conversation: ImageConversation & Record<string, 
           model: (conversation.model as ImageModel) || "gpt-image-2",
           mode: conversation.mode === "edit" ? "edit" : "generate",
           referenceImages: getLegacyReferenceImages(conversation),
-          count: Number(conversation.count || 1),
+          count: normalizeImageCount(conversation.count || 1),
           size: typeof conversation.size === "string" ? conversation.size : "",
           ratio: typeof conversation.ratio === "string" && conversation.ratio ? conversation.ratio : "1:1",
           tier: typeof conversation.tier === "string" && conversation.tier ? conversation.tier : "2k",

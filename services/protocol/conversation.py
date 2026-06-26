@@ -22,6 +22,7 @@ from services.proxy_service import (
 )
 from utils.helper import (
     IMAGE_MODELS,
+    MAX_IMAGE_COUNT,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
@@ -424,6 +425,83 @@ def is_image_account_exhausted_error(exc: Exception) -> bool:
 
 def is_image_account_fallback_limit_error(exc: Exception) -> bool:
     return isinstance(exc, ImageGenerationError) and exc.code == "image_account_fallback_limit_reached"
+
+
+def _merge_image_generation_error_context(error: ImageGenerationError, account_context: dict[str, Any]) -> ImageGenerationError:
+    account_id = str(account_context.get("account_id") or "").strip()
+    account_email = str(account_context.get("account_email") or "").strip()
+    conversation_id = str(account_context.get("conversation_id") or "").strip()
+    account_emails = _unique_nonempty_strings(account_context.get("account_emails"))
+    tried_account_emails = _unique_nonempty_strings(account_context.get("tried_account_emails"))
+    tried_account_ids = _unique_nonempty_strings(account_context.get("tried_account_ids"))
+    fallback_count = account_context.get("fallback_count")
+    fallback_limit = account_context.get("fallback_limit")
+    fallback_reason = str(account_context.get("fallback_reason") or "").strip()
+    fallback_events = [
+        dict(item)
+        for item in (account_context.get("fallback_events") or [])
+        if isinstance(item, dict)
+    ]
+    if account_email and not getattr(error, "account_email", ""):
+        error.account_email = account_email
+    if account_id and not getattr(error, "account_id", ""):
+        error.account_id = account_id
+    if conversation_id and not getattr(error, "conversation_id", ""):
+        error.conversation_id = conversation_id
+    if account_emails:
+        error.account_emails = _unique_nonempty_strings([*getattr(error, "account_emails", []), *account_emails])
+    if tried_account_emails:
+        error.tried_account_emails = _unique_nonempty_strings([
+            *getattr(error, "tried_account_emails", []),
+            *tried_account_emails,
+        ])
+    if tried_account_ids:
+        error.tried_account_ids = _unique_nonempty_strings([
+            *getattr(error, "tried_account_ids", []),
+            *tried_account_ids,
+        ])
+    if fallback_count is not None:
+        try:
+            error.fallback_count = max(error.fallback_count or 0, max(0, int(fallback_count)))
+        except (TypeError, ValueError):
+            pass
+    if fallback_limit is not None:
+        try:
+            error.fallback_limit = max(error.fallback_limit or 0, max(0, int(fallback_limit)))
+        except (TypeError, ValueError):
+            pass
+    if fallback_reason and not getattr(error, "fallback_reason", ""):
+        error.fallback_reason = fallback_reason
+    if fallback_events:
+        existing = [
+            dict(item)
+            for item in getattr(error, "fallback_events", [])
+            if isinstance(item, dict)
+        ]
+        error.fallback_events = [*existing, *fallback_events]
+    return error
+
+
+def _wrap_image_generation_error(error: Exception, account_context: dict[str, Any]) -> ImageGenerationError:
+    if isinstance(error, ImageGenerationError):
+        return _merge_image_generation_error_context(error, account_context)
+    return ImageGenerationError(
+        image_stream_error_message(str(error)),
+        account_email=str(account_context.get("account_email") or ""),
+        account_id=str(account_context.get("account_id") or ""),
+        conversation_id=str(account_context.get("conversation_id") or ""),
+        account_emails=_unique_nonempty_strings(account_context.get("account_emails")),
+        tried_account_emails=_unique_nonempty_strings(account_context.get("tried_account_emails")),
+        tried_account_ids=_unique_nonempty_strings(account_context.get("tried_account_ids")),
+        fallback_count=account_context.get("fallback_count"),
+        fallback_limit=account_context.get("fallback_limit"),
+        fallback_reason=str(account_context.get("fallback_reason") or ""),
+        fallback_events=[
+            dict(item)
+            for item in (account_context.get("fallback_events") or [])
+            if isinstance(item, dict)
+        ],
+    )
 
 
 REFERENCED_IMAGE_IDS_RE = re.compile(r'"referenced_image_ids"\s*:\s*\[([^\]]+)\]')
@@ -2409,19 +2487,67 @@ def _collect_error_account_context(errors: dict[int, Exception]) -> dict[str, An
     return context
 
 
+def _raise_image_generation_incomplete(
+        errors: dict[int, Exception],
+        requested: int,
+        succeeded: int,
+        account_context: dict[str, Any] | None = None,
+) -> None:
+    context = account_context or _collect_error_account_context(errors)
+    for index in range(1, requested + 1):
+        error = errors.get(index)
+        if error is not None:
+            raise _wrap_image_generation_error(error, context)
+    raise ImageGenerationError(
+        f"image generation did not complete for every requested image: requested {requested}, succeeded {succeeded}",
+        status_code=502,
+        error_type="server_error",
+        code="image_generation_incomplete",
+        param="n",
+        account_email=str(context.get("account_email") or ""),
+        account_id=str(context.get("account_id") or ""),
+        conversation_id=str(context.get("conversation_id") or ""),
+        account_emails=_unique_nonempty_strings(context.get("account_emails")),
+        tried_account_emails=_unique_nonempty_strings(context.get("tried_account_emails")),
+        tried_account_ids=_unique_nonempty_strings(context.get("tried_account_ids")),
+        fallback_count=context.get("fallback_count"),
+        fallback_limit=context.get("fallback_limit"),
+        fallback_reason=str(context.get("fallback_reason") or ""),
+        fallback_events=[
+            dict(item)
+            for item in (context.get("fallback_events") or [])
+            if isinstance(item, dict)
+        ],
+    )
+
+
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
     """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
     if not is_supported_image_model(request.model):
         raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
-    if request.n != 1:
+    try:
+        if isinstance(request.n, bool):
+            raise ValueError
+        normalized_n = int(request.n)
+        if isinstance(request.n, float) and not request.n.is_integer():
+            raise ValueError
+    except (TypeError, ValueError):
         raise ImageGenerationError(
-            "n must be 1",
+            "n must be an integer",
             status_code=400,
             error_type="invalid_request_error",
             code="invalid_request",
             param="n",
         )
-
+    request.n = normalized_n
+    if request.n < 1 or request.n > MAX_IMAGE_COUNT:
+        raise ImageGenerationError(
+            f"n must be between 1 and {MAX_IMAGE_COUNT}",
+            status_code=400,
+            error_type="invalid_request_error",
+            code="invalid_request",
+            param="n",
+        )
     fallback_tracker = request.fallback_tracker if isinstance(request.fallback_tracker, ImageFallbackTracker) else ImageFallbackTracker()
 
     def max_nonnegative_int(*values: object) -> int | None:
@@ -2521,9 +2647,36 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
             "n": request.n,
             "model": request.model,
         })
+        results: dict[int, list[ImageOutput]] = {}
+        errors: dict[int, Exception] = {}
         for index in range(1, request.n + 1):
-            outputs = _generate_single_image(request, index, request.n, token_pool=token_pool, fallback_tracker=fallback_tracker)
-            for output in attach_request_fallback_context(outputs):
+            try:
+                results[index] = _generate_single_image(request, index, request.n, token_pool=token_pool, fallback_tracker=fallback_tracker)
+            except Exception as exc:
+                errors[index] = exc
+                logger.warning({
+                    "event": "image_serial_generation_error",
+                    "index": index,
+                    "error": str(exc)[:300],
+                })
+                if is_image_account_exhausted_error(exc) or is_image_account_fallback_limit_error(exc):
+                    break
+        if not results:
+            account_context = _collect_error_account_context(errors)
+            _raise_image_generation_incomplete(errors, request.n, len(results), account_context)
+        if errors:
+            logger.warning({
+                "event": "image_serial_generation_partial_failure",
+                "requested": request.n,
+                "succeeded": len(results),
+                "failed": len(errors),
+                "failed_indexes": sorted(errors),
+            })
+            _raise_image_generation_incomplete(errors, request.n, len(results))
+        for index in range(1, request.n + 1):
+            if index not in results:
+                continue
+            for output in attach_request_fallback_context(results[index], _collect_error_account_context(errors) if errors else None):
                 yield output
         return
 
@@ -2571,87 +2724,48 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                 if not stop_submitting and next_index <= request.n:
                     submit_next(executor)
     partial_error_context = _collect_error_account_context(errors) if errors else None
-
-    # yield 结果：跳过索引顺序限制，不再让低索引失败阻塞高索引成功结果
-    emitted = False
-    last_error = ""
-    # 先 yield 所有成功的结果
-    for index in range(1, request.n + 1):
-        if index in results:
-            for output in attach_request_fallback_context(results[index], partial_error_context):
-                emitted = True
-                yield output
-        elif index in errors:
-            last_error = str(errors[index])
-            if not emitted:
-                logger.warning({
-                    "event": "image_parallel_failure_before_success",
-                    "failed_index": index,
-                    "error": last_error[:200],
-                })
-
-    # 如果有失败但也有成功，记录警告
-    if emitted:
-        for index in range(1, request.n + 1):
-            if index in errors:
-                logger.warning({
-                    "event": "image_parallel_partial_failure",
-                    "failed_index": index,
-                    "error": str(errors[index])[:200],
-                })
-
-    if not emitted:
-        if not last_error:
-            last_error = "no account in the pool could generate images — check account quota and rate-limit status"
-        account_context = partial_error_context or _collect_error_account_context(errors)
-        account_id = account_context["account_id"]
-        account_email = account_context["account_email"]
-        account_emails = account_context["account_emails"]
-        conversation_id = account_context["conversation_id"]
-        tried_account_emails = account_context["tried_account_emails"]
-        tried_account_ids = account_context["tried_account_ids"]
-        fallback_count = account_context["fallback_count"]
-        fallback_limit = account_context["fallback_limit"]
-        fallback_reason = account_context["fallback_reason"]
-        fallback_events = account_context["fallback_events"]
-        for index in range(1, request.n + 1):
-            error = errors.get(index)
-            if isinstance(error, ImageGenerationError):
-                if account_email and not getattr(error, "account_email", ""):
-                    error.account_email = account_email
-                if account_id and not getattr(error, "account_id", ""):
-                    error.account_id = account_id
-                if conversation_id and not getattr(error, "conversation_id", ""):
-                    error.conversation_id = conversation_id
-                if account_emails:
-                    setattr(error, "account_emails", account_emails)
-                if tried_account_emails:
-                    setattr(error, "tried_account_emails", tried_account_emails)
-                if tried_account_ids:
-                    setattr(error, "tried_account_ids", tried_account_ids)
-                if fallback_count is not None:
-                    setattr(error, "fallback_count", fallback_count)
-                if fallback_limit is not None:
-                    setattr(error, "fallback_limit", fallback_limit)
-                if fallback_reason and not getattr(error, "fallback_reason", ""):
-                    setattr(error, "fallback_reason", fallback_reason)
-                if fallback_events:
-                    setattr(error, "fallback_events", fallback_events)
-                raise error
-        wrapped = ImageGenerationError(
-            image_stream_error_message(last_error),
-            account_email=account_email,
-            account_id=account_id,
-            conversation_id=conversation_id,
-            account_emails=account_emails,
-            tried_account_emails=tried_account_emails,
-            tried_account_ids=tried_account_ids,
-            fallback_count=fallback_count,
-            fallback_limit=fallback_limit,
-            fallback_reason=fallback_reason,
-            fallback_events=fallback_events,
+    missing_indexes = [
+        index
+        for index in range(1, request.n + 1)
+        if index not in results and index not in errors
+    ]
+    if missing_indexes:
+        missing_error = ImageGenerationError(
+            "image generation did not start for every requested image",
+            status_code=502,
+            error_type="server_error",
+            code="image_generation_incomplete",
+            param="n",
         )
-        raise wrapped
+        for index in missing_indexes:
+            errors[index] = missing_error
+        partial_error_context = _collect_error_account_context(errors)
+
+    if errors and not results:
+        account_context = partial_error_context or _collect_error_account_context(errors)
+        logger.warning({
+            "event": "image_parallel_generation_failed",
+            "requested": request.n,
+            "succeeded": len(results),
+            "failed": len(errors),
+            "failed_indexes": sorted(errors),
+        })
+        _raise_image_generation_incomplete(errors, request.n, len(results), account_context)
+    if errors:
+        logger.warning({
+            "event": "image_parallel_generation_partial_failure",
+            "requested": request.n,
+            "succeeded": len(results),
+            "failed": len(errors),
+            "failed_indexes": sorted(errors),
+        })
+        _raise_image_generation_incomplete(errors, request.n, len(results), partial_error_context)
+
+    for index in range(1, request.n + 1):
+        if index not in results:
+            continue
+        for output in attach_request_fallback_context(results[index], partial_error_context):
+            yield output
 
 
 def stream_image_chunks(outputs: Iterable[ImageOutput]) -> Iterator[dict[str, Any]]:

@@ -59,7 +59,7 @@ const IMAGE_MODEL_STORAGE_KEY = "chatgpt2api:image_last_model";
 const IMAGE_COUNT_STORAGE_KEY = "chatgpt2api:image_last_count";
 const SCROLL_POSITIONS_STORAGE_KEY = "chatgpt2api:image_scroll_positions";
 const SCROLL_TO_LATEST_THRESHOLD = 160;
-const MAX_IMAGE_COUNT = 50;
+const MAX_IMAGE_COUNT = 10;
 const DEFAULT_MAX_IMAGE_SIDE = 4096;
 const DEFAULT_MAX_IMAGE_PIXELS = DEFAULT_MAX_IMAGE_SIDE * DEFAULT_MAX_IMAGE_SIDE;
 const DEFAULT_IMAGE_RATIO = "1:1";
@@ -92,8 +92,12 @@ function saveScrollPositions(positions: Map<string, number>) {
   }
 }
 
+function normalizeImageCount(value: unknown) {
+  return Math.min(MAX_IMAGE_COUNT, Math.max(1, Math.floor(Number(value) || 1)));
+}
+
 function clampImageCount(value: string) {
-  return String(Math.min(MAX_IMAGE_COUNT, Math.max(1, Math.floor(Number(value) || 1))));
+  return String(normalizeImageCount(value));
 }
 function parseImageSize(size: string) {
   const match = size.match(/^(\d+)x(\d+)$/);
@@ -189,11 +193,18 @@ function resolveImageSizeMode(ratio: string, tier: string, size: string) {
 function normalizeTurnSizeMode(turn: ImageTurn, limits: ImageResizeLimits = resolveImageResizeLimits(null)) {
   const nextSize = safeImageSize(turn.size, limits);
   const sizeMode = resolveImageSizeMode(turn.ratio, turn.tier, nextSize);
-  if (sizeMode.ratio === turn.ratio && sizeMode.tier === turn.tier && nextSize === turn.size) {
+  const nextCount = normalizeImageCount(turn.count || turn.images.length || 1);
+  if (
+    sizeMode.ratio === turn.ratio &&
+    sizeMode.tier === turn.tier &&
+    nextSize === turn.size &&
+    nextCount === turn.count
+  ) {
     return turn;
   }
   return {
     ...turn,
+    count: nextCount,
     size: nextSize,
     ratio: sizeMode.ratio,
     tier: sizeMode.tier,
@@ -1336,7 +1347,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
     setSelectedConversationId(conversationId);
     setImagePrompt(turn.prompt);
-    setImageCount(String(Math.max(1, turn.count || turn.images.length || 1)));
+    setImageCount(clampImageCount(String(turn.count || turn.images.length || 1)));
     const safeSize = safeImageSize(turn.size, imageResizeLimits);
     const parsedSize = parseImageSize(safeSize);
     const sizeMode = resolveImageSizeMode(turn.ratio, turn.tier, safeSize);
@@ -1368,7 +1379,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   }, []);
 
   const createLoadingImages = (turnId: string, count: number) =>
-    Array.from({ length: count }, (_, index) => {
+    Array.from({ length: normalizeImageCount(count) }, (_, index) => {
       const imageId = `${turnId}-${index}`;
       return {
         id: imageId,
@@ -1376,6 +1387,37 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         status: "loading" as const,
       };
     });
+
+  const markImagesAsFailed = useCallback(async (conversationId: string, turnId: string, failures: { taskId: string; error: string }[]) => {
+    if (failures.length === 0) {
+      return;
+    }
+    const failureMap = new Map(failures.map((failure) => [failure.taskId, failure.error]));
+    await updateConversation(conversationId, (current) => {
+      const conversation = current ?? conversationsRef.current.find((item) => item.id === conversationId);
+      if (!conversation) return current!;
+      return {
+        ...conversation,
+        updatedAt: new Date().toISOString(),
+        turns: conversation.turns.map((turn) => {
+          if (turn.id !== turnId) {
+            return turn;
+          }
+          const images = turn.images.map((image) => {
+            const taskId = image.taskId || image.id;
+            const error = failureMap.get(taskId);
+            return error ? { ...image, status: "error" as const, error } : image;
+          });
+          const derived = deriveTurnStatus({ ...turn, images });
+          return {
+            ...turn,
+            ...derived,
+            images,
+          };
+        }),
+      };
+    });
+  }, [updateConversation]);
 
   /* eslint-disable react-hooks/preserve-manual-memoization */
   const runConversationQueue = useCallback(
@@ -1433,15 +1475,36 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         }
 
         const pendingImages = activeTurn.images.filter((image) => image.status === "loading");
-        const submitted = await Promise.all(
-          pendingImages.map((image) => {
+        const submitImages = pendingImages.slice(0, MAX_IMAGE_COUNT);
+        const overflowImages = pendingImages.slice(MAX_IMAGE_COUNT);
+        await markImagesAsFailed(
+          conversationId,
+          activeTurn.id,
+          overflowImages.map((image) => ({
+            taskId: image.taskId || image.id,
+            error: `一次最多生成 ${MAX_IMAGE_COUNT} 张图片`,
+          })),
+        );
+        const submitted: ImageTask[] = [];
+        const submitFailures: { taskId: string; error: string }[] = [];
+        await Promise.all(
+          submitImages.map(async (image) => {
             const taskId = image.taskId || image.id;
-            return activeTurn.mode === "edit"
-              ? createImageEditTask(taskId, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeTurn.id, activeTurn.ratio)
-              : createImageGenerationTask(taskId, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeTurn.id, activeTurn.ratio);
+            try {
+              const task = activeTurn.mode === "edit"
+                ? await createImageEditTask(taskId, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeTurn.id, activeTurn.ratio)
+                : await createImageGenerationTask(taskId, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeTurn.id, activeTurn.ratio);
+              submitted.push(task);
+            } catch (error) {
+              submitFailures.push({
+                taskId,
+                error: error instanceof Error ? error.message : "提交图片任务失败",
+              });
+            }
           }),
         );
         await applyTasks(submitted);
+        await markImagesAsFailed(conversationId, activeTurn.id, submitFailures);
 
         let consecutiveErrors = 0;
         const retryingTaskIdsRef = new Set<string>();
@@ -1496,33 +1559,45 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
               const missingImages = latestTurn.images.filter(
                 (image) => image.status === "loading" && image.taskId && taskList.missing_ids.includes(image.taskId),
               );
-              const resubmitted = await Promise.all(
-                missingImages.map((image) =>
-                  activeTurn.mode === "edit"
-                    ? createImageEditTask(
-                        image.taskId || image.id,
-                        referenceFiles,
-                        activeTurn.prompt,
-                        activeTurn.model,
-                        activeTurn.size,
-                        activeTurn.quality,
-                        activeTurn.id,
-                        activeTurn.ratio,
-                      )
-                    : createImageGenerationTask(
-                        image.taskId || image.id,
-                        activeTurn.prompt,
-                        activeTurn.model,
-                        activeTurn.size,
-                        activeTurn.quality,
-                        activeTurn.id,
-                        activeTurn.ratio,
-                      ),
-                ),
+              const resubmitted: ImageTask[] = [];
+              const resubmitFailures: { taskId: string; error: string }[] = [];
+              await Promise.all(
+                missingImages.map(async (image) => {
+                  const taskId = image.taskId || image.id;
+                  try {
+                    const task = activeTurn.mode === "edit"
+                      ? await createImageEditTask(
+                          taskId,
+                          referenceFiles,
+                          activeTurn.prompt,
+                          activeTurn.model,
+                          activeTurn.size,
+                          activeTurn.quality,
+                          activeTurn.id,
+                          activeTurn.ratio,
+                        )
+                      : await createImageGenerationTask(
+                          taskId,
+                          activeTurn.prompt,
+                          activeTurn.model,
+                          activeTurn.size,
+                          activeTurn.quality,
+                          activeTurn.id,
+                          activeTurn.ratio,
+                        );
+                    resubmitted.push(task);
+                  } catch (error) {
+                    resubmitFailures.push({
+                      taskId,
+                      error: error instanceof Error ? error.message : "重新提交图片任务失败",
+                    });
+                  }
+                }),
               );
               if (resubmitted.length > 0) {
                 await applyTasks(resubmitted);
               }
+              await markImagesAsFailed(conversationId, activeTurn.id, resubmitFailures);
             }
           } catch (pollError) {
             consecutiveErrors += 1;
@@ -1571,7 +1646,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         }
       }
     },
-    [loadQuota, updateConversation],
+    [loadQuota, markImagesAsFailed, updateConversation],
   );
   /* eslint-enable react-hooks/preserve-manual-memoization */
 
@@ -1585,7 +1660,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
       const now = new Date().toISOString();
       const nextTurnId = createId();
-      const count = Math.max(1, sourceTurn.count || sourceTurn.images.length || 1);
+      const count = normalizeImageCount(sourceTurn.count || sourceTurn.images.length || 1);
       const imageSize = safeImageSize(sourceTurn.size, imageResizeLimits);
       const sizeMode = resolveImageSizeMode(sourceTurn.ratio, sourceTurn.tier, imageSize);
       const nextTurn: ImageTurn = {

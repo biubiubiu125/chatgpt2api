@@ -13,7 +13,7 @@ from typing import Any
 from services.config import DATA_DIR, config
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.account_service import account_service
-from utils.helper import is_codex_image_model, parse_image_size
+from utils.helper import is_codex_image_model, parse_image_count, parse_image_size
 from utils.request_summary import request_text
 
 TASK_STATUS_QUEUED = "queued"
@@ -79,6 +79,13 @@ def _clean(value: object, default: str = "") -> str:
 def _normalize_response_format(value: object, default: str = "b64_json") -> str:
     text = _clean(value, default).lower()
     return "url" if text == "url" else "b64_json"
+
+
+def _parse_task_image_count(value: object) -> int:
+    count = parse_image_count(value)
+    if count != 1:
+        raise ValueError("image task n must be 1")
+    return count
 
 
 def _task_result_rel(key: str, index: int) -> str:
@@ -521,13 +528,15 @@ class ImageTaskService:
         aspect_ratio: str | None = None,
         quality: str = "auto",
         response_format: str = "b64_json",
+        n: object = 1,
         base_url: str = "",
     ) -> dict[str, Any]:
+        normalized_n = _parse_task_image_count(n)
         normalized_size = parse_image_size(size, aspect_ratio)
         payload = {
             "prompt": prompt,
             "model": model,
-            "n": 1,
+            "n": normalized_n,
             "size": normalized_size,
             "quality": quality,
             "response_format": _normalize_response_format(response_format),
@@ -547,17 +556,19 @@ class ImageTaskService:
         aspect_ratio: str | None = None,
         quality: str = "auto",
         response_format: str = "b64_json",
+        n: object = 1,
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
     ) -> dict[str, Any]:
+        normalized_n = _parse_task_image_count(n)
         normalized_size = parse_image_size(size, aspect_ratio)
         payload = {
             "prompt": prompt,
             "images": images or [],
             "mask": masks or [],
             "model": model,
-            "n": 1,
+            "n": normalized_n,
             "size": normalized_size,
             "quality": quality,
             "response_format": _normalize_response_format(response_format),
