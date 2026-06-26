@@ -204,17 +204,17 @@ export function ConfigCard() {
             <p className="text-xs text-stone-500">限制每个账号同时处理的图片请求数量，默认 3。</p>
           </div>
           <div className="space-y-2">
-            <label className="text-sm text-stone-700">生图账号兜底次数</label>
+            <label className="text-sm text-stone-700">生图最多尝试账号数</label>
             <Input
               type="number"
               min={0}
-              max={1}
+              max={10}
               value={String(config?.image_account_fallback_limit ?? "")}
               onChange={(event) => setImageAccountFallbackLimit(event.target.value)}
-              placeholder="1"
+              placeholder="10"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">整个生图请求内最多只换一次账号；填 0 表示不兜底，文生图和图生图一致。</p>
+            <p className="text-xs text-stone-500">整个生图请求内最多尝试的账号总数，最大 10；填 0 表示不兜底，文生图和图生图一致。</p>
           </div>
           <div className="space-y-2">
             <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">

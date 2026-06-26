@@ -42,9 +42,9 @@ class ImageFallbackTracker:
     @staticmethod
     def _normalize_limit(value: object) -> int:
         try:
-            return min(1, max(0, int(value)))
+            return min(10, max(0, int(value)))
         except (TypeError, ValueError):
-            return 1
+            return 10
 
     def __post_init__(self) -> None:
         self.limit = self._normalize_limit(self.limit)
@@ -58,6 +58,9 @@ class ImageFallbackTracker:
             self.limit = self._normalize_limit(self.limit)
             return self.count, self.limit, [dict(item) for item in self.events]
 
+    def _allowed_fallback_count(self) -> int:
+        return max(0, self.limit - 1)
+
     def use(
             self,
             reason: str,
@@ -69,7 +72,7 @@ class ImageFallbackTracker:
     ) -> tuple[bool, int, int, list[dict[str, Any]]]:
         with self.lock:
             self.limit = self._normalize_limit(self.limit)
-            if self.count >= self.limit:
+            if self.count >= self._allowed_fallback_count():
                 self.events.append({
                     "reason": reason,
                     "account_email": account_email,
@@ -299,15 +302,41 @@ def is_image_account_unusable_exception(exc: Exception) -> bool:
     return is_image_account_unusable_error(_exception_text(exc))
 
 
+def is_no_image_generated_error(message: str) -> bool:
+    text = str(message or "").lower()
+    if not text:
+        return False
+    if is_token_invalid_error(text) or is_image_policy_rejection_error(text) or is_image_account_unusable_error(text):
+        return False
+    markers = (
+        "no image result found",
+        "no image generated",
+        "without generating images",
+        "completed without generating images",
+        "completed upstream but the result could not be retrieved",
+        "result could not be retrieved",
+        "image may still be processing",
+        "response was incomplete",
+        "please try again in a moment",
+        "please try again.",
+        "image generation request failed. please try again later",
+    )
+    return any(marker in text for marker in markers)
+
+
 def is_non_account_image_generation_error(exc: Exception, message: str = "") -> bool:
     text = str(message or "") or _exception_text(exc)
     if is_image_account_unusable_error(text):
+        return False
+    if is_no_image_generated_error(text):
         return False
     if is_image_policy_rejection_error(text):
         return True
     code = str(getattr(exc, "code", "") or "").strip()
     error_type = str(getattr(exc, "error_type", "") or "").strip()
-    if code in {"content_policy_violation", "no_image_generated"}:
+    if code == "no_image_generated":
+        return False
+    if code == "content_policy_violation":
         return True
     if error_type == "invalid_request_error" and not is_token_invalid_exception(exc):
         return True
@@ -778,11 +807,16 @@ class ImageTokenLeasePool:
         account = account_service.get_account(access_token) or {}
         account_email = str(account.get("email") or "").strip()
         account_id = str(account.get("account_id") or account.get("user_id") or "").strip()
+        error_text = _exception_text(exc)
+        if is_token_invalid_exception(exc):
+            account_service.remove_invalid_token(access_token, "image_account_preflight")
+        elif is_image_account_unusable_error(error_text):
+            account_service.remove_abnormal_image_account(access_token, "image_account_preflight", error_text)
         allowed, used_count, limit, events = self.fallback_tracker.use(
             "account_preflight_failed",
             account_email=account_email,
             account_id=account_id,
-            error_text=_exception_text(exc),
+            error_text=error_text,
         )
         if allowed:
             logger.warning({
@@ -790,7 +824,7 @@ class ImageTokenLeasePool:
                 "fallback_count": used_count,
                 "fallback_limit": limit,
                 "account_email": account_email,
-                "error": _exception_text(exc)[:200],
+                "error": error_text[:200],
             })
             return
         error = ImageGenerationError(
@@ -1834,6 +1868,11 @@ def _generate_single_image(
         account = account_service.get_account(candidate_token) or {}
         candidate_email = str(account.get("email") or "").strip()
         candidate_id = str(account.get("account_id") or account.get("user_id") or "").strip()
+        error_text = _exception_text(exc)
+        if is_token_invalid_exception(exc):
+            account_service.remove_invalid_token(candidate_token, "image_account_preflight")
+        elif is_image_account_unusable_error(error_text):
+            account_service.remove_abnormal_image_account(candidate_token, "image_account_preflight", error_text)
         if candidate_email and candidate_email not in tried_account_emails:
             tried_account_emails.append(candidate_email)
         if candidate_id and candidate_id not in tried_account_ids:
@@ -1842,7 +1881,7 @@ def _generate_single_image(
             "account_preflight_failed",
             account_email=candidate_email,
             account_id=candidate_id,
-            error_text=_exception_text(exc),
+            error_text=error_text,
         )
         nonlocal account_fallback_count, account_fallback_limit, fallback_events
         account_fallback_count = used_count
@@ -1855,7 +1894,7 @@ def _generate_single_image(
                 "index": index,
                 "fallback_count": account_fallback_count,
                 "fallback_limit": account_fallback_limit,
-                "error": _exception_text(exc)[:200],
+                "error": error_text[:200],
             })
             return
         error = ImageGenerationError(
@@ -2046,11 +2085,12 @@ def _generate_single_image(
                     message_text = output.text or "Image generation was rejected by upstream policy."
                     is_account_error = is_image_account_unusable_error(message_text)
                     is_text_reply = is_model_text_reply_instead_of_image(message_text)
+                    is_no_image_error = is_no_image_generated_error(message_text)
                     raise ImageGenerationError(
                         message_text,
-                        status_code=403 if is_account_error else (502 if is_text_reply else 400),
-                        error_type="authentication_error" if is_account_error else ("server_error" if is_text_reply else "invalid_request_error"),
-                        code="account_unusable" if is_account_error else ("upstream_text_reply" if is_text_reply else "content_policy_violation"),
+                        status_code=403 if is_account_error else (502 if (is_text_reply or is_no_image_error) else 400),
+                        error_type="authentication_error" if is_account_error else ("server_error" if (is_text_reply or is_no_image_error) else "invalid_request_error"),
+                        code="account_unusable" if is_account_error else ("upstream_text_reply" if is_text_reply else ("no_image_generated" if is_no_image_error else "content_policy_violation")),
                         account_email=account_email,
                         account_id=account_id,
                         conversation_id=output.conversation_id,
@@ -2068,33 +2108,25 @@ def _generate_single_image(
                 release_current_token(False)
                 if emitted_for_token:
                     conv_id = outputs[-1].conversation_id if outputs else ""
-                    error = ImageGenerationError(
-                        "upstream completed without generating images",
-                        status_code=400,
-                        error_type="invalid_request_error",
-                        code="no_image_generated",
-                        account_email=account_email,
-                        account_id=account_id,
-                        conversation_id=conv_id,
-                    )
-                    attach_fallback_context(error)
-                    raise error
+                    error_text = "upstream completed without generating images"
+                    logger.warning({
+                        "event": "image_stream_no_image_generated_retry",
+                        "request_token": token,
+                        "account_email": account_email,
+                        "index": index,
+                        "conversation_id": conv_id,
+                    })
+                    use_account_fallback_after_current_released("no_image_generated", error_text, conv_id)
+                    continue
                 return outputs
             _record_backend_proxy_result(backend, True)
             release_current_token(True)
             return annotate_outputs(outputs)
         except ImagePollTimeoutError as exc:
             attach_account_context(exc)
-            account_service.remove_abnormal_image_timeout_account(
-                token,
-                "image_poll_timeout",
-                str(exc),
-            )
-            if token_pool is not None:
-                token_pool.release(token)
-            current_token = ""
+            release_current_token(False)
             logger.warning({
-                "event": "image_poll_timeout_account_removed",
+                "event": "image_poll_timeout_switch_account",
                 "request_token": token,
                 "account_email": account_email,
                 "index": index,
@@ -2179,6 +2211,17 @@ def _generate_single_image(
                 )
                 attach_fallback_context(error, "upstream_text_reply")
                 raise error from exc
+            if is_no_image_generated_error(error_text):
+                logger.warning({
+                    "event": "image_stream_no_image_retry",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "emitted_for_token": emitted_for_token,
+                    "index": index,
+                    "error": error_text[:200],
+                })
+                if switch_token_with_fallback_limit("no_image_generated", error_text, getattr(exc, "conversation_id", "")):
+                    continue
             if should_use_image_account_fallback(exc, error_text):
                 logger.warning({
                     "event": "image_stream_account_unusable_retry",
@@ -2234,6 +2277,17 @@ def _generate_single_image(
                 })
                 remove_current_image_account("image_account_unusable", last_error)
                 if switch_token_with_fallback_limit("account_unusable", last_error, ""):
+                    continue
+            if is_no_image_generated_error(last_error):
+                logger.warning({
+                    "event": "image_stream_no_image_retry",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "emitted_for_token": emitted_for_token,
+                    "index": index,
+                    "error": last_error[:200],
+                })
+                if switch_token_with_fallback_limit("no_image_generated", last_error, ""):
                     continue
             if is_upstream_connection_error(last_error):
                 retry_count = upstream_connection_retries_by_token.get(token, 0) + 1
@@ -2359,6 +2413,14 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
     if not is_supported_image_model(request.model):
         raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
+    if request.n != 1:
+        raise ImageGenerationError(
+            "n must be 1",
+            status_code=400,
+            error_type="invalid_request_error",
+            code="invalid_request",
+            param="n",
+        )
 
     fallback_tracker = request.fallback_tracker if isinstance(request.fallback_tracker, ImageFallbackTracker) else ImageFallbackTracker()
 

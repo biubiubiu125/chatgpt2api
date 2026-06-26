@@ -49,9 +49,9 @@ def _normalize_fallback_limit(value: object = None) -> int:
     if value is None:
         value = config.image_account_fallback_limit
     try:
-        return min(1, max(0, int(value)))
+        return min(10, max(0, int(value)))
     except (TypeError, ValueError):
-        return 1
+        return 10
 
 
 def _now_iso() -> str:
@@ -261,6 +261,29 @@ def _is_image_token_invalid_exception(exc: Exception) -> bool:
         )
 
 
+def _is_image_account_unusable_exception(exc: Exception) -> bool:
+    try:
+        from services.protocol.conversation import is_image_account_unusable_exception
+
+        return is_image_account_unusable_exception(exc)
+    except Exception:
+        text = str(exc or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "account disabled",
+                "account suspended",
+                "account banned",
+                "account locked",
+                "account_deactivated",
+                "does not have access",
+                "not entitled",
+                "subscription required",
+                "subscription inactive",
+            )
+        )
+
+
 def _serialize_image_input(item: object) -> dict[str, str] | None:
     if not isinstance(item, tuple) or len(item) < 3:
         return None
@@ -381,6 +404,23 @@ def _find_account_for_resume(account_id: str = "", account_email: str = "") -> d
         if normalized_email and candidate_email == normalized_email:
             return dict(account)
     return None
+
+
+def _is_resume_account_unusable(account: dict[str, Any]) -> bool:
+    if not isinstance(account, dict):
+        return True
+    if bool(account.get("image_disabled")):
+        return True
+    if _clean(account.get("status")) in {"限流", "异常", "禁用"}:
+        return True
+    if bool(account.get("image_quota_unknown")):
+        return False
+    if "quota" not in account or account.get("quota") is None:
+        return False
+    try:
+        return int(account.get("quota") or 0) <= 0
+    except (TypeError, ValueError):
+        return True
 
 
 def _public_task(
@@ -985,7 +1025,7 @@ class ImageTaskService:
                 for event in (fallback_context.get("fallback_events") or [])
                 if isinstance(event, dict)
             ]
-            if fallback_count >= fallback_limit:
+            if fallback_count >= max(0, fallback_limit - 1):
                 fallback_events.append({
                     "reason": reason,
                     "account_email": account_email,
@@ -1271,6 +1311,28 @@ class ImageTaskService:
                 return _public_task(task, result_dir=self.result_dir)
             raise ValueError(_public_image_error(error_message))
         access_token = _clean(account.get("access_token"))
+        if _is_resume_account_unusable(account):
+            account_service.remove_abnormal_image_account(
+                access_token,
+                "image_resume_poll_account_unusable",
+                "resume poll account is unusable",
+            )
+            regenerated, error_message, _fallback_context = self._consume_resume_fallback_and_regenerate(
+                key,
+                mode,
+                payload,
+                dict(identity),
+                model,
+                account_email,
+                conversation_id,
+                "image resume poll account is unusable",
+                run_async=True,
+            )
+            if regenerated:
+                with self._lock:
+                    task = dict(self._tasks.get(key) or {})
+                return _public_task(task, result_dir=self.result_dir)
+            raise ValueError(_public_image_error(error_message))
         refreshed_token = account_service.refresh_access_token(access_token, event="image_resume_poll")
         if not refreshed_token:
             regenerated, error_message, _fallback_context = self._consume_resume_fallback_and_regenerate(
@@ -1396,6 +1458,22 @@ class ImageTaskService:
                     account_email,
                     conversation_id,
                     error_message,
+                    allowed_statuses=(TASK_STATUS_RUNNING,),
+                )
+                if regenerated:
+                    return
+            elif _is_image_account_unusable_exception(exc):
+                account_service.remove_abnormal_image_account(access_token, "image_resume_poll_account_unusable", error_message)
+                regenerated, error_message, fallback_context = self._consume_resume_fallback_and_regenerate(
+                    key,
+                    mode,
+                    payload or {},
+                    dict(identity),
+                    model,
+                    account_email,
+                    conversation_id,
+                    error_message,
+                    reason="account_unusable",
                     allowed_statuses=(TASK_STATUS_RUNNING,),
                 )
                 if regenerated:

@@ -468,9 +468,10 @@ class ConfigStore:
     @property
     def image_account_fallback_limit(self) -> int:
         try:
-            return min(1, max(0, int(self.data.get("image_account_fallback_limit", 1))))
+            value = int(self.data.get("image_account_fallback_limit", 10))
+            return min(10, max(0, value))
         except (TypeError, ValueError):
-            return 1
+            return 10
 
     @property
     def image_resize_max_side(self) -> int:
@@ -652,9 +653,9 @@ class ConfigStore:
                     next_data.pop(key, None)
         if "image_account_fallback_limit" in next_data:
             try:
-                next_data["image_account_fallback_limit"] = min(1, max(0, int(next_data["image_account_fallback_limit"])))
+                next_data["image_account_fallback_limit"] = min(10, max(0, int(next_data["image_account_fallback_limit"])))
             except (TypeError, ValueError):
-                next_data["image_account_fallback_limit"] = 1
+                next_data["image_account_fallback_limit"] = 10
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:

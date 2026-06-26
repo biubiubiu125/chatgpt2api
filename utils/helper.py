@@ -32,7 +32,7 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
 MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_JSON_EDIT_IMAGES = 10
-MAX_IMAGE_COUNT = 50
+MAX_IMAGE_COUNT = 1
 DEFAULT_IMAGE_ASPECT_RATIO = "1:1"
 DEFAULT_IMAGE_RESOLUTION_TIER = "2k"
 IMAGE_SIZE_PRESETS = {
@@ -695,8 +695,8 @@ def parse_image_count(raw_value: object) -> int:
             value = int(text)
     except (TypeError, ValueError, decimal.InvalidOperation) as exc:
         raise HTTPException(status_code=400, detail={"error": "n must be an integer"}) from exc
-    if value < 1 or value > MAX_IMAGE_COUNT:
-        raise HTTPException(status_code=400, detail={"error": f"n must be between 1 and {MAX_IMAGE_COUNT}"})
+    if value != 1:
+        raise HTTPException(status_code=400, detail={"error": "n must be 1"})
     return value
 
 
