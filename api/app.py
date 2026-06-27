@@ -20,16 +20,19 @@ from services.realtime_monitor_service import realtime_monitor_service
 from utils.log import logger
 
 
-def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 500) -> int:
+def _env_int(name: str, default: int, minimum: int = 1, maximum: int | None = None) -> int:
     try:
         value = int(str(os.getenv(name, "") or default).strip())
     except (TypeError, ValueError):
         value = default
-    return min(max(value, minimum), maximum)
+    value = max(value, minimum)
+    if maximum is not None:
+        value = min(value, maximum)
+    return value
 
 
 def _configure_threadpool() -> None:
-    tokens = _env_int("CHATGPT2API_THREAD_TOKENS", 80, 1, 500)
+    tokens = _env_int("CHATGPT2API_THREAD_TOKENS", 80, 1)
     limiter = current_default_thread_limiter()
     previous = int(getattr(limiter, "total_tokens", 0) or 0)
     if previous != tokens:

@@ -130,7 +130,7 @@ text() {
       err_mode) printf 'MODE must be docker or python.' ;;
       err_storage) printf 'STORAGE_BACKEND must be json, sqlite, postgres or git.' ;;
       err_port) printf 'PORT must be a number.' ;;
-      err_thread_tokens) printf 'CHATGPT2API_THREAD_TOKENS must be a number between 1 and 500.' ;;
+      err_thread_tokens) printf 'CHATGPT2API_THREAD_TOKENS must be a positive number.' ;;
       err_not_git) printf 'exists but is not a git repository.' ;;
       err_compose) printf 'docker compose plugin not found. Please install Docker Compose v2 first.' ;;
       info_update) printf 'Updating' ;;
@@ -157,7 +157,7 @@ text() {
   fi
 
   case "${key}" in
-    err_thread_tokens) printf 'CHATGPT2API_THREAD_TOKENS 必须是 1 到 500 之间的数字。' ;;
+    err_thread_tokens) printf 'CHATGPT2API_THREAD_TOKENS 必须是正整数。' ;;
     prompt_thread_tokens) printf '后端线程池容量' ;;
     usage_title) printf 'ChatGPT2API 安装脚本' ;;
     usage_usage) printf '用法：' ;;
@@ -467,7 +467,7 @@ validate_inputs() {
     exit 1
   fi
 
-  if [[ -z "${THREAD_TOKENS}" || ! "${THREAD_TOKENS}" =~ ^[0-9]+$ || "${THREAD_TOKENS}" -lt 1 || "${THREAD_TOKENS}" -gt 500 ]]; then
+  if [[ -z "${THREAD_TOKENS}" || ! "${THREAD_TOKENS}" =~ ^[0-9]+$ || "${THREAD_TOKENS}" -lt 1 ]]; then
     echo "[$(text prefix_error)] $(text err_thread_tokens)" >&2
     exit 1
   fi
