@@ -104,6 +104,15 @@ def format_image_result(
                 "revised_prompt": revised_prompt,
             }
         else:
+            try:
+                save(image_bytes, base_url)
+            except Exception as exc:
+                logger.warning({
+                    "event": "image_result_save_failed",
+                    "response_format": response_format_normalized or "b64_json",
+                    "size": f"{image_size[0]}x{image_size[1]}" if image_size else "",
+                    "error": str(exc)[:200],
+                })
             result_item = {
                 "b64_json": b64_json,
                 "revised_prompt": revised_prompt,
