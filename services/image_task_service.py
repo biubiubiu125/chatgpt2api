@@ -25,6 +25,8 @@ UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
 MAX_TASK_GROUP_WORKERS = 20
 TASK_RESULT_DIR = DATA_DIR / "image_task_results"
 TASK_RESULT_PATH_KEY = "_b64_path"
+TASK_RESULT_PUBLIC_KEYS = {"b64_json", "revised_prompt", "width", "height", "size"}
+TASK_RESULT_STORED_KEYS = {TASK_RESULT_PATH_KEY, "revised_prompt", "width", "height", "size"}
 
 
 def _default_generation_handler(payload: dict[str, Any]) -> dict[str, Any]:
@@ -77,8 +79,7 @@ def _clean(value: object, default: str = "") -> str:
 
 
 def _normalize_response_format(value: object, default: str = "b64_json") -> str:
-    text = _clean(value, default).lower()
-    return "url" if text == "url" else "b64_json"
+    return "b64_json"
 
 
 def _parse_task_image_count(value: object) -> int:
@@ -127,13 +128,12 @@ def _store_task_data(key: str, data: list[Any], result_dir: Path = TASK_RESULT_D
         if not isinstance(item, dict):
             stored.append(item)
             continue
-        next_item = dict(item)
-        b64_json = _clean(next_item.get("b64_json"))
+        next_item = {field: value for field, value in item.items() if field in TASK_RESULT_STORED_KEYS}
+        b64_json = _clean(item.get("b64_json"))
         if b64_json:
             result_dir.mkdir(parents=True, exist_ok=True)
-            rel = _clean(next_item.get(TASK_RESULT_PATH_KEY)) or _task_result_rel(key, index)
+            rel = _clean(item.get(TASK_RESULT_PATH_KEY)) or _task_result_rel(key, index)
             _task_result_path(rel, result_dir).write_bytes(base64.b64decode(b64_json))
-            next_item.pop("b64_json", None)
             next_item[TASK_RESULT_PATH_KEY] = rel
         stored.append(next_item)
     return stored
@@ -153,11 +153,7 @@ def _hydrate_task_data(
         if not isinstance(item, dict):
             hydrated.append(item)
             continue
-        next_item = {
-            key: value
-            for key, value in item.items()
-            if key != TASK_RESULT_PATH_KEY
-        }
+        next_item = {field: value for field, value in item.items() if field in TASK_RESULT_PUBLIC_KEYS}
         if include_image_data:
             b64_json = _clean(item.get("b64_json"))
             rel = _clean(item.get(TASK_RESULT_PATH_KEY))
@@ -186,13 +182,7 @@ def _task_group_key(owner_id: str, group_id: str, task_id: str) -> str:
 
 
 def _collect_image_urls(data: list[Any]) -> list[str]:
-    urls: list[str] = []
-    for item in data:
-        if isinstance(item, dict):
-            url = item.get("url")
-            if isinstance(url, str) and url:
-                urls.append(url)
-    return urls
+    return []
 
 
 def _collect_account_emails(value: object) -> list[str]:

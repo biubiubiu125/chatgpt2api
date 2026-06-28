@@ -406,17 +406,6 @@ export function ConfigCard() {
                   disabled={!config?.image_storage?.enabled}
                 />
               </div>
-              <div className="space-y-2 md:col-span-3">
-                <label className="text-sm text-stone-700">公开访问前缀</label>
-                <Input
-                  value={String(config?.image_storage?.public_base_url || "")}
-                  onChange={(event) => setImageStorageField("public_base_url", event.target.value)}
-                  placeholder="https://cdn.example.com/chatgpt2api/images"
-                  className="h-10 rounded-xl border-stone-200 bg-white"
-                  disabled={!config?.image_storage?.enabled}
-                />
-                <p className="text-xs text-stone-500">留空时返回本应用 /images/... 代理地址；填入后直接返回公开图片地址。</p>
-              </div>
             </div>
           </div>
           <div className="space-y-4 rounded-xl border border-stone-200 bg-white px-4 py-3 md:col-span-2">

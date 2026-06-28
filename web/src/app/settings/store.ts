@@ -174,7 +174,6 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
       webdav_username: "",
       webdav_password: "",
       webdav_root_path: "chatgpt2api/images",
-      public_base_url: "",
     };
   const imageStorageMode: ImageStorageMode = imageStorage.enabled && imageStorage.mode === "both"
     ? "both"
@@ -251,7 +250,6 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
       webdav_username: String(imageStorage.webdav_username || ""),
       webdav_password: String(imageStorage.webdav_password || ""),
       webdav_root_path: String(imageStorage.webdav_root_path || "chatgpt2api/images"),
-      public_base_url: String(imageStorage.public_base_url || ""),
     },
     proxy_runtime: normalizeProxyRuntime(config.proxy_runtime),
     third_party_apps: normalizeThirdPartyApps(config.third_party_apps),
@@ -535,7 +533,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           webdav_username: String(config.image_storage?.webdav_username || "").trim(),
           webdav_password: String(config.image_storage?.webdav_password || "").trim(),
           webdav_root_path: String(config.image_storage?.webdav_root_path || "chatgpt2api/images").trim(),
-          public_base_url: String(config.image_storage?.public_base_url || "").trim(),
         },
         proxy_runtime: {
           ...normalizeProxyRuntime(config.proxy_runtime),

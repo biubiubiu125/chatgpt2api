@@ -33,6 +33,21 @@ def _parse_task_ids(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+TASK_URL_KEYS = {"url", "urls", "image_url", "remote_url", "thumbnail_url", "view_path", "thumbnail_path"}
+
+
+def _strip_image_urls(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_strip_image_urls(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _strip_image_urls(item)
+            for key, item in value.items()
+            if key not in TASK_URL_KEYS
+        }
+    return value
+
+
 async def filter_or_log(call: LoggedCall, text: str) -> None:
     try:
         await run_in_threadpool(check_request, text)
@@ -51,7 +66,8 @@ def create_router() -> APIRouter:
         authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
-        return await run_in_threadpool(image_task_service.list_tasks, identity, _parse_task_ids(ids), include_image_data)
+        result = await run_in_threadpool(image_task_service.list_tasks, identity, _parse_task_ids(ids), include_image_data)
+        return _strip_image_urls(result)
 
     @router.post("/api/image-tasks/generations")
     async def create_generation_task(
@@ -62,7 +78,7 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         await filter_or_log(LoggedCall(identity, "/api/image-tasks/generations", body.model, "文生图任务", request_text=body.prompt), body.prompt)
         try:
-            return await run_in_threadpool(
+            result = await run_in_threadpool(
                 image_task_service.submit_generation,
                 identity,
                 client_task_id=body.client_task_id,
@@ -73,9 +89,10 @@ def create_router() -> APIRouter:
                 size=body.size,
                 aspect_ratio=body.aspect_ratio,
                 quality=body.quality,
-                response_format=body.response_format,
+                response_format="b64_json",
                 base_url=resolve_image_base_url(request),
             )
+            return _strip_image_urls(result)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
@@ -98,7 +115,7 @@ def create_router() -> APIRouter:
         images = await read_image_sources(image_sources)
         masks = await read_image_sources(mask_sources) if mask_sources else None
         try:
-            return await run_in_threadpool(
+            result = await run_in_threadpool(
                 image_task_service.submit_edit,
                 identity,
                 client_task_id=client_task_id,
@@ -109,11 +126,12 @@ def create_router() -> APIRouter:
                 size=payload["size"],
                 aspect_ratio=payload.get("aspect_ratio"),
                 quality=payload["quality"],
-                response_format=payload["response_format"],
+                response_format="b64_json",
                 base_url=resolve_image_base_url(request),
                 images=images,
                 masks=masks,
             )
+            return _strip_image_urls(result)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
@@ -126,12 +144,13 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         try:
-            return await run_in_threadpool(
+            result = await run_in_threadpool(
                 image_task_service.resume_poll,
                 identity,
                 task_id,
                 body.extra_timeout_secs,
             )
+            return _strip_image_urls(result)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 

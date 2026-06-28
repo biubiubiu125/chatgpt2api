@@ -312,15 +312,6 @@ function buildReferenceImageFromResult(image: StoredImage, fileName: string): St
   };
 }
 
-async function fetchImageAsFile(url: string, fileName: string) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error("读取结果图失败");
-  }
-  const blob = await response.blob();
-  return new File([blob], fileName, { type: blob.type || "image/png" });
-}
-
 async function buildReferenceImageFromStoredImage(image: StoredImage, fileName: string) {
   const direct = buildReferenceImageFromResult(image, fileName);
   if (direct) {
@@ -329,25 +320,13 @@ async function buildReferenceImageFromStoredImage(image: StoredImage, fileName: 
       file: dataUrlToFile(direct.dataUrl, direct.name, direct.type),
     };
   }
-
-  if (!image.url) {
-    return null;
-  }
-  const file = await fetchImageAsFile(image.url, fileName);
-  return {
-    referenceImage: {
-      name: file.name,
-      type: file.type || "image/png",
-      dataUrl: await readFileAsDataUrl(file),
-    },
-    file,
-  };
+  return null;
 }
 
 function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage {
   if (task.status === "success") {
     const first = task.data?.[0];
-    if (!first?.b64_json && !first?.url) {
+    if (!first?.b64_json) {
       return {
         ...image,
         taskId: task.id,
@@ -364,7 +343,6 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
       taskStatus: undefined,
       progress: undefined,
       b64_json: first.b64_json,
-      url: first.url,
       revised_prompt: first.revised_prompt,
       size: first.size,
       width: first.width,
@@ -469,7 +447,7 @@ async function syncConversationImageTasks(items: ImageConversation[]) {
   try {
     taskList = await fetchImageTasks(taskIds, false);
     const successIds = taskList.items
-      .filter((task) => task.status === "success" && !task.data?.some((item) => item.b64_json || item.url))
+      .filter((task) => task.status === "success" && !task.data?.some((item) => item.b64_json))
       .map((task) => task.id);
     if (successIds.length > 0) {
       const fullTaskList = await fetchImageTasks(successIds);
@@ -1523,7 +1501,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
           try {
             let taskList = await fetchImageTasks(loadingTaskIds, false);
             const successIds = taskList.items
-              .filter((task) => task.status === "success" && !task.data?.some((item) => item.b64_json || item.url))
+              .filter((task) => task.status === "success" && !task.data?.some((item) => item.b64_json))
               .map((task) => task.id);
             if (successIds.length > 0) {
               const fullTaskList = await fetchImageTasks(successIds);

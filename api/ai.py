@@ -106,6 +106,7 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
         payload["n"] = parse_image_count(payload.get("n"))
+        payload["response_format"] = "b64_json"
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
@@ -118,6 +119,7 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
+        payload["response_format"] = "b64_json"
         prompt = str(payload["prompt"])
         model = str(payload["model"])
         call = LoggedCall(identity, "/v1/images/edits", model, "图生图", request_text=prompt)

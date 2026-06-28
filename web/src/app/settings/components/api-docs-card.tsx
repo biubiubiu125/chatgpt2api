@@ -104,14 +104,12 @@ const docs: ApiDoc[] = [
       ["n", "number", "可选，生成数量，范围 1-10，默认 1。"],
       ["size", "string", "可选，支持 WIDTHxHEIGHT 精确尺寸，或 1k/2k/4k 档位；未传时默认按 2k 和当前比例处理。"],
       ["quality", "string", "可选，默认 auto。"],
-      ["response_format", "string", "可选，默认 b64_json；只有传 url 时才返回图片链接。"],
     ],
     output: [
       ["data", "array", "图片结果列表。"],
       ["data[].b64_json", "string", "base64 图片内容。"],
-      ["data[].url", "string", "仅 response_format=url 时返回。"],
     ],
-    example: (baseUrl: string, key: string) => `curl ${baseUrl}/images/generations \\
+    example: (baseUrl: string, key: string) => `curl ${baseUrl}/v1/images/generations \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer ${key}" \\
   -d '{"model":"gpt-image-2","prompt":"一张极简产品海报","n":1}'`,
@@ -122,20 +120,18 @@ const docs: ApiDoc[] = [
     path: "/v1/images/edits",
     icon: FileArchive,
     input: [
-      ["image", "file | file[] | URL", "参考图，支持 multipart 上传，也支持 JSON 图片链接。"],
+      ["image", "file | file[] | data URL | base64", "参考图，支持 multipart 上传，也支持 JSON data URL/base64。"],
       ["prompt", "string", "编辑提示词。"],
       ["model", "string", "可选，默认 gpt-image-2。"],
       ["n", "number", "可选，生成数量，范围 1-10，默认 1。"],
       ["size", "string", "可选，支持 WIDTHxHEIGHT 精确尺寸，或 1k/2k/4k 档位；未传时默认按 2k 和当前比例处理。"],
       ["quality", "string", "可选，默认 auto。"],
-      ["response_format", "string", "可选，默认 b64_json；只有传 url 时才返回图片链接。"],
     ],
     output: [
       ["data", "array", "编辑后的图片结果列表。"],
       ["data[].b64_json", "string", "base64 图片内容。"],
-      ["data[].url", "string", "仅 response_format=url 时返回。"],
     ],
-    example: (baseUrl: string, key: string) => `curl ${baseUrl}/images/edits \\
+    example: (baseUrl: string, key: string) => `curl ${baseUrl}/v1/images/edits \\
   -H "Authorization: Bearer ${key}" \\
   -F "model=gpt-image-2" \\
   -F "prompt=改成赛博朋克夜景" \\

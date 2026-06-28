@@ -109,10 +109,20 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.get("/images/{image_path:path}", include_in_schema=False)
     async def get_image(image_path: str):
-        return get_image_response(image_path)
+        raise HTTPException(status_code=404, detail="Not Found")
 
     @router.get("/image-thumbnails/{image_path:path}", include_in_schema=False)
     async def get_image_thumbnail(image_path: str):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    @router.get("/api/images/view/{image_path:path}", include_in_schema=False)
+    async def get_admin_image(image_path: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return get_image_response(image_path)
+
+    @router.get("/api/images/thumbnail/{image_path:path}", include_in_schema=False)
+    async def get_admin_image_thumbnail(image_path: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
         return get_thumbnail_response(image_path)
 
     @router.post("/api/images/delete")

@@ -29,7 +29,7 @@ class ImageStorageError(RuntimeError):
 @dataclass(frozen=True)
 class StoredImage:
     rel: str
-    url: str
+    view_path: str
     storage: str
     size: int
 
@@ -190,12 +190,8 @@ class ImageStorageService:
     def _save_index(self, items: dict[str, dict[str, object]]) -> None:
         _write_json_object(self.index_file, {"items": items})
 
-    def _public_url(self, rel: str, base_url: str | None = None) -> str:
-        settings = self.settings()
-        public_base_url = _clean(settings.get("public_base_url"))
-        if public_base_url:
-            return f"{public_base_url.rstrip('/')}/{_safe_relative_path(rel)}"
-        return f"{(base_url or config.base_url).rstrip('/')}/images/{_safe_relative_path(rel)}"
+    def _view_path(self, rel: str, base_url: str | None = None) -> str:
+        return f"{(base_url or config.base_url).rstrip('/')}/api/images/view/{_safe_relative_path(rel)}"
 
     def make_relative_path(self, image_data: bytes) -> str:
         file_hash = hashlib.md5(image_data).hexdigest()
@@ -248,7 +244,7 @@ class ImageStorageService:
             cleanup_images_by_storage_limit()
         except Exception as exc:
             logger.warning({"event": "image_storage_limit_cleanup_failed", "error": str(exc)[:200]})
-        return StoredImage(rel=rel, url=self._public_url(rel, base_url), storage=str(item["storage"]), size=len(image_data))
+        return StoredImage(rel=rel, view_path=self._view_path(rel, base_url), storage=str(item["storage"]), size=len(image_data))
 
     def get_bytes(self, rel: str) -> bytes:
         safe_rel = _safe_relative_path(rel)
@@ -338,10 +334,10 @@ class ImageStorageService:
                 if end_date and day > end_date:
                     continue
                 items.append({
-                    **item,
+                    **{key: value for key, value in item.items() if key not in {"url", "remote_url"}},
                     "rel": rel,
                     "path": rel,
-                    "url": self._public_url(rel, base_url),
+                    "view_path": self._view_path(rel, base_url),
                 })
             if changed:
                 self._save_index(indexed)

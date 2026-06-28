@@ -19,7 +19,7 @@ class ImageResizeError(RuntimeError):
 def save_image_bytes(image_data: bytes, base_url: str | None = None) -> str:
     from services.image_storage_service import image_storage_service
 
-    return image_storage_service.save(image_data, base_url).url
+    return image_storage_service.save(image_data, base_url).view_path
 
 
 def _parse_target_size(size: object) -> tuple[int, int] | None:
@@ -98,25 +98,19 @@ def format_image_result(
             )
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         response_format_normalized = str(response_format or "").strip().lower()
-        if response_format_normalized == "url":
-            result_item = {
-                "url": save(image_bytes, base_url),
-                "revised_prompt": revised_prompt,
-            }
-        else:
-            try:
-                save(image_bytes, base_url)
-            except Exception as exc:
-                logger.warning({
-                    "event": "image_result_save_failed",
-                    "response_format": response_format_normalized or "b64_json",
-                    "size": f"{image_size[0]}x{image_size[1]}" if image_size else "",
-                    "error": str(exc)[:200],
-                })
-            result_item = {
-                "b64_json": b64_json,
-                "revised_prompt": revised_prompt,
-            }
+        try:
+            save(image_bytes, base_url)
+        except Exception as exc:
+            logger.warning({
+                "event": "image_result_save_failed",
+                "response_format": response_format_normalized or "b64_json",
+                "size": f"{image_size[0]}x{image_size[1]}" if image_size else "",
+                "error": str(exc)[:200],
+            })
+        result_item = {
+            "b64_json": b64_json,
+            "revised_prompt": revised_prompt,
+        }
         if image_size:
             result_item["width"], result_item["height"] = image_size
             result_item["size"] = f"{image_size[0]}x{image_size[1]}"

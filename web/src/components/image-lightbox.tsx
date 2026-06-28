@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { ChevronLeft, ChevronRight, Download, X } from "lucide-react";
 
+import { request } from "@/lib/request";
 import { cn } from "@/lib/utils";
 
 type LightboxImage = {
@@ -87,6 +88,30 @@ function normalizeTransform(transform: ImageTransform) {
   };
 }
 
+function isAuthenticatedImageSrc(src: string) {
+  if (!src) return false;
+  try {
+    const url = new URL(src, window.location.origin);
+    return url.pathname.startsWith("/api/images/view/") || url.pathname.startsWith("/api/images/thumbnail/");
+  } catch {
+    return src.startsWith("/api/images/view/") || src.startsWith("/api/images/thumbnail/");
+  }
+}
+
+function requestPath(src: string) {
+  try {
+    const url = new URL(src, window.location.origin);
+    return `${url.pathname}${url.search}`;
+  } catch {
+    return src;
+  }
+}
+
+async function fetchAuthenticatedImageBlob(src: string) {
+  const response = await request.get(requestPath(src), { responseType: "blob" });
+  return response.data as Blob;
+}
+
 export function ImageLightbox({
   images,
   currentIndex,
@@ -100,6 +125,7 @@ export function ImageLightbox({
   const rafRef = useRef<number | null>(null);
   const [transform, setTransform] = useState<ImageTransform>({ scale: 1, x: 0, y: 0 });
   const [isGesturing, setIsGesturing] = useState(false);
+  const [displaySrc, setDisplaySrc] = useState("");
   const current = images[currentIndex];
   const hasPrev = currentIndex > 0;
   const hasNext = currentIndex < images.length - 1;
@@ -157,6 +183,32 @@ export function ImageLightbox({
   }, [current?.id, open, resetTransform]);
 
   useEffect(() => {
+    let objectUrl = "";
+    let cancelled = false;
+    if (!open || !current?.src) {
+      setDisplaySrc("");
+      return;
+    }
+    if (!isAuthenticatedImageSrc(current.src)) {
+      setDisplaySrc(current.src);
+      return;
+    }
+    setDisplaySrc("");
+    void fetchAuthenticatedImageBlob(current.src)
+      .then((blob) => {
+        objectUrl = URL.createObjectURL(blob);
+        if (!cancelled) setDisplaySrc(objectUrl);
+      })
+      .catch(() => {
+        if (!cancelled) setDisplaySrc("");
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [current?.src, open]);
+
+  useEffect(() => {
     return () => {
       if (rafRef.current != null) {
         cancelAnimationFrame(rafRef.current);
@@ -184,10 +236,18 @@ export function ImageLightbox({
 
   const handleDownload = useCallback(() => {
     if (!current) return;
-    const link = document.createElement("a");
-    link.href = current.src;
-    link.download = `image-${current.id}.png`;
-    link.click();
+    const download = (href: string, revoke = false) => {
+      const link = document.createElement("a");
+      link.href = href;
+      link.download = `image-${current.id}.png`;
+      link.click();
+      if (revoke) URL.revokeObjectURL(href);
+    };
+    if (!isAuthenticatedImageSrc(current.src)) {
+      download(current.src);
+      return;
+    }
+    void fetchAuthenticatedImageBlob(current.src).then((blob) => download(URL.createObjectURL(blob), true));
   }, [current]);
 
   const toggleZoom = useCallback(() => {
@@ -398,7 +458,7 @@ export function ImageLightbox({
             onTouchCancel={handleTouchCancel}
           >
             <img
-              src={current.src}
+              src={displaySrc}
               alt=""
               className={cn(
                 "max-h-[90vh] max-w-[90vw] rounded-lg object-contain will-change-transform",

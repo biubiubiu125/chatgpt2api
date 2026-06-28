@@ -36,7 +36,6 @@ DEFAULT_IMAGE_STORAGE = {
     "webdav_username": "",
     "webdav_password": "",
     "webdav_root_path": "chatgpt2api/images",
-    "public_base_url": "",
 }
 
 DEFAULT_CHAT_COMPLETION_CACHE = {
@@ -161,7 +160,6 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
         "webdav_username": str(source.get("webdav_username") or "").strip(),
         "webdav_password": str(source.get("webdav_password") or "").strip(),
         "webdav_root_path": root_path or str(DEFAULT_IMAGE_STORAGE["webdav_root_path"]),
-        "public_base_url": str(source.get("public_base_url") or "").strip().rstrip("/"),
     }
 
 

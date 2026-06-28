@@ -53,7 +53,15 @@ function formatDuration(item: SystemLog) {
   return typeof value === "number" ? `${(value / 1000).toFixed(2)} s` : "-";
 }
 
+function isImageCallLog(item: SystemLog | null) {
+  const endpoint = item?.detail?.endpoint;
+  if (typeof endpoint === "string" && endpoint.startsWith("/v1/images")) return true;
+  const summary = item?.summary;
+  return typeof summary === "string" && (summary.includes("文生图") || summary.includes("图生图"));
+}
+
 function getUrls(item: SystemLog | null) {
+  if (isImageCallLog(item)) return [];
   const urls = item?.detail?.urls;
   return Array.isArray(urls) ? urls.filter((url): url is string => typeof url === "string") : [];
 }
@@ -325,7 +333,7 @@ function LogsContent() {
                         setLightboxOpen(true);
                       }}
                     >
-                      <img src={url} alt="" className="h-full w-full object-cover" />
+                      <ImageThumbnail src={url} thumbnailSrc={getImageThumbnailUrl(url)} className="h-full w-full" />
                     </button>
                   ))}
                 </div>

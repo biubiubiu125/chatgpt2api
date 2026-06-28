@@ -13,7 +13,6 @@ export type ImageStorageSettings = {
   webdav_username: string;
   webdav_password: string;
   webdav_root_path: string;
-  public_base_url: string;
 };
 
 export type Account = {
@@ -287,8 +286,8 @@ export type ManagedImage = {
   name: string;
   date: string;
   size: number;
-  url: string;
-  thumbnail_url?: string;
+  view_path: string;
+  thumbnail_path?: string;
   created_at: string;
   width?: number;
   height?: number;
@@ -309,7 +308,7 @@ export type ImageResponse = {
   size?: string;
   width?: number;
   height?: number;
-  data: Array<{ b64_json?: string; url?: string; revised_prompt?: string; width?: number; height?: number; size?: string }>;
+  data: Array<{ b64_json?: string; revised_prompt?: string; width?: number; height?: number; size?: string }>;
 };
 
 export type ImageTask = {
@@ -323,7 +322,7 @@ export type ImageTask = {
   created_at: string;
   updated_at: string;
   can_resume_poll?: boolean;
-  data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string; width?: number; height?: number; size?: string }>;
+  data?: Array<{ b64_json?: string; revised_prompt?: string; width?: number; height?: number; size?: string }>;
   error?: string;
   progress?: string;
   elapsed_secs?: number;

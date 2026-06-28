@@ -31,7 +31,6 @@ from services.protocol.web_search_tool import (
     text_with_url_citations,
 )
 from utils.helper import (
-    build_chat_image_markdown_content,
     extract_chat_image,
     extract_chat_prompt,
     is_image_chat_request,
@@ -145,7 +144,10 @@ def _image_result_metadata(data: object) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         image: dict[str, Any] = {"index": index}
-        for key in ("url", "revised_prompt", "size"):
+        b64_json = str(item.get("b64_json") or "").strip()
+        if b64_json:
+            image["b64_json"] = b64_json
+        for key in ("revised_prompt", "size"):
             value = item.get(key)
             if isinstance(value, str) and value:
                 image[key] = value
@@ -332,7 +334,7 @@ def stream_web_search_chat_completion(messages: list[dict[str, Any]], model: str
 def image_result_content(result: dict[str, Any]) -> str:
     data = result.get("data")
     if isinstance(data, list) and data:
-        return build_chat_image_markdown_content(result)
+        return ""
     return str(result.get("message") or "Image generation completed.")
 
 
@@ -404,18 +406,19 @@ def stream_image_chat_completion(
             content = output.text
             sent_text += content
         elif output.kind == "result":
-            content = build_chat_image_markdown_content({"data": output.data})
             image_metadata = _image_result_metadata(output.data)
         elif output.kind == "message":
             content = output.text[len(sent_text):] if output.text.startswith(sent_text) else output.text
             image_metadata = []
-        if not content:
+        if not content and not image_metadata:
             continue
         if not sent_role:
             sent_role = True
-            delta: dict[str, Any] = {"role": "assistant", "content": content}
+            delta: dict[str, Any] = {"role": "assistant"}
         else:
-            delta = {"content": content}
+            delta = {}
+        if content:
+            delta["content"] = content
         if image_metadata:
             _attach_image_metadata(delta, image_metadata)
         chunk = completion_chunk(model, delta, None, completion_id, created)

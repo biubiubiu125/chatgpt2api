@@ -3,17 +3,15 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-import mimetypes
 import re
-from pathlib import PurePosixPath
 from typing import Any, TypeGuard
-from urllib.parse import unquote, unquote_to_bytes, urlparse
+from urllib.parse import unquote_to_bytes
 
 from fastapi import HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
-from utils.helper import parse_image_count, parse_image_size, safe_download_remote_image_url
+from utils.helper import parse_image_count, parse_image_size
 
 ImageInput = tuple[bytes, str, str]
 ImageSource = str | UploadFile | ImageInput
@@ -135,8 +133,11 @@ def _sources_from_value(value: object) -> list[ImageSource]:
         text = value.strip()
         if not text:
             return []
-        if text.lower().startswith(("data:", "http://", "https://")):
+        lowered = text.lower()
+        if lowered.startswith("data:"):
             return [text]
+        if lowered.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail={"error": "remote image URLs are not supported"})
         return [_decode_base64_image(text, "image.png", "image/png")]
     if isinstance(value, list):
         sources: list[ImageSource] = []
@@ -205,16 +206,6 @@ def _extension_from_mime(mime_type: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", subtype.lower()) or "png"
 
 
-def _safe_filename(name: str, mime_type: str, fallback: str) -> str:
-    """生成安全文件名：清理 URL 文件名并补齐扩展名。"""
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
-    if not cleaned:
-        cleaned = fallback
-    if "." not in cleaned:
-        cleaned = f"{cleaned}.{_extension_from_mime(mime_type)}"
-    return cleaned
-
-
 def _decode_data_url(url: str) -> ImageInput:
     """解码 data URL：把内联图片转成标准图片输入元组。"""
     header, separator, payload = url.partition(",")
@@ -234,49 +225,19 @@ def _decode_data_url(url: str) -> ImageInput:
     return data, f"image_url.{_extension_from_mime(mime_type)}", mime_type
 
 
-def _response_mime_type(response: object, parsed_path: str) -> str:
-    """识别下载图片类型：优先响应头，必要时按 URL 后缀推断。"""
-    header_type = str(response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
-    guessed_type = mimetypes.guess_type(parsed_path)[0] or ""
-    if header_type.startswith("image/"):
-        return header_type
-    if header_type and header_type not in {"application/octet-stream", "binary/octet-stream"}:
-        raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
-    if guessed_type.startswith("image/"):
-        return guessed_type
-    if not header_type or header_type in {"application/octet-stream", "binary/octet-stream"}:
-        return "image/png"
-    raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
-
-
-def _filename_from_url(parsed_path: str, mime_type: str) -> str:
-    """生成 URL 图片文件名：从链接路径提取名称并做安全化。"""
-    raw_name = PurePosixPath(unquote(parsed_path)).name
-    return _safe_filename(raw_name, mime_type, "image_url")
-
-
-def _download_image_url(url: str) -> ImageInput:
-    """下载远程图片：把 http/https 图片链接转成标准图片输入元组。"""
-    source = _clean(url)
-    if source.startswith("data:"):
+def _decode_image_source_string(value: str) -> ImageInput:
+    """读取字符串图片来源：只允许 data URL 或 base64，拒绝远程 URL。"""
+    source = _clean(value)
+    lowered = source.lower()
+    if lowered.startswith("data:"):
         return _decode_data_url(source)
-    parsed = urlparse(source)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"})
-    data, response, final_url = safe_download_remote_image_url(
-        source,
-        max_bytes=MAX_IMAGE_REFERENCE_BYTES,
-        timeout=60,
-        user_agent="chatgpt2api image fetcher",
-        size_error="image_url exceeds 50MB limit",
-    )
-    final_path = urlparse(final_url).path or parsed.path
-    mime_type = _response_mime_type(response, final_path)
-    return data, _filename_from_url(final_path, mime_type), mime_type
+    if lowered.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail={"error": "remote image URLs are not supported"})
+    return _decode_base64_image(source, "image.png", "image/png")
 
 
 async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:
-    """读取图片来源：上传文件直接读取，URL 下载后统一返回图片元组。"""
+    """读取图片来源：上传文件、data URL 和 base64 统一返回图片元组。"""
     images: list[ImageInput] = []
     for source in sources:
         if isinstance(source, tuple):
@@ -291,7 +252,7 @@ async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:
                 raise HTTPException(status_code=400, detail={"error": "image file is empty"})
             images.append((image_data, source.filename or "image.png", source.content_type or "image/png"))
             continue
-        images.append(await run_in_threadpool(_download_image_url, source))
+        images.append(await run_in_threadpool(_decode_image_source_string, source))
     if not images:
         raise HTTPException(status_code=400, detail={"error": "image file or image_url is required"})
     return images

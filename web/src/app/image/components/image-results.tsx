@@ -50,7 +50,7 @@ function getStoredImageSrc(image: StoredImage) {
     }
     return url;
   }
-  return image.url || "";
+  return "";
 }
 
 function turnAspectStyle(size: string): CSSProperties | undefined {
@@ -97,23 +97,11 @@ async function downloadStoredImage(image: StoredImage, index: number) {
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
       blob = new Blob([bytes], { type: "image/png" });
-    } else if (image.url) {
-      // 确保 URL 是绝对路径
-      const url = image.url.startsWith("http") ? image.url : `${window.location.origin}${image.url}`;
-      const res = await fetch(url);
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-      }
-      blob = await res.blob();
     } else {
       return;
     }
   } catch (err) {
     console.error("Failed to download image:", err);
-    // 如果 fetch 失败，尝试直接在新窗口打开
-    if (image.url) {
-      window.open(image.url, "_blank");
-    }
     return;
   }
   const url = URL.createObjectURL(blob);

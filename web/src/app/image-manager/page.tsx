@@ -1,11 +1,12 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CalendarDays, ChevronLeft, ChevronRight, Copy, Download, ImageIcon, LoaderCircle, Maximize2, Plus, RefreshCw, Search, Tag, Trash2, X } from "lucide-react";
+import { CalendarDays, ChevronLeft, ChevronRight, Download, ImageIcon, LoaderCircle, Maximize2, Plus, RefreshCw, Search, Tag, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { DateRangeFilter } from "@/components/date-range-filter";
 import { ImageLightbox } from "@/components/image-lightbox";
+import { ImageThumbnail } from "@/components/image-thumbnail";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -24,7 +25,7 @@ function formatSize(size: number) {
 }
 
 function imageKey(item: ManagedImage) {
-  return item.rel || item.url;
+  return item.rel || item.view_path;
 }
 
 function useLongPress(onLongPress: () => void, ms = LONG_PRESS_MS) {
@@ -99,7 +100,7 @@ function ImageManagerContent() {
 
   const lightboxImages = filteredItems.map((item) => ({
     id: item.name,
-    src: item.url,
+    src: item.view_path,
     sizeLabel: formatSize(item.size),
     dimensions: item.width && item.height ? `${item.width} x ${item.height}` : undefined,
   }));
@@ -474,7 +475,7 @@ function ImageManagerContent() {
           </div>
           <div className="grid gap-0 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {currentRows.map((item) => {
-              const imageIndex = filteredItems.findIndex((row) => row.url === item.url);
+              const imageIndex = filteredItems.findIndex((row) => row.view_path === item.view_path);
               return (
               <div key={item.rel} className="group border-r border-b border-stone-100 p-4 transition hover:bg-stone-50 dark:hover:bg-white/5">
                 <div className="relative">
@@ -486,15 +487,12 @@ function ImageManagerContent() {
                       setLightboxOpen(true);
                     }}
                   >
-                    <img
-                      src={item.thumbnail_url || item.url}
+                    <ImageThumbnail
+                      src={item.view_path}
+                      thumbnailSrc={item.thumbnail_path}
                       alt={item.name}
-                      className="h-full w-full object-cover transition group-hover:scale-[1.02]"
-                      onError={(event) => {
-                        if (event.currentTarget.src !== item.url) {
-                          event.currentTarget.src = item.url;
-                        }
-                      }}
+                      className="h-full w-full"
+                      imageClassName="transition group-hover:scale-[1.02]"
                     />
                     <span className="absolute right-2 bottom-2 rounded-full bg-black/50 p-2 text-white opacity-100 transition sm:opacity-0 sm:group-hover:opacity-100">
                       <Maximize2 className="size-4" />
@@ -527,17 +525,6 @@ function ImageManagerContent() {
                         title="下载图片"
                       >
                         <Download className="size-4" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="size-8 rounded-lg text-stone-400 hover:bg-stone-100 hover:text-stone-700"
-                        onClick={() => {
-                          void navigator.clipboard.writeText(item.url);
-                          toast.success("图片地址已复制");
-                        }}
-                      >
-                        <Copy className="size-4" />
                       </Button>
                       <Checkbox className={IMAGE_MANAGER_CHECKBOX_CLASS} checked={selectedSet.has(imageKey(item))} onCheckedChange={(checked) => togglePaths([imageKey(item)], Boolean(checked))} />
                     </div>
@@ -643,11 +630,10 @@ function ImageManagerContent() {
           </p>
           {deleteTarget ? (
             <div className="flex items-center gap-3 overflow-hidden rounded-xl border border-stone-200 bg-stone-50 p-3">
-              <img
-                src={deleteTarget.thumbnail_url || deleteTarget.url}
-                alt=""
-                className="size-16 shrink-0 rounded-lg object-cover"
-                onError={(e) => { if (e.currentTarget.src !== deleteTarget.url) e.currentTarget.src = deleteTarget.url; }}
+              <ImageThumbnail
+                src={deleteTarget.view_path}
+                thumbnailSrc={deleteTarget.thumbnail_path}
+                className="size-16 shrink-0 rounded-lg"
               />
               <div className="min-w-0 overflow-hidden text-xs text-stone-500">
                 <div className="truncate font-medium text-stone-700">{deleteTarget.name}</div>

@@ -19,7 +19,6 @@ export type StoredImage = {
   taskStatus?: "queued" | "running";
   progress?: string;
   b64_json?: string;
-  url?: string;
   revised_prompt?: string;
   size?: string;
   width?: number;
@@ -79,11 +78,11 @@ function normalizeImageCount(value: unknown) {
 }
 
 function normalizeStoredImage(image: StoredImage): StoredImage {
+  const { url: _url, ...imageWithoutUrl } = image as StoredImage & { url?: unknown };
   const normalized = {
-    ...image,
+    ...imageWithoutUrl,
     taskId: typeof image.taskId === "string" && image.taskId ? image.taskId : undefined,
     taskStatus: image.taskStatus === "queued" || image.taskStatus === "running" ? image.taskStatus : undefined,
-    url: typeof image.url === "string" && image.url ? image.url : undefined,
     revised_prompt: typeof image.revised_prompt === "string" ? image.revised_prompt : undefined,
     size: typeof image.size === "string" && image.size ? image.size : undefined,
     width: typeof image.width === "number" && Number.isFinite(image.width) && image.width > 0 ? image.width : undefined,
@@ -98,7 +97,7 @@ function normalizeStoredImage(image: StoredImage): StoredImage {
   }
   return {
     ...normalized,
-    status: image.b64_json || image.url ? "success" : "loading",
+    status: image.b64_json ? "success" : "loading",
   };
 }
 

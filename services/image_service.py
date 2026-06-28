@@ -97,14 +97,9 @@ def _stored_image_timestamp(item: dict[str, object]) -> float | None:
 
 
 def get_image_response(relative_path: str) -> FileResponse | Response:
-    headers = {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-        "Access-Control-Allow-Headers": "*",
-    }
     if image_storage_service.has_local(relative_path):
-        return FileResponse(_safe_image_path(relative_path), headers=headers)
-    return Response(content=image_storage_service.get_bytes(relative_path), media_type="image/png", headers=headers)
+        return FileResponse(_safe_image_path(relative_path))
+    return Response(content=image_storage_service.get_bytes(relative_path), media_type="image/png")
 
 
 def _thumbnail_path(relative_path: str) -> Path:
@@ -112,8 +107,8 @@ def _thumbnail_path(relative_path: str) -> Path:
     return config.image_thumbnails_dir / f"{rel}.png"
 
 
-def thumbnail_url(base_url: str, relative_path: str) -> str:
-    return f"{base_url.rstrip('/')}/image-thumbnails/{_safe_relative_path(relative_path)}"
+def thumbnail_path(base_url: str, relative_path: str) -> str:
+    return f"{base_url.rstrip('/')}/api/images/thumbnail/{_safe_relative_path(relative_path)}"
 
 
 def _image_dimensions(path: Path) -> tuple[int, int] | None:
@@ -160,29 +155,16 @@ def ensure_thumbnail(relative_path: str) -> Path:
 
 
 def get_thumbnail_response(relative_path: str) -> FileResponse:
-    headers = {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-        "Access-Control-Allow-Headers": "*",
-    }
-    return FileResponse(ensure_thumbnail(relative_path), headers=headers)
+    return FileResponse(ensure_thumbnail(relative_path))
 
 
 def get_image_download_response(relative_path: str) -> FileResponse | Response:
-    cors_headers = {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-        "Access-Control-Allow-Headers": "*",
-    }
     if image_storage_service.has_local(relative_path):
         path = _safe_image_path(relative_path)
-        headers = {**cors_headers, "Content-Disposition": f'attachment; filename="{path.name}"'}
+        headers = {"Content-Disposition": f'attachment; filename="{path.name}"'}
         return FileResponse(path, filename=path.name, headers=headers)
     rel = _safe_relative_path(relative_path)
-    headers = {
-        **cors_headers,
-        "Content-Disposition": f'attachment; filename="{Path(rel).name}"',
-    }
+    headers = {"Content-Disposition": f'attachment; filename="{Path(rel).name}"'}
     return Response(
         content=image_storage_service.get_bytes(rel),
         media_type="image/png",
@@ -233,9 +215,9 @@ def list_images(base_url: str, start_date: str = "", end_date: str = "") -> dict
     all_tags = load_tags()
     items = [
         {
-            **item,
-            "url": str(item.get("url") or f"{base_url.rstrip('/')}/images/{item['path']}"),
-            "thumbnail_url": thumbnail_url(base_url, str(item["path"])),
+            **{key: value for key, value in item.items() if key not in {"url", "remote_url"}},
+            "view_path": f"{base_url.rstrip('/')}/api/images/view/{item['path']}",
+            "thumbnail_path": thumbnail_path(base_url, str(item["path"])),
             "tags": all_tags.get(str(item["path"]), []),
         }
         for item in image_storage_service.list_items(base_url, start_date, end_date)

@@ -582,7 +582,7 @@ class LoggedCall:
             conv_id = conv_ids[0] if conv_ids else ""
         if conv_id:
             detail["conversation_id"] = conv_id
-        collected_urls = [*(urls or []), *_collect_urls(result)]
+        collected_urls = [] if self.endpoint.startswith("/v1/images") else [*(urls or []), *_collect_urls(result)]
         if collected_urls and not self.endpoint.startswith("/v1/search"):
             detail["urls"] = list(dict.fromkeys(collected_urls))
         reference_counts = _collect_reference_image_counts(result)
