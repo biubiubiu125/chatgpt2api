@@ -633,6 +633,16 @@ def build_image_prompt(
         "Render the image with high clarity, rich fine detail, sharp edges, clean textures, "
         "and no low-resolution, blurry, compressed, pixelated, or artifact-heavy appearance. "
     )
+    hints.append(
+        "If the prompt, reference images, or generated image include Chinese text, labels, logos, packaging text, "
+        "captions, titles, or any user-specified wording, treat text rendering as a critical requirement, not decoration. "
+        "Render Chinese characters as standard, complete, readable Simplified Chinese glyphs with correct stroke structure, "
+        "spacing, and alignment. Preserve the exact character sequence and wording from the prompt or reference image. "
+        "Do not invent similar-looking characters, merge or split characters, omit, replace, reorder, misspell, use pinyin, "
+        "use English substitutions, create garbled pseudo-Chinese, random strokes, or stylize the text so heavily that it becomes unreadable. "
+        "Keep Chinese text clean, sharp, high-contrast, and easy to read when the prompt allows. "
+        "Do not add text unless the user requested it or it already exists in the reference image. "
+    )
     return f"{prompt.strip()}\n\n{''.join(hints)}" if hints else prompt
 
 
