@@ -262,6 +262,7 @@ export function systemLogRowSignature(item: SystemLogRow, input: SystemLogRowSig
     statusTone(item),
     boundedSignatureText(summaryText(item)),
     item.imageUrls.length,
+    item.accountSwitchCount,
     item.imageUrls.slice(0, 4).map((url) => boundedSignatureText(url, 96)).join(','),
     boundedSignatureText(item.preview),
     isFailed(item) ? 1 : 0,

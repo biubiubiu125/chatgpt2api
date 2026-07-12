@@ -56,9 +56,10 @@ const DIGEST_METRIC_PAIRS = [
   ['SSE空窗', 'sse_max_gap_ms'],
   ['上游生成', 'conversation_stream_ms'],
   ['上游断流', 'stream_error_ms'],
-  ['解析/轮询', 'resolve_ms'],
+  ['等待结果', 'poll_wait_ms'],
+  ['查询结果', 'poll_request_ms'],
+  ['结果处理', 'resolve_ms'],
   ['下载', 'download_ms'],
-  ['重试等待', 'retry_wait_ms'],
   ['单图链路', 'stream_ms'],
 ] as const
 
@@ -83,9 +84,10 @@ const SLOW_METRIC_PAIRS = [
   { key: 'sse_last_gap_ms', label: 'SSE 收尾空窗' },
   { key: 'conversation_stream_ms', label: '上游生成' },
   { key: 'stream_error_ms', label: '上游断流' },
-  { key: 'resolve_ms', label: '解析/轮询' },
+  { key: 'poll_wait_ms', label: '等待结果' },
+  { key: 'poll_request_ms', label: '查询结果' },
+  { key: 'resolve_ms', label: '结果处理' },
   { key: 'download_ms', label: '下载' },
-  { key: 'retry_wait_ms', label: '重试等待' },
   { key: 'response_ms', label: '响应整理' },
   { key: 'stream_ms', label: '单图内部' },
   { key: 'total_ms', label: '单图总耗时' },
@@ -107,9 +109,10 @@ const EVENT_METRIC_PAIRS = [
   ['SSE空窗', 'sse_max_gap_ms'],
   ['上游生成', 'conversation_stream_ms'],
   ['上游断流', 'stream_error_ms'],
-  ['解析/轮询', 'resolve_ms'],
+  ['等待结果', 'poll_wait_ms'],
+  ['查询结果', 'poll_request_ms'],
+  ['结果处理', 'resolve_ms'],
   ['下载', 'download_ms'],
-  ['重试等待', 'retry_wait_ms'],
   ['响应整理', 'response_ms'],
   ['单图内部', 'stream_ms'],
   ['单图总耗时', 'total_ms'],
@@ -136,9 +139,10 @@ const RECORD_SIGNATURE_METRIC_KEYS = [
   'sse_last_gap_ms',
   'conversation_stream_ms',
   'stream_error_ms',
+  'poll_wait_ms',
+  'poll_request_ms',
   'resolve_ms',
   'download_ms',
-  'retry_wait_ms',
   'response_ms',
   'stream_ms',
   'total_ms',
@@ -263,9 +267,10 @@ export function trackedDurationMs(row: RealtimeMonitorRecord) {
     'generation_start_ms',
     'conversation_stream_ms',
     'stream_error_ms',
+    'poll_wait_ms',
+    'poll_request_ms',
     'resolve_ms',
     'download_ms',
-    'retry_wait_ms',
     'response_ms',
   ].reduce((sum, key) => sum + metricValue(row, key), 0)
   const wrappedStage = Math.max(metricValue(row, 'total_ms'), metricValue(row, 'stream_ms'), linearStages)
@@ -313,8 +318,14 @@ export function slowRowReason(row: RealtimeMonitorRecord) {
   if (top.key === 'untracked_ms') {
     return `仍有 ${top.value} 没有落到具体阶段，说明这段链路还缺埋点。`
   }
+  if (top.key === 'poll_wait_ms') {
+    return `主要卡在等待图片结果，通常是 ChatGPT 图片任务尚未完成或轮询退避。`
+  }
+  if (top.key === 'poll_request_ms') {
+    return `主要卡在查询图片结果，通常是任务或会话查询接口响应较慢。`
+  }
   if (top.key === 'resolve_ms') {
-    return `主要卡在图片结果解析/轮询，通常对应等待 ChatGPT 图片任务完成或轮询超时。`
+    return `主要卡在结果处理，通常是图片文件 ID 转换下载地址较慢。`
   }
   if (top.key === 'conversation_stream_ms') {
     return `主要卡在上游生成中，通常是 ChatGPT 生成阶段耗时。`
@@ -342,9 +353,6 @@ export function slowRowReason(row: RealtimeMonitorRecord) {
   }
   if (top.key === 'account_wait_ms') {
     return `主要卡在等待账号，通常是可用账号不足或账号并发被占满。`
-  }
-  if (top.key === 'retry_wait_ms') {
-    return `主要卡在重试等待，通常是轮询、TLS 或连接失败后的退避时间。`
   }
   if (top.key === 'handler_queue_ms' || top.key === 'stream_first_queue_ms') {
     return `主要卡在等待入口，通常是后端同步线程容量不足；可通过环境变量 CHATGPT2API_THREAD_TOKENS 调整。`
@@ -525,7 +533,9 @@ export function buildDiagnosticGroups(
         { key: 'sse_max_gap_ms', label: 'SSE 最大空窗', value: formatMs(p95.sse_max_gap_ms), meta: '两次事件最大间隔', valueClass: 'text-indigo-600 dark:text-indigo-400' },
         { key: 'conversation_stream_ms', label: '上游生成', value: formatMs(p95.conversation_stream_ms), meta: '会话流响应', valueClass: 'text-emerald-600 dark:text-emerald-400' },
         { key: 'stream_error_ms', label: '上游断流', value: formatMs(p95.stream_error_ms), meta: 'HTTP2 / SSE', valueClass: 'text-slate-600 dark:text-slate-300' },
-        { key: 'resolve_ms', label: '图片解析', value: formatMs(p95.resolve_ms), meta: 'conversation / file', valueClass: 'text-emerald-600 dark:text-emerald-400' },
+        { key: 'poll_wait_ms', label: '等待结果', value: formatMs(p95.poll_wait_ms), meta: '间隔 / 退避', valueClass: 'text-amber-600 dark:text-amber-400' },
+        { key: 'poll_request_ms', label: '查询结果', value: formatMs(p95.poll_request_ms), meta: 'task / conversation', valueClass: 'text-cyan-600 dark:text-cyan-400' },
+        { key: 'resolve_ms', label: '结果处理', value: formatMs(p95.resolve_ms), meta: 'file ID / 下载地址', valueClass: 'text-orange-600 dark:text-orange-400' },
         { key: 'download_ms', label: '图片下载', value: formatMs(p95.download_ms), meta: '下载并返回', valueClass: 'text-foreground' },
         { key: 'stream_ms', label: '单图内部', value: formatMs(p95.stream_ms), meta: '上游到结果', valueClass: 'text-foreground' },
         { key: 'total_ms', label: '单图总耗时', value: formatMs(p95.total_ms), meta: '完整链路', valueClass: 'text-foreground' },

@@ -41,13 +41,23 @@
       />
     </td>
     <td class="py-4 pr-5 align-middle">
-      <p
-        class="max-w-[28rem] truncate text-xs text-foreground"
-        :class="{ 'text-rose-600': failed }"
-        :title="summary"
-      >
-        {{ summary || '-' }}
-      </p>
+      <div class="flex min-w-0 items-center gap-2">
+        <p
+          class="min-w-0 max-w-[28rem] flex-1 truncate text-xs text-foreground"
+          :class="{ 'text-rose-600': failed }"
+          :title="summary"
+        >
+          {{ summary || '-' }}
+        </p>
+        <MetaChip
+          v-if="item.accountSwitchCount"
+          size="xs"
+          tone="warning"
+          chip-class="shrink-0"
+        >
+          切换 {{ item.accountSwitchCount }} 次
+        </MetaChip>
+      </div>
     </td>
     <td class="py-4 pr-4 text-right align-middle">
       <div class="flex justify-end gap-1.5">

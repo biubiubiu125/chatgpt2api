@@ -119,6 +119,22 @@ export type LogDiagnosisChip = {
   tone: 'neutral' | 'success' | 'warning' | 'danger' | 'info'
 }
 
+export type ImageAttempt = {
+  slot: number
+  attempt: number
+  accountEmail: string
+  status: string
+  failureCode: string
+  conversationId: string
+  durationMs: number
+  monitor: ImageAttemptMonitor
+}
+
+export type ImageAttemptMonitor = {
+  metrics: Record<string, number>
+  events: Array<Record<string, string | number>>
+}
+
 export type SystemLogRow = {
   id: string
   raw: SystemLog
@@ -166,6 +182,8 @@ export type SystemLogRow = {
   rawUpstreamError: string
   urls: string[]
   imageUrls: string[]
+  imageAttempts: ImageAttempt[]
+  accountSwitchCount: number
   diagnosisChips: LogDiagnosisChip[]
   preview: string
   rawJson: string
@@ -402,6 +420,8 @@ export function normalizeSystemLogRow(item: SystemLog, index: number, options: N
   const preview = summarizeLogText(requestText || rawUpstreamMessage || upstreamPreview || error || rawUpstreamError || reason || summary)
   const urls = collectUrls(detail)
   const imageUrls = normalizePreviewUrls(urls, options.apiBaseUrl)
+  const imageAttempts = normalizeImageAttempts(detailRawValue(detail, 'image_attempts'))
+  const accountSwitchCount = imageAccountSwitchCount(imageAttempts)
   const status = detailValue(detail, 'status')
   const durationMs = detailValue(detail, 'duration_ms')
   const statusCode = detailValue(detail, 'status_code')
@@ -465,6 +485,8 @@ export function normalizeSystemLogRow(item: SystemLog, index: number, options: N
     rawUpstreamError,
     urls,
     imageUrls,
+    imageAttempts,
+    accountSwitchCount,
     diagnosisChips: buildSystemLogDiagnosisChips({
       status,
       durationMs,
@@ -709,6 +731,71 @@ function buildSystemStatsFallback(items: SystemLog[]) {
       return isImageEndpointLog(detailValue(detail, 'endpoint'), detailValue(detail, 'model'))
     }).length,
   }
+}
+
+function normalizeNonNegativeNumber(value: unknown): number {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.round(parsed) : 0
+}
+
+function normalizeImageAttemptMonitor(value: unknown): ImageAttemptMonitor {
+  const monitor = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  const rawMetrics = monitor.metrics && typeof monitor.metrics === 'object'
+    ? monitor.metrics as Record<string, unknown>
+    : {}
+  const metrics = Object.fromEntries(
+    Object.entries(rawMetrics)
+      .filter(([key]) => key.endsWith('_ms'))
+      .map(([key, item]) => [key, normalizeNonNegativeNumber(item)] as const)
+      .filter(([, item]) => item > 0),
+  )
+  const rawEvents = Array.isArray(monitor.events) ? monitor.events : []
+  const events = rawEvents
+    .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
+    .slice(-40)
+    .map((item) => Object.fromEntries(
+      Object.entries(item)
+        .filter(([key]) => ['time', 'event', 'label', 'status'].includes(key) || key.endsWith('_ms'))
+        .map(([key, eventValue]) => [
+          key,
+          key.endsWith('_ms') ? normalizeNonNegativeNumber(eventValue) : cleanString(eventValue),
+        ]),
+    ))
+  return { metrics, events }
+}
+
+function normalizeImageAttempts(value: unknown): ImageAttempt[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
+    .map((item) => ({
+      slot: Math.max(1, normalizeNonNegativeNumber(item.slot)),
+      attempt: Math.max(1, normalizeNonNegativeNumber(item.attempt)),
+      accountEmail: cleanString(item.account_email),
+      status: cleanString(item.status).toLowerCase(),
+      failureCode: cleanString(item.failure_code).toLowerCase(),
+      conversationId: cleanString(item.conversation_id),
+      durationMs: normalizeNonNegativeNumber(item.duration_ms),
+      monitor: normalizeImageAttemptMonitor(item.monitor),
+    }))
+    .filter((item) => Boolean(item.status))
+    .sort((left, right) => left.slot - right.slot || left.attempt - right.attempt)
+}
+
+export function imageAccountSwitchCount(attempts: ImageAttempt[]): number {
+  const attemptsPerSlot = new Map<number, number>()
+  attempts.forEach((attempt) => {
+    attemptsPerSlot.set(attempt.slot, (attemptsPerSlot.get(attempt.slot) || 0) + 1)
+  })
+  return Array.from(attemptsPerSlot.values()).reduce((total, count) => total + Math.max(0, count - 1), 0)
+}
+
+export function switchedImageAttempts(attempts: ImageAttempt[]): ImageAttempt[] {
+  const attemptsPerSlot = new Map<number, number>()
+  attempts.forEach((attempt) => {
+    attemptsPerSlot.set(attempt.slot, (attemptsPerSlot.get(attempt.slot) || 0) + 1)
+  })
+  return attempts.filter((attempt) => (attemptsPerSlot.get(attempt.slot) || 0) > 1)
 }
 
 function normalizeSystemResponse(response: BackendLogsResponse): SystemLogsResponse {

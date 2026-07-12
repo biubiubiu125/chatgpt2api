@@ -81,6 +81,11 @@
           @toggle-details="emit('toggle-timeline-details')"
         />
 
+        <LogsImageAttemptTimeline
+          v-if="log.accountSwitchCount"
+          :attempts="log.imageAttempts"
+        />
+
         <DetailTextBlock
           :title="log.requestTextTruncated ? '请求文本（已截断）' : '请求文本'"
           :content="log.requestTextFull || log.requestText"
@@ -146,6 +151,7 @@ import {
 import type { DetailPreviewImage } from '@/views/logs/logDetailRuntime'
 import { statusLabel, statusTone, summaryText } from '@/views/logs/logsView'
 import LogsDetailTimeline from '@/views/logs/LogsDetailTimeline.vue'
+import LogsImageAttemptTimeline from '@/views/logs/LogsImageAttemptTimeline.vue'
 
 defineProps<{
   log: SystemLogRow | null
