@@ -60,7 +60,6 @@ const DIGEST_METRIC_PAIRS = [
   ['查询结果', 'poll_request_ms'],
   ['结果处理', 'resolve_ms'],
   ['下载', 'download_ms'],
-  ['单图链路', 'stream_ms'],
 ] as const
 
 const SLOW_METRIC_PAIRS = [
@@ -89,8 +88,6 @@ const SLOW_METRIC_PAIRS = [
   { key: 'resolve_ms', label: '结果处理' },
   { key: 'download_ms', label: '下载' },
   { key: 'response_ms', label: '响应整理' },
-  { key: 'stream_ms', label: '单图内部' },
-  { key: 'total_ms', label: '单图总耗时' },
 ]
 
 const EVENT_METRIC_PAIRS = [
@@ -114,8 +111,6 @@ const EVENT_METRIC_PAIRS = [
   ['结果处理', 'resolve_ms'],
   ['下载', 'download_ms'],
   ['响应整理', 'response_ms'],
-  ['单图内部', 'stream_ms'],
-  ['单图总耗时', 'total_ms'],
 ] as const
 
 const RECORD_SIGNATURE_METRIC_KEYS = [
@@ -537,8 +532,6 @@ export function buildDiagnosticGroups(
         { key: 'poll_request_ms', label: '查询结果', value: formatMs(p95.poll_request_ms), meta: 'task / conversation', valueClass: 'text-cyan-600 dark:text-cyan-400' },
         { key: 'resolve_ms', label: '结果处理', value: formatMs(p95.resolve_ms), meta: 'file ID / 下载地址', valueClass: 'text-orange-600 dark:text-orange-400' },
         { key: 'download_ms', label: '图片下载', value: formatMs(p95.download_ms), meta: '下载并返回', valueClass: 'text-foreground' },
-        { key: 'stream_ms', label: '单图内部', value: formatMs(p95.stream_ms), meta: '上游到结果', valueClass: 'text-foreground' },
-        { key: 'total_ms', label: '单图总耗时', value: formatMs(p95.total_ms), meta: '完整链路', valueClass: 'text-foreground' },
       ],
     },
   ] satisfies MonitorDiagnosticGroup[]
