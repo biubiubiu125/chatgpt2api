@@ -1,0 +1,402 @@
+# 部署与升级指南
+
+本文介绍 ChatGPT2API 的一键安装、Docker Compose、主从集群、源码运行和升级回滚。生产部署优先使用 GHCR（GitHub Container Registry）镜像；二次开发或需要本地改代码时再使用源码构建。
+
+## 部署前准备
+
+服务器需要安装：
+
+- Docker Engine
+- Docker Compose v2
+- `curl`、`bash`
+- 主从集群额外需要 WireGuard、`iproute2`、`openssl`
+
+首次部署前建议确认：
+
+```bash
+docker version
+docker compose version
+curl --version
+```
+
+项目核心持久化文件：
+
+| 路径 | 作用 |
+| --- | --- |
+| `data/config.json`（Docker）/ `config.json`（源码） | 主配置、后台密钥、代理、图片、备份等配置 |
+| `.env` | Docker Compose 环境变量和部署参数 |
+| `data/` | 账号、注册配置、日志、图片、任务记录等运行数据 |
+| `join/` | 主从集群一次性 Worker 加入文件，不应提交到 Git |
+
+升级和迁移时重点保留 `.env`、配置文件和 `data/`。标准 Docker Compose 不自动创建外部 PostgreSQL；`IMAGE_QUEUE_DATABASE_URL` 必须指向可连接的图片队列数据库。
+
+## 方式一：一键安装脚本
+
+脚本地址：
+
+```text
+deploy/install.sh
+```
+
+脚本支持 Docker 镜像模式、源码 Python 模式、WARP 模式以及主从集群命令。单机 Docker 安装会生成认证密钥，下载 Compose 文件，拉取镜像并等待 `/health` 健康检查。
+
+### 交互式安装
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh -o /tmp/chatgpt2api-install.sh
+sudo bash /tmp/chatgpt2api-install.sh
+```
+
+默认值：
+
+- 安装目录：`/opt/chatgpt2api`
+- Docker 端口：`3000`
+- 账号存储：`json`
+- 图片队列：必须填写 PostgreSQL 地址
+- 镜像：`ghcr.io/biubiubiu125/chatgpt2api:latest`
+
+### 非交互式安装
+
+适合自动化部署。将下面的 PostgreSQL 地址替换成真实值：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh | \
+  sudo env NONINTERACTIVE=1 MODE=docker INSTALL_DIR=/opt/chatgpt2api PORT=3000 \
+  STORAGE_BACKEND=json \
+  IMAGE_QUEUE_DATABASE_URL='postgresql+psycopg2://user:password@postgres-host:5432/chatgpt2api_image_queue' \
+  bash -s -- --non-interactive
+```
+
+启用 WARP / Privoxy / FlareSolverr：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh | \
+  sudo env NONINTERACTIVE=1 MODE=docker WITH_WARP=1 INSTALL_DIR=/opt/chatgpt2api \
+  IMAGE_QUEUE_DATABASE_URL='postgresql+psycopg2://user:password@postgres-host:5432/chatgpt2api_image_queue' \
+  bash -s -- --non-interactive --with-warp
+```
+
+常用环境变量：
+
+| 变量 | 说明 |
+| --- | --- |
+| `MODE` | `docker` 或 `python` |
+| `WITH_WARP` | `0` 或 `1` |
+| `INSTALL_DIR` | 安装目录，默认 `/opt/chatgpt2api` |
+| `CHATGPT2API_PORT` / `PORT` | 宿主机端口，默认 `3000` |
+| `CHATGPT2API_AUTH_KEY` / `AUTH_KEY` | 管理员密钥；留空时自动生成 |
+| `CHATGPT2API_IMAGE` | 要使用的 GHCR 或本地镜像 |
+| `STORAGE_BACKEND` | `json`、`sqlite`、`postgres` 或 `git` |
+| `DATABASE_URL` | 账号存储为 `postgres` 时使用 |
+| `IMAGE_QUEUE_DATABASE_URL` | 持久图片队列 PostgreSQL，始终必填 |
+| `CHATGPT2API_BASE_URL` | 对外 API 基础地址 |
+| `CHATGPT2API_IMAGE_BASE_URL` | Worker 对外图片基础地址 |
+
+帮助和状态：
+
+```bash
+sudo bash /tmp/chatgpt2api-install.sh --help
+sudo bash /tmp/chatgpt2api-install.sh status --install-dir /opt/chatgpt2api
+```
+
+安装完成后检查：
+
+```bash
+cd /opt/chatgpt2api
+docker compose ps
+docker compose logs --tail=200 app
+curl -fsS 'http://127.0.0.1:3000/health/live?format=json'
+```
+
+脚本不会覆盖已有的 `data/config.json`；如果安装目录已有文件但不是 Git 仓库，会停止以避免误覆盖。
+
+## 方式二：普通 Docker 部署
+
+适合不需要 WARP / FlareSolverr 的场景。标准 Compose 只启动应用容器，需要自行准备 PostgreSQL 图片队列：
+
+```bash
+git clone https://github.com/biubiubiu125/chatgpt2api.git
+cd chatgpt2api
+mkdir -p data
+cp .env.example .env
+CHATGPT2API_AUTH_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+printf '{"auth-key":"%s"}\n' "$CHATGPT2API_AUTH_KEY" > data/config.json
+```
+
+编辑 `.env`，至少确认：
+
+```dotenv
+CHATGPT2API_AUTH_KEY=
+CHATGPT2API_IMAGE=ghcr.io/biubiubiu125/chatgpt2api:latest
+IMAGE_QUEUE_DATABASE_URL=postgresql+psycopg2://user:password@postgres-host:5432/chatgpt2api_image_queue
+```
+
+启动、检查和停止：
+
+```bash
+docker compose pull
+docker compose up -d
+docker compose ps
+curl -fsS 'http://127.0.0.1:3000/health/live?format=json'
+docker compose down
+```
+
+访问地址：
+
+```text
+Web 面板：http://localhost:3000
+API：http://localhost:3000/v1
+```
+
+如果 GHCR 包是私有的，先登录：
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+docker compose pull
+```
+
+## 方式三：本地 Compose 试跑
+
+该方式自带 PostgreSQL 17，账号存储使用 SQLite，默认访问 `http://localhost:8000`：
+
+```bash
+mkdir -p data
+CHATGPT2API_AUTH_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+printf '{"auth-key":"%s"}\n' "$CHATGPT2API_AUTH_KEY" > data/config.json
+docker compose -f docker-compose.local.yml up -d --build
+docker compose -f docker-compose.local.yml ps
+```
+
+只建议用于本机试跑，不要把示例数据库密码直接用于公网环境。
+
+## 方式四：主从集群部署
+
+集群模式由 API 主节点和图片 Worker 从节点组成：
+
+- 主节点运行 API、管理台、账号存储和 PostgreSQL。
+- Worker 通过 WireGuard 私网访问 `chatgpt2api_app` 和 `chatgpt2api_image_queue`。
+- Worker 公网只暴露 `/images/`、`/image-thumbnails/` 和健康检查。
+- Worker 返回图片 URL 后，主节点校验 URL 归属和可达性，再返回给客户端。
+
+### 主节点
+
+主节点需要公网 UDP `51820`，WireGuard 私网地址固定为 `10.77.0.1`：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh -o /tmp/chatgpt2api-install.sh
+sudo env WIREGUARD_SERVER_ENDPOINT=主节点公网IP或域名 \
+  POSTGRES_PASSWORD='主节点数据库密码' \
+  POSTGRES_ADMIN_PASSWORD='主节点管理密码' \
+  bash /tmp/chatgpt2api-install.sh main
+sudo bash /tmp/chatgpt2api-install.sh create-worker 1
+sudo bash /tmp/chatgpt2api-install.sh status
+```
+
+主节点会生成：
+
+```text
+/opt/chatgpt2api/join/worker-1.join
+/opt/chatgpt2api/join/join-signing.pub
+```
+
+将这两个文件安全复制到 Worker 主机的 `/opt/chatgpt2api/join/`。
+
+### Worker 节点
+
+Worker 编号 `1` 对应 WireGuard 地址 `10.77.0.11`。先配置公开图片域名和反向代理，再运行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh -o /tmp/chatgpt2api-install.sh
+sudo mkdir -p /opt/chatgpt2api/join
+# 将主节点生成的 worker-1.join 和 join-signing.pub 复制到上面的目录
+sudo env CHATGPT2API_IMAGE_BASE_URL=https://img-1.example.com/images \
+  CHATGPT2API_WORKER_IMAGE_PROXY_READY=1 \
+  bash /tmp/chatgpt2api-install.sh worker /opt/chatgpt2api/join/worker-1.join
+sudo bash /tmp/chatgpt2api-install.sh worker-check
+```
+
+Worker 图片地址必须是客户端可访问的 `http` 或 `https` 地址，不能指向 localhost、内网、链路本地或保留地址，也不能包含 query / fragment。Nginx 示例在 `deploy/nginx-worker-images.example.conf`，脚本会生成 `deploy/nginx-worker-images.conf`；其余路径返回 `403`。
+
+集群脚本命令：
+
+- `main`：安装或修复主节点和 PostgreSQL。
+- `create-worker 1`：生成一次性 Worker 加入文件并登记 WireGuard peer。
+- `worker <join-file>`：校验并消费 join 文件，启动 Worker。
+- `rotate-worker 1`：废弃旧的待加入记录并重新生成配置。
+- `worker-check`：检查 WireGuard、数据库角色、心跳、文件写入和图片 URL。
+- `status`：查看安装目录、Compose、WireGuard 和 Worker 状态。
+
+`worker-*.join`、数据库密码和 `.env` 不要提交到 Git 仓库。
+
+## 方式五：源码运行
+
+适合二次开发、调试和前端开发。后端需要 Python `3.13` 和 `uv`：
+
+```bash
+git clone https://github.com/biubiubiu125/chatgpt2api.git
+cd chatgpt2api
+uv sync --frozen
+PORT=8000 uv run python -m scripts.run_uvicorn
+```
+
+前端：
+
+```bash
+cd web-vue
+npm ci --no-audit --no-fund
+npm run dev
+```
+
+源码方式读取项目根目录的 `config.json` 和 `data/`。后端默认监听 `0.0.0.0:80`，本地开发建议显式设置 `PORT=8000`。
+
+## 本地构建和自动构建
+
+本地构建单架构镜像：
+
+```bash
+docker buildx build --platform linux/amd64 -t chatgpt2api:local --load .
+```
+
+多架构验证：
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 -t chatgpt2api:test .
+```
+
+`.github/workflows/docker-publish.yml` 会在 `main` push、`v*` tag 或手动触发时构建并发布 `linux/amd64`、`linux/arm64`。前端构建阶段固定使用 BuildKit 的构建机架构，避免在 arm64 QEMU 中执行前端依赖安装；`web-vue/package-lock.json` 使用现代 lockfile，Docker 中的 npm 安装关闭 audit / fund 网络请求。Job 超时时间为 45 分钟，便于尽快暴露真正失败步骤。
+
+截图中的 `Error: The operation was canceled` 代表 GitHub Actions Job 被取消，不等于 `npm ci` 本身报错。排查时查看取消前最后一个步骤，并分别验证：
+
+```bash
+cd web-vue
+npm ci --no-audit --no-fund
+npm run build
+cd ..
+docker buildx build --platform linux/amd64 -t chatgpt2api:local --load .
+```
+
+## 反向代理和健康检查
+
+标准 Compose 默认只绑定宿主机 `127.0.0.1:3000`，可以由同机 Nginx 对外提供服务：
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;
+    proxy_read_timeout 600s;
+}
+```
+
+健康检查：
+
+```bash
+curl -fsS 'http://127.0.0.1:3000/health/live?format=json'
+curl -i 'http://127.0.0.1:3000/health?format=json&scope=runtime'
+docker compose ps
+docker compose logs --tail=200 app
+```
+
+`/health/live` 只判断进程存活；`/health?scope=runtime` 还会检查运行时和图片队列，异常时可能返回 `503`。
+
+## 升级前备份
+
+升级前建议备份 `.env` 和 `data/`：
+
+```bash
+cd /opt/chatgpt2api
+mkdir -p backups
+tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz .env data
+```
+
+如果没有 `.env`，只备份数据：
+
+```bash
+tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz data
+```
+
+也可以在后台设置页配置 Cloudflare R2 备份。
+
+## 升级：普通 Docker
+
+```bash
+cd /opt/chatgpt2api
+mkdir -p backups
+tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz .env data
+docker compose pull
+docker compose up -d
+docker compose ps
+curl -fsS 'http://127.0.0.1:3000/health/live?format=json'
+```
+
+## 升级：WARP / FlareSolverr
+
+```bash
+cd /opt/chatgpt2api
+mkdir -p backups
+tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz .env data
+docker compose -f docker-compose.warp.yml pull
+docker compose -f docker-compose.warp.yml up -d
+docker compose -f docker-compose.warp.yml ps
+```
+
+## 升级：源码运行
+
+```bash
+cd chatgpt2api
+git pull
+uv sync --frozen
+cd web-vue
+npm ci --no-audit --no-fund
+npm run build
+```
+
+然后按你的进程管理方式重启后端。不要删除 `data/`、`config.json` 或 `.env`。
+
+## 回滚
+
+回滚前先备份当前 `.env` 和 `data/`，再选择旧版本：
+
+```bash
+cd /opt/chatgpt2api
+git log --oneline -n 20
+git checkout <旧版本commit>
+docker compose up -d
+```
+
+如果使用远程 GHCR 镜像，也可以只在 `.env` 固定旧镜像 tag：
+
+```dotenv
+CHATGPT2API_IMAGE=ghcr.io/biubiubiu125/chatgpt2api:<旧版本tag>
+```
+
+恢复数据前先停止容器：
+
+```bash
+docker compose down
+tar -xzf backups/你的备份文件.tgz
+docker compose up -d
+```
+
+## 常用维护命令
+
+```bash
+cd /opt/chatgpt2api
+docker compose ps
+docker compose logs --tail=200 app
+docker compose restart
+```
+
+WARP 部署：
+
+```bash
+docker compose -f docker-compose.warp.yml ps
+docker compose -f docker-compose.warp.yml logs --tail=200 app
+docker compose -f docker-compose.warp.yml restart
+```
+
+不要直接执行 `rm -rf data`、删除 `.env` 或覆盖 `config.json`，除非已经确认存在可用备份。

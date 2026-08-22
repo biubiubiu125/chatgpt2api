@@ -1,0 +1,144 @@
+services:
+  init-config:
+    image: python:3.13-alpine
+    container_name: chatgpt2api-warp-init
+    working_dir: /app
+    volumes:
+      - ./data:/app/data
+      - ./scripts:/app/scripts:ro
+    environment:
+      CHATGPT2API_CONFIG_FILE: /app/data/config.json
+      CHATGPT2API_PROXY_RUNTIME_ENABLED: ${CHATGPT2API_PROXY_RUNTIME_ENABLED:-true}
+      CHATGPT2API_PROXY_RUNTIME_EGRESS_MODE: ${CHATGPT2API_PROXY_RUNTIME_EGRESS_MODE:-single_proxy}
+      CHATGPT2API_PROXY_RUNTIME_PROXY_URL: ${CHATGPT2API_PROXY_RUNTIME_PROXY_URL:-http://privoxy:8118}
+      CHATGPT2API_PROXY_RUNTIME_RESOURCE_PROXY_URL: ${CHATGPT2API_PROXY_RUNTIME_RESOURCE_PROXY_URL:-}
+      CHATGPT2API_PROXY_RUNTIME_SKIP_SSL_VERIFY: ${CHATGPT2API_PROXY_RUNTIME_SKIP_SSL_VERIFY:-false}
+      CHATGPT2API_PROXY_RUNTIME_RESET_STATUS_CODES: ${CHATGPT2API_PROXY_RUNTIME_RESET_STATUS_CODES:-403}
+      CHATGPT2API_PROXY_RUNTIME_CLEARANCE_ENABLED: ${CHATGPT2API_PROXY_RUNTIME_CLEARANCE_ENABLED:-true}
+      CHATGPT2API_PROXY_RUNTIME_CLEARANCE_MODE: ${CHATGPT2API_PROXY_RUNTIME_CLEARANCE_MODE:-flaresolverr}
+      CHATGPT2API_PROXY_RUNTIME_CLEARANCE_TIMEOUT_SEC: ${CHATGPT2API_PROXY_RUNTIME_CLEARANCE_TIMEOUT_SEC:-60}
+      CHATGPT2API_PROXY_RUNTIME_CLEARANCE_REFRESH_INTERVAL: ${CHATGPT2API_PROXY_RUNTIME_CLEARANCE_REFRESH_INTERVAL:-3600}
+      CHATGPT2API_PROXY_RUNTIME_WARM_UP_ON_START: ${CHATGPT2API_PROXY_RUNTIME_WARM_UP_ON_START:-false}
+      CHATGPT2API_PROXY_RUNTIME_BROWSER: ${CHATGPT2API_PROXY_RUNTIME_BROWSER:-chrome}
+      CHATGPT2API_PROXY_RUNTIME_USER_AGENT: ${CHATGPT2API_PROXY_RUNTIME_USER_AGENT:-}
+      CHATGPT2API_FLARESOLVERR_URL: ${CHATGPT2API_FLARESOLVERR_URL:-http://flaresolverr:8191}
+    command: ["python3", "/app/scripts/init_proxy_config.py"]
+    restart: "no"
+
+  warp-proxy:
+    image: caomingjun/warp:latest
+    container_name: chatgpt2api-warp-proxy
+    restart: unless-stopped
+    environment:
+      WARP_SLEEP: "2"
+      # 可选：填写 Cloudflare WARP+ License Key
+      # WARP_LICENSE_KEY: ${WARP_LICENSE_KEY:-}
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: 0
+      net.ipv4.conf.all.src_valid_mark: 1
+    ports:
+      - "127.0.0.1:${WARP_SOCKS_PORT:-40000}:1080"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.create_connection(('127.0.0.1', 1080), 5); s.close()\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  privoxy:
+    image: vimagick/privoxy:latest
+    container_name: chatgpt2api-privoxy
+    restart: unless-stopped
+    depends_on:
+      warp-proxy:
+        condition: service_started
+    volumes:
+      - ./scripts/privoxy-warp.conf:/etc/privoxy/config:ro
+    ports:
+      - "127.0.0.1:${PRIVOXY_PORT:-40080}:8118"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8118 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: chatgpt2api-flaresolverr
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: ${FLARESOLVERR_LOG_LEVEL:-info}
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "127.0.0.1:${FLARESOLVERR_PORT:-8191}:8191"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8191/ >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  app:
+    image: ${CHATGPT2API_IMAGE:-ghcr.io/biubiubiu125/chatgpt2api:latest}
+    container_name: chatgpt2api-warp
+    restart: unless-stopped
+    depends_on:
+      init-config:
+        condition: service_completed_successfully
+      privoxy:
+        condition: service_started
+      flaresolverr:
+        condition: service_started
+    ports:
+      - "127.0.0.1:${CHATGPT2API_PORT:-3000}:80"
+    volumes:
+      - ./data:/app/data
+    environment:
+      CHATGPT2API_CONFIG_FILE: /app/data/config.json
+      CHATGPT2API_NODE_ROLE: ${CHATGPT2API_NODE_ROLE:-standalone}
+      CHATGPT2API_RUN_API: ${CHATGPT2API_RUN_API:-}
+      CHATGPT2API_RUN_WORKER: ${CHATGPT2API_RUN_WORKER:-}
+      CHATGPT2API_WORKER_ID: ${CHATGPT2API_WORKER_ID:-}
+      CHATGPT2API_WIREGUARD_IP: ${CHATGPT2API_WIREGUARD_IP:-}
+      CHATGPT2API_IMAGE_BASE_URL: ${CHATGPT2API_IMAGE_BASE_URL:-}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-json}
+      APP_DATABASE_URL: ${APP_DATABASE_URL:-}
+      DATABASE_URL: ${DATABASE_URL:-}
+      IMAGE_QUEUE_DATABASE_URL: "${IMAGE_QUEUE_DATABASE_URL:?IMAGE_QUEUE_DATABASE_URL is required for durable image APIs}"
+      IMAGE_QUEUE_ARTIFACT_ROOT: /app/data/images
+      IMAGE_PROMPT_SUFFIX_ENABLED: ${IMAGE_PROMPT_SUFFIX_ENABLED:-true}
+      IMAGE_PROMPT_SUFFIX: ${IMAGE_PROMPT_SUFFIX:-}
+      IMAGE_QUEUE_RECOVERY_ACCOUNT_TIMEOUT_SECONDS: ${IMAGE_QUEUE_RECOVERY_ACCOUNT_TIMEOUT_SECONDS:-900}
+      IMAGE_QUEUE_DELIVERY_GRACE_SECONDS: ${IMAGE_QUEUE_DELIVERY_GRACE_SECONDS:-604800}
+      IMAGE_QUEUE_TERMINAL_RETENTION_SECONDS: ${IMAGE_QUEUE_TERMINAL_RETENTION_SECONDS:-2592000}
+      IMAGE_QUEUE_STARTUP_RETRY_SECONDS: ${IMAGE_QUEUE_STARTUP_RETRY_SECONDS:-5}
+      IMAGE_QUEUE_PROTOCOL_WAIT_TIMEOUT_SECONDS: ${IMAGE_QUEUE_PROTOCOL_WAIT_TIMEOUT_SECONDS:-300}
+      IMAGE_QUEUE_VERIFY_RETURNED_URL: ${IMAGE_QUEUE_VERIFY_RETURNED_URL:-true}
+      IMAGE_QUEUE_RETURNED_URL_VERIFY_TIMEOUT_SECONDS: ${IMAGE_QUEUE_RETURNED_URL_VERIFY_TIMEOUT_SECONDS:-5}
+      IMAGE_QUEUE_RETURNED_URL_VERIFY_ATTEMPTS: ${IMAGE_QUEUE_RETURNED_URL_VERIFY_ATTEMPTS:-3}
+      IMAGE_QUEUE_RETURNED_URL_VERIFY_MAX_BYTES: ${IMAGE_QUEUE_RETURNED_URL_VERIFY_MAX_BYTES:-65536}
+      IMAGE_QUEUE_GENERATION_CONCURRENCY: ${IMAGE_QUEUE_GENERATION_CONCURRENCY:-}
+      IMAGE_QUEUE_GENERATION_CONCURRENCY_CAP: ${IMAGE_QUEUE_GENERATION_CONCURRENCY_CAP:-64}
+      IMAGE_QUEUE_ABSOLUTE_GUARD: ${IMAGE_QUEUE_ABSOLUTE_GUARD:-128}
+      IMAGE_QUEUE_MAX_BACKLOG: ${IMAGE_QUEUE_MAX_BACKLOG:-50}
+      IMAGE_QUEUE_PENDING_TTL_SECONDS: ${IMAGE_QUEUE_PENDING_TTL_SECONDS:-1800}
+      IMAGE_QUEUE_CLAIM_MAX_RUNTIME_SECONDS: ${IMAGE_QUEUE_CLAIM_MAX_RUNTIME_SECONDS:-1800}
+      GIT_REPO_URL: ${GIT_REPO_URL:-}
+      GIT_TOKEN: ${GIT_TOKEN:-}
+      GIT_BRANCH: ${GIT_BRANCH:-main}
+      GIT_FILE_PATH: ${GIT_FILE_PATH:-accounts.json}
+      GIT_AUTH_KEYS_FILE_PATH: ${GIT_AUTH_KEYS_FILE_PATH:-auth_keys.json}
+      CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
+      CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
+      CHATGPT2API_THREAD_TOKENS: ${CHATGPT2API_THREAD_TOKENS:-}
+      TZ: ${TZ:-Asia/Shanghai}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1/health?format=json&scope=runtime', timeout=5).status == 200 else 1)\""]
+      interval: 30s
+      timeout: 6s
+      retries: 5
+      start_period: 30s

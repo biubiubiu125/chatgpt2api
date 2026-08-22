@@ -1,0 +1,158 @@
+# ChatGPT2API 配置示例
+#
+# 说明：
+# - 仓库只保存这个示例文件，运行时仍然使用 config.json。
+# - Docker 安装脚本会自动生成 config.json；手动部署时可以按本文件内容在控制台里配置，
+#   或自行创建 config.json。
+# - 敏感信息（auth-key、代理、R2、WebDAV、Git Token 等）不要提交到仓库。
+# - PostgreSQL 生图队列和提示词后缀在启动时通过 IMAGE_QUEUE_*、IMAGE_PROMPT_SUFFIX_* 环境变量配置。
+
+auth-key: chatgpt2api
+refresh_account_interval_minute: 5
+image_retention_days: 15
+log_retention_days: 30
+image_poll_timeout_secs: 60
+image_stream_timeout_secs: 80
+image_poll_interval_secs: 10
+image_poll_initial_wait_secs: 10
+image_account_concurrency: 1
+image_account_retry_enabled: true
+image_preflight_token_refresh_enabled: false
+image_upscale_enabled: false
+image_upscale_engine: sharp_lanczos3
+image_auth_refresh_concurrency: 10
+image_max_account_attempts: 4
+image_parallel_generation: true
+image_remove_conversation_after_result: false
+image_min_free_mb: 500
+image_settle_enabled: false
+image_check_before_hit_enabled: false
+image_settle_secs: 2
+
+auto_remove_rate_limited_accounts: false
+auto_remove_invalid_accounts: true
+auto_relogin_after_refresh: false
+
+log_levels:
+  - debug
+  - info
+  - warning
+  - error
+
+proxy: ""
+fallback_proxy: ""
+base_url: ""
+sensitive_words: []
+global_system_prompt: ""
+
+proxy_runtime:
+  enabled: false
+  egress_mode: direct
+  proxy_url: ""
+  resource_proxy_url: ""
+  skip_ssl_verify: false
+  reset_session_status_codes:
+    - 403
+  clearance:
+    enabled: false
+    mode: none
+    cf_cookies: ""
+    cf_clearance: ""
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+    browser: chrome
+    flaresolverr_url: ""
+    timeout_sec: 60
+    refresh_interval: 3600
+    warm_up_on_start: false
+
+image_storage:
+  enabled: false
+  mode: local
+  webdav_url: ""
+  webdav_username: ""
+  webdav_password: ""
+  webdav_root_path: chatgpt2api/images
+  private_webdav_url: ""
+  private_webdav_username: ""
+  private_webdav_password: ""
+  private_webdav_root_path: chatgpt2api/private
+  public_base_url: ""
+
+chat_completion_cache:
+  enabled: true
+  ttl_seconds: 60
+  max_entries: 256
+  dedupe_inflight: true
+  stream_cache: true
+  normalize_messages: true
+  drop_adjacent_duplicates: true
+  drop_assistant_history: false
+
+ai_review:
+  enabled: false
+  base_url: ""
+  api_key: ""
+  model: ""
+  prompt: ""
+
+backup:
+  enabled: false
+  provider: cloudflare_r2
+  account_id: ""
+  access_key_id: ""
+  secret_access_key: ""
+  bucket: ""
+  prefix: backups
+  interval_minutes: 1440
+  rotation_keep: 10
+  encrypt: false
+  passphrase: ""
+  include:
+    config: true
+    register: true
+    cpa: true
+    sub2api: true
+    logs: true
+    dashboard_metrics: true
+    image_tasks: true
+    accounts_snapshot: true
+    auth_keys_snapshot: true
+    images: true
+
+third_party_apps:
+  infinite_canvas:
+    enabled: true
+    url: https://canvas.best
+
+basic:
+  api_key: ""
+  base_url: ""
+  proxy: ""
+  image_expire_hours: 15
+
+image_generation:
+  enabled: true
+  supported_models: []
+  model_options: []
+  block_rich_output_on_base_chat_models: true
+  output_format: url
+  nanobanana_lane: fast
+  nanobanana_lane_order:
+    - fast
+
+quota_limits:
+  enabled: true
+  fast_daily_limit: -1
+  thinking_daily_limit: -1
+  pro_daily_limit: -1
+  image_daily_limit: -1
+  music_daily_limit: -1
+  video_daily_limit: -1
+
+runtime_capacity:
+  uvicorn_workers: 1
+  text_concurrency_limit: 80
+  image_concurrency_limit: 2000
+  request_queue_timeout_seconds: 0
+
+proxy_profiles: []

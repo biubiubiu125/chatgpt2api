@@ -1,0 +1,57 @@
+{
+  "name": "chatgpt2api-console",
+  "private": true,
+  "version": "2.7.1-rc.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "clean:dist": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean:dist && tsc && vite build",
+    "test:debug-center-editable-tasks": "node scripts/test-debug-center-editable-tasks.mjs",
+    "test:register-provider": "node scripts/test-register-provider-view.mjs",
+    "test:studio-image-tasks": "node scripts/test-studio-image-task-closed-loop.mjs && node scripts/test-studio-image-task-runtime.mjs",
+    "test:third-party-links": "node scripts/test-third-party-links.mjs && node scripts/test-safe-external-url.mjs",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@iconify/vue": "^5.0.0",
+    "@types/js-beautify": "^1.14.3",
+    "@types/markdown-it": "^14.1.2",
+    "autoprefixer": "^10.4.23",
+    "postcss": "^8.5.26",
+    "tailwindcss": "^3.4.19",
+    "typescript": "~5.9.3",
+    "vite": "^7.3.6"
+  },
+  "dependencies": {
+    "@vitejs/plugin-vue": "^6.0.6",
+    "axios": "^1.19.0",
+    "highlight.js": "^11.11.1",
+    "js-beautify": "^1.15.4",
+    "markdown-it": "^14.2.0",
+    "nanocat-ui": "^0.1.6",
+    "pinia": "^3.0.4",
+    "vue": "^3.5.26",
+    "vue-router": "^4.6.4",
+    "vue-virtual-scroller": "^2.0.0-beta.8"
+  },
+  "overrides": {
+    "micromatch": {
+      "picomatch": "2.3.2"
+    },
+    "anymatch": {
+      "picomatch": "2.3.2"
+    },
+    "vite": {
+      "picomatch": "4.0.4",
+      "tinyglobby": {
+        "picomatch": "4.0.4"
+      }
+    },
+    "sucrase": {
+      "tinyglobby": {
+        "picomatch": "4.0.4"
+      }
+    }
+  }
+}
