@@ -310,7 +310,7 @@ docker buildx build --platform linux/amd64,linux/arm64 -t chatgpt2api:test .
 
 `.github/workflows/docker-publish.yml` 会在 `main` push、`v*` tag 或手动触发时构建并发布 `linux/amd64`、`linux/arm64`。前端构建阶段固定使用 BuildKit 的构建机架构，避免在 arm64 QEMU 中执行前端依赖安装；`web-vue/package-lock.json` 使用现代 lockfile，Docker 中的 npm 安装关闭 audit / fund 网络请求。Job 超时时间为 45 分钟，便于尽快暴露真正失败步骤。
 
-发布前必须同步更新 `deploy/release-manifest.env`，其中 `CHATGPT2API_RELEASE_REF` 必须等于本次 `GITHUB_SHA`；工作流会在镜像构建前严格校验，不再允许源码提交、GHCR 镜像和一键安装脚本指向不同版本。manifest 中的 `UV_VERSION` 同时用于 Docker `build-args` 和 CI 的 `uv sync`。
+发布前必须同步更新 `deploy/release-manifest.env` 和 `deploy/install.sh` 里的默认 release pin；工作流会在镜像构建前严格校验两者一致，不再允许源码提交、GHCR 镜像和一键安装脚本指向不同版本。manifest 中的 `UV_VERSION` 同时用于 Docker `build-args` 和 CI 的 `uv sync`。
 
 截图中的 `Error: The operation was canceled` 代表 GitHub Actions Job 被取消，不等于 `npm ci` 本身报错。排查时查看取消前最后一个步骤，并分别验证：
 

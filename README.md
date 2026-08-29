@@ -402,7 +402,7 @@ docker compose logs --tail=200 app
 - 前端阶段使用构建机架构，避免在 arm64 QEMU（模拟器）中重复执行前端依赖安装。
 - Job 有明确超时；如果超过 45 分钟会失败并保留可定位的步骤，而不是等待 GitHub 6 小时后显示 `cancelled`。
 - 工作流权限：`contents: read`、`packages: write`。
-- `deploy/release-manifest.env` 是生产发布的唯一版本元数据；发布前必须与当前 `GITHUB_SHA` 完全一致，过期 manifest 会在构建前直接失败，避免出现“已发布但一键脚本仍部署旧版本”。
+- `deploy/release-manifest.env` 是生产发布的唯一版本元数据；发布前必须与 `deploy/install.sh` 里的默认 release pin 保持一致，避免安装脚本和发布清单分叉。
 - manifest 中的 `UV_VERSION` 同时驱动 Docker 构建和 CI 后端依赖安装，Python 一键模式也读取同一版本。
 
 镜像地址：

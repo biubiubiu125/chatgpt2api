@@ -119,7 +119,13 @@ jobs:
             printf '%s' "${value}"
           }
           default_release_ref="$(strip_optional_quotes "$(sed -n 's/^DEFAULT_RELEASE_REF=//p' deploy/install.sh | head -n 1)")"
-          test "${default_release_ref}" = "${GITHUB_SHA}"
+          manifest_release_ref=""
+          if [ -f deploy/release-manifest.env ]; then
+            manifest_release_ref="$(strip_optional_quotes "$(sed -n 's/^CHATGPT2API_RELEASE_REF=//p' deploy/release-manifest.env | head -n 1)")"
+          fi
+          test -n "${default_release_ref}"
+          test -n "${manifest_release_ref}"
+          test "${default_release_ref}" = "${manifest_release_ref}"
 
       - name: Validate frontend regression scripts
         working-directory: web-vue
