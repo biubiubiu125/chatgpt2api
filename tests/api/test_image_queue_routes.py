@@ -1,19 +1,56 @@
 from __future__ import annotations
 
+import base64
 import json
+from io import BytesIO
 from threading import Event
 from types import SimpleNamespace
+from uuid import UUID
 
 from fastapi.testclient import TestClient
+from PIL import Image
 import pytest
 
 from api import app as app_module
 from api import ai as ai_module
+from api import image_tasks as image_tasks_module
 from services.image_queue.database import ImageQueueUnavailableError
 from services.image_queue.repository import IdempotencyConflict
-from services.image_queue.types import ResourceDecision
+from services.image_queue.types import ImageAccountCandidate, ResourceDecision
 from services.log_service import LoggedCall, _image_error_response
 from services.image_queue.idempotency import require_public_image_model
+from services.quota_service import QuotaService
+
+
+def _tiny_png_base64() -> str:
+    output = BytesIO()
+    Image.new("RGB", (2, 2), (20, 30, 40)).save(output, format="PNG")
+    return base64.b64encode(output.getvalue()).decode("ascii")
+
+
+class _RecordingQuota:
+    def __init__(self, events: list) -> None:
+        self.events = events
+        self.committed = False
+
+    def commit(self) -> None:
+        self.committed = True
+        self.events.append("commit")
+
+    def cancel(self) -> None:
+        self.events.append("cancel")
+
+
+def _patch_native_task_logging(monkeypatch, events: list, quota: _RecordingQuota | None = None) -> None:
+    class FakeCall:
+        def __init__(self, *args, **kwargs):
+            self.call_id = "call-native-task-1"
+
+        def log(self, suffix, result=None, status="success", **kwargs):
+            events.append(("log", suffix, status, bool(quota and quota.committed), result, kwargs))
+
+    monkeypatch.setattr(image_tasks_module, "LoggedCall", FakeCall)
+
 
 def test_generation_route_enqueues_with_idempotency_and_trace_headers(
     image_queue_client,
@@ -42,6 +79,120 @@ def test_generation_route_enqueues_with_idempotency_and_trace_headers(
     assert api_image_task_service.repository.get_task_by_idempotency_key("owner-1", "request-1") is not None
     assert saved["request_payload"]["trace_headers"]["x-newapi-request-id"] == "newapi-trace-1"
     assert saved["request_payload"]["trace_headers"]["call_id"]
+
+
+def test_native_generation_task_logs_queued_after_quota_commit(
+    image_queue_client,
+    monkeypatch,
+) -> None:
+    events = []
+    quota = _RecordingQuota(events)
+    _patch_native_task_logging(monkeypatch, events, quota)
+    monkeypatch.setattr(image_tasks_module, "reserve_quota", lambda *args, **kwargs: quota)
+
+    response = image_queue_client.post(
+        "/api/image-tasks/generations",
+        headers={"Authorization": "Bearer test", "Idempotency-Key": "native-log-1"},
+        json={"client_task_id": "native-log-1", "prompt": "cat", "model": "gpt-image-2"},
+    )
+
+    assert response.status_code == 200
+    assert events[0] == "commit"
+    assert events[1][0:4] == ("log", "已入队", "queued", True)
+    assert events[1][4]["task_id"] == response.json()["task_id"]
+
+
+def test_native_edit_task_logs_queued_after_quota_commit(
+    image_queue_client,
+    monkeypatch,
+) -> None:
+    events = []
+    quota = _RecordingQuota(events)
+    _patch_native_task_logging(monkeypatch, events, quota)
+    monkeypatch.setattr(image_tasks_module, "reserve_quota", lambda *args, **kwargs: quota)
+
+    response = image_queue_client.post(
+        "/api/image-tasks/edits",
+        headers={"Authorization": "Bearer test", "Idempotency-Key": "native-edit-log-1"},
+        json={
+            "client_task_id": "native-edit-log-1",
+            "prompt": "make it warmer",
+            "model": "gpt-image-2",
+            "images": [{"b64_json": _tiny_png_base64(), "filename": "source.png", "mime_type": "image/png"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert events[0] == "commit"
+    assert events[1][0:4] == ("log", "已入队", "queued", True)
+    assert events[1][4]["task_id"] == response.json()["task_id"]
+
+
+def test_native_generation_task_logs_idempotency_conflict_failure(
+    image_queue_client,
+    monkeypatch,
+) -> None:
+    events = []
+    _patch_native_task_logging(monkeypatch, events)
+    headers = {"Authorization": "Bearer test", "Idempotency-Key": "native-conflict-1"}
+
+    first = image_queue_client.post(
+        "/api/image-tasks/generations",
+        headers=headers,
+        json={"client_task_id": "native-conflict-a", "prompt": "cat", "model": "gpt-image-2"},
+    )
+    second = image_queue_client.post(
+        "/api/image-tasks/generations",
+        headers=headers,
+        json={"client_task_id": "native-conflict-b", "prompt": "dog", "model": "gpt-image-2"},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    failures = [event for event in events if event[0:3] == ("log", "调用失败", "failed")]
+    assert failures
+    assert failures[-1][5]["error"] == "idempotency_conflict"
+
+
+def test_generation_route_quota_dedupes_same_client_task_with_new_header(
+    image_queue_client,
+    api_image_task_service,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    quota_service = QuotaService(
+        tmp_path / "quota_usage.json",
+        settings_provider=lambda: {"enabled": True, "image_daily_limit": 5},
+        today_provider=lambda: "2026-08-27",
+    )
+
+    def reserve(identity, endpoint, model, *, image_request=False, idempotency_key="", idempotency_aliases=()):
+        return quota_service.reserve(
+            identity,
+            "image",
+            idempotency_key=idempotency_key,
+            idempotency_aliases=idempotency_aliases,
+        )
+
+    monkeypatch.setattr("api.image_tasks.reserve_quota", reserve)
+
+    first = image_queue_client.post(
+        "/api/image-tasks/generations",
+        headers={"Authorization": "Bearer test", "Idempotency-Key": "header-key-1"},
+        json={"client_task_id": "same-client-task", "prompt": "cat", "model": "gpt-image-2"},
+    )
+    second = image_queue_client.post(
+        "/api/image-tasks/generations",
+        headers={"Authorization": "Bearer test", "Idempotency-Key": "header-key-2"},
+        json={"client_task_id": "same-client-task", "prompt": "cat", "model": "gpt-image-2"},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["task_id"] == second.json()["task_id"]
+    assert len(api_image_task_service.repository.list_tasks("owner-1")) == 1
+    persisted = json.loads(quota_service.path.read_text(encoding="utf-8"))
+    assert persisted["usage"]["owner-1"]["image"] == 1
 
 
 def test_generation_route_returns_conflict_for_reused_key_with_different_request(
@@ -160,6 +311,50 @@ def test_get_and_cancel_routes_are_idempotent_and_canceled_task_cannot_be_acked(
 
     assert fetched.status_code == 200
     assert first_cancel.json()["status"] == second_cancel.json()["status"] == "canceled"
+    assert acknowledged.status_code == 409
+    assert acknowledged.json()["detail"]["error"] == "task_state_conflict"
+
+
+def test_ack_route_rejects_success_task_after_gallery_artifact_is_deleted(
+    image_queue_client,
+    api_image_task_service,
+) -> None:
+    created = image_queue_client.post(
+        "/api/image-tasks/generations",
+        headers={"Authorization": "Bearer test"},
+        json={"client_task_id": "ack-after-delete", "prompt": "cat", "model": "gpt-image-2"},
+    ).json()
+    task_id = created["task_id"]
+    repository = api_image_task_service.repository
+    claim = repository.claim_next_job(
+        "worker-1",
+        [ImageAccountCandidate(
+            account_id=UUID("10000000-0000-0000-0000-000000000001"),
+            access_token="token",
+        )],
+        1,
+    )
+    assert claim is not None
+    payload = _tiny_png_base64()
+    artifact = api_image_task_service.artifact_service.persist_final(
+        claim.job.task_id,
+        claim.job.id,
+        base64.b64decode(payload),
+        "https://api.example",
+    )
+    repository.complete_job(
+        claim,
+        artifact,
+        {"url": artifact.public_url, "width": artifact.width, "height": artifact.height},
+    )
+
+    assert api_image_task_service.delete_public_final_artifact(artifact.relative_path) is True
+
+    acknowledged = image_queue_client.post(
+        f"/api/image-tasks/{task_id}/ack",
+        headers={"Authorization": "Bearer test"},
+    )
+
     assert acknowledged.status_code == 409
     assert acknowledged.json()["detail"]["error"] == "task_state_conflict"
 
@@ -366,6 +561,52 @@ def test_external_image_routes_inject_durable_context(monkeypatch) -> None:
     assert prepared and prepared[0][2]["mode"] == "generation"
 
 
+def test_external_image_context_uses_client_task_id_as_quota_alias(monkeypatch) -> None:
+    captured = {}
+
+    async def prepare(body, payload, **kwargs):
+        return {}
+
+    class FakeCall:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        def attach_trace_metadata(self, payload):
+            return None
+
+        def _trace_image_perf(self):
+            return False
+
+        async def run(self, handler, payload, **kwargs):
+            captured.update(payload["_image_task_context"])
+            return {"ok": True}
+
+    async def allow(call, text):
+        return None
+
+    monkeypatch.setattr(ai_module, "LoggedCall", FakeCall)
+    monkeypatch.setattr(ai_module, "filter_or_log", allow)
+    monkeypatch.setattr(ai_module.durable_image, "prepare", prepare)
+    monkeypatch.setattr(ai_module, "require_identity", lambda authorization: {"id": "owner-1", "role": "user"})
+    app = __import__("fastapi").FastAPI()
+    app.include_router(ai_module.create_router())
+
+    response = TestClient(app).post(
+        "/v1/images/generations",
+        headers={"Authorization": "Bearer test", "Idempotency-Key": "header-key-1"},
+        json={
+            "model": "gpt-image-2",
+            "prompt": "cat",
+            "client_task_id": "same-client-task",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["idempotency_key"] == "header-key-1"
+    assert captured["quota_idempotency_key"] == "header-key-1"
+    assert captured["quota_idempotency_aliases"] == ["same-client-task"]
+
+
 def test_text_chat_does_not_receive_image_queue_context(monkeypatch) -> None:
     captured = {}
 
@@ -502,3 +743,124 @@ def test_image_protocol_accepts_client_task_id_as_idempotency_key(monkeypatch) -
 
     assert response.status_code == 200
     assert captured["_image_task_context"]["idempotency_key"] == "client-retry-1"
+
+
+def test_editable_file_task_rejects_request_without_replayable_idempotency_key(
+    monkeypatch,
+) -> None:
+    captured = {}
+
+    class FakeQuota:
+        def cancel(self):
+            captured["quota_cancelled"] = True
+
+    async def allow(call, text):
+        return None
+
+    def submit_ppt(identity, **kwargs):
+        captured.update(kwargs)
+        return {"id": "task-1", "status": "queued"}
+
+    monkeypatch.setattr(ai_module, "require_identity", lambda authorization: {"id": "owner-1"})
+    monkeypatch.setattr(ai_module, "filter_or_log", allow)
+    monkeypatch.setattr(ai_module, "reserve_quota", lambda *args, **kwargs: FakeQuota())
+    monkeypatch.setattr(ai_module, "_commit_editable_quota_or_raise", lambda *args: None)
+    monkeypatch.setattr(ai_module, "resolve_api_base_url", lambda request: "https://api.example")
+    monkeypatch.setattr(ai_module.editable_file_task_service, "submit_ppt", submit_ppt)
+    app = __import__("fastapi").FastAPI()
+    app.include_router(ai_module.create_router())
+
+    response = TestClient(app).post(
+        "/v1/ppt/generations",
+        headers={"Authorization": "Bearer test"},
+        json={"prompt": "make a deck"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "idempotency_key_required"
+    assert "id" not in captured
+
+
+def test_editable_file_task_accepts_idempotency_header_as_task_id(monkeypatch) -> None:
+    captured = {}
+
+    class FakeQuota:
+        def cancel(self):
+            return None
+
+    async def allow(call, text):
+        return None
+
+    def submit_ppt(identity, **kwargs):
+        captured.update(kwargs)
+        return {"id": kwargs["client_task_id"], "status": "queued"}
+
+    monkeypatch.setattr(ai_module, "require_identity", lambda authorization: {"id": "owner-1"})
+    monkeypatch.setattr(ai_module, "filter_or_log", allow)
+    monkeypatch.setattr(ai_module, "reserve_quota", lambda *args, **kwargs: FakeQuota())
+    monkeypatch.setattr(ai_module, "_commit_editable_quota_or_raise", lambda *args: None)
+    monkeypatch.setattr(ai_module, "resolve_api_base_url", lambda request: "https://api.example")
+    monkeypatch.setattr(ai_module.editable_file_task_service, "submit_ppt", submit_ppt)
+    app = __import__("fastapi").FastAPI()
+    app.include_router(ai_module.create_router())
+
+    response = TestClient(app).post(
+        "/v1/ppt/generations",
+        headers={
+            "Authorization": "Bearer test",
+            "Idempotency-Key": "header-task-1",
+        },
+        json={"prompt": "make a deck"},
+    )
+
+    assert response.status_code == 200
+    assert captured["client_task_id"] == "header-task-1"
+
+
+def test_editable_file_task_logs_queued_submission_after_quota_commit(monkeypatch) -> None:
+    events = []
+
+    class FakeQuota:
+        committed = False
+
+        def commit(self):
+            self.committed = True
+            events.append("commit")
+
+        def cancel(self):
+            events.append("cancel")
+
+    quota = FakeQuota()
+
+    class FakeCall:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        def log(self, suffix, result=None, status="success", **kwargs):
+            events.append(("log", suffix, status, bool(quota.committed), result))
+
+    async def allow(call, text):
+        return None
+
+    def submit_ppt(identity, **kwargs):
+        return {"id": kwargs["client_task_id"], "task_id": kwargs["client_task_id"], "status": "queued"}
+
+    monkeypatch.setattr(ai_module, "LoggedCall", FakeCall)
+    monkeypatch.setattr(ai_module, "require_identity", lambda authorization: {"id": "owner-1"})
+    monkeypatch.setattr(ai_module, "filter_or_log", allow)
+    monkeypatch.setattr(ai_module, "reserve_quota", lambda *args, **kwargs: quota)
+    monkeypatch.setattr(ai_module, "resolve_api_base_url", lambda request: "https://api.example")
+    monkeypatch.setattr(ai_module.editable_file_task_service, "submit_ppt", submit_ppt)
+    app = __import__("fastapi").FastAPI()
+    app.include_router(ai_module.create_router())
+
+    response = TestClient(app).post(
+        "/v1/ppt/generations",
+        headers={"Authorization": "Bearer test", "Idempotency-Key": "deck-task-1"},
+        json={"prompt": "make a deck"},
+    )
+
+    assert response.status_code == 200
+    assert events[0] == "commit"
+    assert events[1][0:4] == ("log", "已入队", "queued", True)
+    assert events[1][4]["task_id"] == "deck-task-1"

@@ -9,8 +9,10 @@ from threading import current_thread
 from uuid import UUID
 
 from services.image_failure import ImageGenerationError, image_failure
+from services.cluster_settings import ClusterSettings
 from services.image_queue.retry_policy import RetryPolicy
 from services.image_queue.settings import ImageQueueSettings
+import services.returned_url_verifier as returned_url_verifier
 from services.image_queue.types import (
     ArtifactDescriptor,
     ArtifactStatus,
@@ -24,6 +26,7 @@ from services.image_queue.types import (
 )
 from services.image_queue import types as queue_types
 from services.image_queue.worker import ImageWorkerManager
+import pytest
 
 
 class AlwaysAllowedResources:
@@ -59,8 +62,68 @@ class FakeAccounts:
     def prepare_image_account(self, account_id):
         return "token-1"
 
+    def get_stats(self):
+        return {
+            "total_quota": 0,
+            "unlimited_quota_count": 0,
+            "unknown_quota_count": 0,
+        }
+
     def record_managed_image_result(self, *args, **kwargs):
         return {"recorded": True}
+
+
+def _complete_url_only_job(repository, claim):
+    relative_path = f"{claim.job.task_id}/{claim.job.id}/{'a' * 64}.png"
+    artifact = ArtifactDescriptor(
+        task_id=claim.job.task_id,
+        job_id=claim.job.id,
+        kind="final",
+        status=ArtifactStatus.READY,
+        relative_path=relative_path,
+        sha256="a" * 64,
+        mime_type="image/png",
+        byte_size=10,
+        width=4,
+        height=3,
+        public_url="https://example.test/image.png",
+    )
+    repository.complete_job(
+        claim,
+        artifact,
+        {
+            "url": "https://example.test/image.png",
+            "width": 4,
+            "height": 3,
+            "relative_path": relative_path,
+            "delivery_mode": "node_url",
+        },
+    )
+
+
+def test_worker_constructor_rejects_image_base_url_hostnames_resolving_to_private_addresses(
+    repository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CHATGPT2API_IMAGE_BASE_URL", "https://internal.example/images")
+    monkeypatch.setattr(
+        returned_url_verifier.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (None, None, None, None, ("127.0.0.1", 443)),
+        ],
+    )
+
+    settings = ImageQueueSettings(database_url="sqlite://")
+
+    with pytest.raises(ValueError, match="private or local address"):
+        ImageWorkerManager(
+            repository,
+            FakeAccounts(),
+            lambda claim, token: None,
+            settings,
+            resource_controller=AlwaysAllowedResources(),
+        )
 
 
 def test_thousand_queued_jobs_do_not_create_thousand_threads(
@@ -132,7 +195,12 @@ def test_generation_pool_can_scale_above_legacy_fixed_cap(repository) -> None:
         def cpu_limit_cores():
             return 128
 
-    settings = ImageQueueSettings(database_url="sqlite://", absolute_guard=256)
+    settings = ImageQueueSettings(
+        database_url="sqlite://",
+        absolute_guard=256,
+        generation_concurrency_limit=128,
+        generation_concurrency_hard_cap=128,
+    )
     manager = ImageWorkerManager(
         repository,
         FakeAccounts(),
@@ -233,8 +301,13 @@ def test_dispatch_adopts_local_crash_artifact_before_listing_accounts(
     repository,
     generation_request,
     account_candidates,
+    monkeypatch,
 ) -> None:
-    repository.lease_seconds = 0
+    monkeypatch.setattr(
+        "services.image_queue.worker.load_cluster_settings",
+        lambda *args, **kwargs: ClusterSettings(),
+    )
+    repository.lease_seconds = 30
     repository.enqueue_task(generation_request)
     original = repository.claim_next_job("worker-before-crash", account_candidates[:1], 1)
     assert original is not None
@@ -266,13 +339,22 @@ def test_dispatch_adopts_local_crash_artifact_before_listing_accounts(
 
     def adopt_local() -> int:
         callback_calls.append(True)
-        return int(repository.adopt_recovery_artifact(original.job.id, recovered))
+        return 0
 
     def execute(claim, token):
         assert token == ""
         executed.set()
         repository.release_claim(claim)
 
+    assert repository.adopt_recovery_artifact(original.job.id, recovered) is True
+    assert (
+        repository.requeue_job_for_recovery(
+            original.job.id,
+            JobStage.SAVING,
+            now=datetime.now(timezone.utc) - timedelta(seconds=1),
+        )
+        is True
+    )
     manager = ImageWorkerManager(
         repository,
         NoAccounts(),
@@ -280,8 +362,10 @@ def test_dispatch_adopts_local_crash_artifact_before_listing_accounts(
         ImageQueueSettings(database_url="sqlite://"),
         resource_controller=AlwaysAllowedResources(),
         local_recovery_callback=adopt_local,
+        local_recovery_available_callback=lambda job, artifacts: bool(artifacts),
     )
 
+    manager._dispatch_once()
     manager._dispatch_once()
 
     assert executed.wait(2)
@@ -338,6 +422,82 @@ def test_successful_job_is_not_reclassified_when_account_bookkeeping_fails(
 
     assert repository.get_task("owner-1", task.id).status == TaskStatus.SUCCESS
     assert accounts.failure_calls == 0
+    manager.stop(2)
+
+
+def test_successful_url_only_job_is_accounted_once(
+    repository,
+    generation_request,
+) -> None:
+    class RecordingAccounts(FakeAccounts):
+        def __init__(self) -> None:
+            super().__init__()
+            self.results = []
+
+        def record_managed_image_result(self, account_id, *, success, **kwargs):
+            self.results.append(kwargs | {"success": success})
+            return {"recorded": True}
+
+    accounts = RecordingAccounts()
+    repository.enqueue_task(generation_request)
+    claim = repository.claim_next_job("worker-1", accounts.list_image_account_candidates(), 1)
+    assert claim is not None
+
+    def execute(completed_claim, token):
+        _complete_url_only_job(repository, completed_claim)
+
+    manager = ImageWorkerManager(
+        repository,
+        accounts,
+        execute,
+        ImageQueueSettings(database_url="sqlite://"),
+        resource_controller=AlwaysAllowedResources(),
+    )
+
+    manager._run_claim(claim)
+
+    assert len(accounts.results) == 1
+    assert accounts.results[0]["success"] is True
+    assert accounts.results[0]["quota_consumed"] is True
+    persisted = repository.get_job(claim.job.id)
+    assert persisted is not None and persisted.quota_accounted is True
+    manager.stop(2)
+
+
+def test_reconcile_unaccounted_url_only_success_is_accounted(
+    repository,
+    generation_request,
+) -> None:
+    class RecordingAccounts(FakeAccounts):
+        def __init__(self) -> None:
+            super().__init__()
+            self.results = []
+
+        def record_managed_image_result(self, account_id, *, success, **kwargs):
+            self.results.append(kwargs | {"success": success})
+            return {"recorded": True}
+
+    accounts = RecordingAccounts()
+    repository.enqueue_task(generation_request)
+    claim = repository.claim_next_job("worker-1", accounts.list_image_account_candidates(), 1)
+    assert claim is not None
+    _complete_url_only_job(repository, claim)
+
+    manager = ImageWorkerManager(
+        repository,
+        accounts,
+        lambda completed_claim, token: None,
+        ImageQueueSettings(database_url="sqlite://"),
+        resource_controller=AlwaysAllowedResources(),
+    )
+
+    manager._reconcile_unaccounted_quotas()
+
+    assert len(accounts.results) == 1
+    assert accounts.results[0]["success"] is True
+    assert accounts.results[0]["quota_consumed"] is True
+    persisted = repository.get_job(claim.job.id)
+    assert persisted is not None and persisted.quota_accounted is True
     manager.stop(2)
 
 

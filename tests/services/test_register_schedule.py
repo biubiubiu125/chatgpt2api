@@ -14,10 +14,10 @@ from services.register_service import RegisterService
 @pytest.mark.parametrize(
     ("hour", "target", "threads", "name"),
     [
-        (18, 100, 4, "peak"),
-        (1, 100, 4, "peak"),
-        (2, 30, 2, "offpeak"),
-        (17, 30, 2, "offpeak"),
+        (9, 100, 4, "peak"),
+        (17, 100, 4, "peak"),
+        (18, 30, 2, "offpeak"),
+        (1, 30, 2, "offpeak"),
     ],
 )
 def test_registration_window_crosses_midnight(tmp_path, hour, target, threads, name) -> None:
@@ -132,3 +132,73 @@ def test_runtime_shutdown_preserves_enabled_registration_for_next_start(tmp_path
     assert service.get()["enabled"] is True
     restored = RegisterService(tmp_path / "register.json")
     assert restored.get()["enabled"] is True
+
+
+def test_registration_normalizes_enabled_disabled_words(tmp_path) -> None:
+    service = RegisterService(tmp_path / "register.json")
+
+    service.update({
+        "enabled": "enabled",
+        "auto_schedule_enabled": "disabled",
+        "proxy_required": "enabled",
+    })
+
+    snapshot = service.get()
+    assert snapshot["enabled"] is True
+    assert snapshot["auto_schedule_enabled"] is False
+    assert snapshot["proxy_required"] is True
+
+
+
+def test_registration_service_logs_core_result_when_recovery_file_unavailable(tmp_path, monkeypatch) -> None:
+    service = RegisterService(tmp_path / "register.json")
+
+    class AllowResources:
+        def sample(self):
+            return object()
+
+        def allow_new_registration(self, snapshot):
+            return ResourceDecision(True, "", 1)
+
+    service.set_resource_controller(AllowResources())
+
+    def submit(operation):
+        future = Future()
+        future.set_result({
+            "ok": False,
+            "core_ok": True,
+            "error": "注册核心已完成，后续处理失败: 后续验活失败: verify failed；核心结果暂存失败: disk full",
+            "result": {
+                "email": "raw-user@example.com",
+                "password": "",
+                "access_token": "at-token",
+                "refresh_token": "rt-token",
+                "id_token": "id-token",
+                "source_type": "web",
+            },
+        })
+        return future
+
+    service.set_registration_submitter(submit)
+    service.update({
+        "auto_schedule_enabled": False,
+        "mode": "total",
+        "total": 1,
+        "threads": 1,
+        "check_interval": 1,
+    })
+
+    service.start()
+    for _ in range(50):
+        snapshot = service.get()
+        if snapshot["stats"].get("done") == 1 and snapshot["state"] == "idle":
+            break
+        Event().wait(0.02)
+    service.shutdown(timeout=2)
+
+    logs = "\n".join(str(item.get("text") or "") for item in service.get().get("logs", []))
+    assert "注册核心结果未入库" in logs
+    assert "raw-user@example.com" in logs
+    assert "at-token" not in logs
+    assert "rt-token" not in logs
+    assert "id-token" not in logs

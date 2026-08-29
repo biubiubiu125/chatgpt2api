@@ -12,13 +12,14 @@ import pytest
 from PIL import Image
 
 from services.image_queue.database import ImageQueueUnavailableError
-from services.image_queue.repository import IdempotencyConflict
+from services.image_queue.repository import IdempotencyConflict, TaskStateConflict
 from services.image_queue.types import (
     ArtifactDescriptor,
     ArtifactStatus,
     ImageAccountCandidate,
     JobCheckpoint,
     JobStage,
+    TaskStatus,
 )
 from services.image_queue.recovery import ImageRecovery
 
@@ -475,6 +476,287 @@ def test_list_tasks_marks_success_result_delivery_attempted(image_task_service) 
     assert result["items"][0]["delivery_status"] == "response_attempted"
 
 
+def test_api_main_delete_invalidates_worker_artifact_for_worker_cleanup(
+    image_task_service,
+    monkeypatch,
+) -> None:
+    output = BytesIO()
+    Image.new("RGB", (12, 9), (80, 100, 120)).save(output, format="PNG")
+    task = image_task_service.submit_generation(
+        IDENTITY,
+        client_task_id="api-main-delete-worker-artifact",
+        prompt="cat",
+        model="gpt-image-2",
+    )
+    claim = image_task_service.repository.claim_next_job(
+        "worker-1",
+        [ImageAccountCandidate(
+            account_id=UUID("10000000-0000-0000-0000-000000000001"),
+            access_token="token",
+        )],
+        1,
+    )
+    assert claim is not None
+    artifact = image_task_service.artifact_service.persist_final(
+        claim.job.task_id,
+        claim.job.id,
+        output.getvalue(),
+        "https://worker.example.com/images",
+    )
+    image_task_service.repository.complete_job(
+        claim,
+        artifact,
+        {"url": artifact.public_url, "relative_path": artifact.relative_path},
+    )
+    monkeypatch.setattr(
+        "services.image_task_service.load_cluster_settings",
+        lambda: SimpleNamespace(is_api_main=True, is_worker=False, worker_id=""),
+    )
+    monkeypatch.setattr(
+        image_task_service.artifact_service,
+        "discard",
+        lambda _artifacts: (_ for _ in ()).throw(
+            AssertionError("api-main must not delete a worker-local artifact")
+        ),
+    )
+
+    assert image_task_service.delete_public_final_artifact(artifact.relative_path) is True
+    stored = next(
+        item
+        for item in image_task_service.repository.list_artifacts(UUID(task["task_id"]))
+        if item.relative_path == artifact.relative_path
+    )
+    assert stored.status == ArtifactStatus.INVALID
+    assert image_task_service.get_task(IDENTITY, task["task_id"])["data"] == []
+
+
+def test_delete_artifact_failure_keeps_invalid_cleanup_record(
+    image_task_service,
+    monkeypatch,
+) -> None:
+    output = BytesIO()
+    Image.new("RGB", (12, 9), (80, 100, 120)).save(output, format="PNG")
+    task = image_task_service.submit_generation(
+        IDENTITY,
+        client_task_id="delete-artifact-failure",
+        prompt="cat",
+        model="gpt-image-2",
+    )
+    claim = image_task_service.repository.claim_next_job(
+        "worker-1",
+        [ImageAccountCandidate(
+            account_id=UUID("10000000-0000-0000-0000-000000000001"),
+            access_token="token",
+        )],
+        1,
+    )
+    assert claim is not None
+    artifact = image_task_service.artifact_service.persist_final(
+        claim.job.task_id,
+        claim.job.id,
+        output.getvalue(),
+        "https://api.example",
+    )
+    image_task_service.repository.complete_job(
+        claim,
+        artifact,
+        {"url": artifact.public_url, "relative_path": artifact.relative_path},
+    )
+    monkeypatch.setattr(image_task_service.artifact_service, "discard", lambda _artifacts: False)
+
+    assert image_task_service.delete_public_final_artifact(artifact.relative_path) is False
+    stored = next(
+        item
+        for item in image_task_service.repository.list_artifacts(UUID(task["task_id"]))
+        if item.relative_path == artifact.relative_path
+    )
+    assert stored.status == ArtifactStatus.INVALID
+    assert image_task_service.get_task(IDENTITY, task["task_id"])["data"] == []
+
+
+def test_passive_reads_fail_url_only_task_when_delivery_probe_fails(image_task_service) -> None:
+    task = image_task_service.submit_generation(
+        IDENTITY,
+        client_task_id="url-only-passive-read",
+        prompt="cat",
+        model="gpt-image-2",
+    )
+    claim = image_task_service.repository.claim_next_job(
+        "worker-url-only",
+        [ImageAccountCandidate(account_id=UUID("10000000-0000-0000-0000-000000000001"), access_token="token")],
+        1,
+    )
+    assert claim is not None
+    image_base_url = "https://worker.example.com/images"
+    image_task_service.repository.update_worker_state(
+        "worker-url-only",
+        resource_snapshot={"image_base_url": image_base_url},
+        effective_concurrency=1,
+    )
+    relative_path = f"{claim.job.task_id}/{claim.job.id}/f/{'a' * 64}.png"
+    returned_url = f"{image_base_url}/{relative_path}"
+    artifact = ArtifactDescriptor(
+        task_id=claim.job.task_id,
+        job_id=claim.job.id,
+        kind="final",
+        status=ArtifactStatus.READY,
+        relative_path=relative_path,
+        sha256="a" * 64,
+        mime_type="image/png",
+        byte_size=0,
+        width=1024,
+        height=1024,
+        public_url=returned_url,
+    )
+    image_task_service.repository.complete_job(
+        claim,
+        artifact,
+        {
+            "url": returned_url,
+            "returned_url": returned_url,
+            "relative_path": relative_path,
+            "delivery_mode": "node_url",
+            "worker_id": "worker-url-only",
+            "image_base_url": image_base_url,
+        },
+    )
+
+    def fail_delivery_probe(_url: str, **_kwargs: object) -> None:
+        raise RuntimeError("temporary delivery outage")
+
+    image_task_service.returned_url_verifier = fail_delivery_probe
+
+    fetched = image_task_service.get_task(IDENTITY, task["task_id"])
+    listed = image_task_service.list_tasks(IDENTITY, [task["task_id"]])
+    persisted = image_task_service.repository.get_task("owner-1", task["task_id"])
+
+    assert fetched["status"] == "failed"
+    assert fetched["delivery_status"] == "pending"
+    assert listed["items"][0]["status"] == "failed"
+    assert listed["items"][0]["delivery_status"] == "pending"
+    assert persisted is not None and persisted.status == TaskStatus.FAILED
+    with pytest.raises(TaskStateConflict, match="only successful or partial completed image results can be acknowledged"):
+        image_task_service.acknowledge(IDENTITY, task["task_id"])
+
+
+def test_passive_reads_validate_non_url_only_remote_public_url_against_worker_base(image_task_service) -> None:
+    task = image_task_service.submit_generation(
+        IDENTITY,
+        client_task_id="webdav-passive-read",
+        prompt="cat",
+        model="gpt-image-2",
+    )
+    claim = image_task_service.repository.claim_next_job(
+        "worker-webdav",
+        [ImageAccountCandidate(account_id=UUID("10000000-0000-0000-0000-000000000001"), access_token="token")],
+        1,
+    )
+    assert claim is not None
+    image_base_url = "https://worker.example.com/images"
+    image_task_service.repository.update_worker_state(
+        "worker-webdav",
+        resource_snapshot={"image_base_url": image_base_url},
+        effective_concurrency=1,
+    )
+    relative_path = f"{claim.job.task_id}/{claim.job.id}/f/{'b' * 64}.png"
+    returned_url = f"{image_base_url}/{relative_path}"
+    artifact = ArtifactDescriptor(
+        task_id=claim.job.task_id,
+        job_id=claim.job.id,
+        kind="final",
+        status=ArtifactStatus.READY,
+        relative_path=relative_path,
+        sha256="b" * 64,
+        mime_type="image/png",
+        byte_size=0,
+        width=1024,
+        height=1024,
+        public_url=returned_url,
+        storage_backend="webdav",
+    )
+    image_task_service.repository.complete_job(
+        claim,
+        artifact,
+        {
+            "url": returned_url,
+            "relative_path": relative_path,
+            "worker_id": "worker-webdav",
+            "image_base_url": image_base_url,
+        },
+    )
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def capture_delivery_probe(url: str, **kwargs: object) -> None:
+        calls.append((url, dict(kwargs)))
+
+    image_task_service.returned_url_verifier = capture_delivery_probe
+
+    fetched = image_task_service.get_task(IDENTITY, task["task_id"])
+
+    assert fetched["status"] == "success"
+    assert fetched["delivery_status"] == "response_attempted"
+    assert calls and calls[0][0] == returned_url
+    assert calls[0][1]["allowed_base_url"] == image_base_url
+
+
+def test_passive_reads_accept_storage_public_url_when_worker_base_differs(image_task_service) -> None:
+    task = image_task_service.submit_generation(
+        IDENTITY,
+        client_task_id="cdn-passive-read",
+        prompt="cat",
+        model="gpt-image-2",
+    )
+    claim = image_task_service.repository.claim_next_job(
+        "worker-cdn",
+        [ImageAccountCandidate(account_id=UUID("10000000-0000-0000-0000-000000000001"), access_token="token")],
+        1,
+    )
+    assert claim is not None
+    worker_base_url = "https://worker.example.com/images"
+    storage_public_url = "https://cdn.example.com/images"
+    image_task_service.repository.update_worker_state(
+        "worker-cdn",
+        resource_snapshot={"image_base_url": worker_base_url},
+        effective_concurrency=1,
+    )
+    output = BytesIO()
+    Image.new("RGB", (1024, 1024), (7, 8, 9)).save(output, format="PNG")
+    artifact = image_task_service.artifact_service.persist_final(
+        claim.job.task_id,
+        claim.job.id,
+        output.getvalue(),
+        storage_public_url,
+    )
+    returned_url = artifact.public_url
+    artifact = replace(artifact, storage_backend="webdav")
+    image_task_service.repository.complete_job(
+        claim,
+        artifact,
+        {
+            "url": returned_url,
+            "returned_url": returned_url,
+            "relative_path": artifact.relative_path,
+            "worker_id": "worker-cdn",
+            "image_base_url": worker_base_url,
+        },
+    )
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def capture_delivery_probe(url: str, **kwargs: object) -> None:
+        calls.append((url, dict(kwargs)))
+
+    image_task_service.returned_url_verifier = capture_delivery_probe
+
+    fetched = image_task_service.get_task(IDENTITY, task["task_id"])
+
+    assert fetched["status"] == "success"
+    assert fetched["delivery_status"] == "response_attempted"
+    assert calls and calls[0][0] == returned_url
+    assert calls[0][1]["allowed_base_url"] == ""
+
+
 def test_claim_execution_uses_bounded_io_and_upscale_pools(image_task_service) -> None:
     output = BytesIO()
     Image.new("RGB", (12, 9), (80, 100, 120)).save(output, format="PNG")
@@ -827,6 +1109,48 @@ def test_recovery_uses_downloaded_artifact_without_remote_access(image_task_serv
     assert completed["status"] == "success"
     assert (completed["data"][0]["width"], completed["data"][0]["height"]) == (13, 8)
     assert {"downloaded", "upscaled", "final"}.issubset(kinds)
+
+
+def test_result_read_prefers_remote_copy_when_local_artifact_is_corrupt(image_task_service) -> None:
+    output = BytesIO()
+    Image.new("RGB", (13, 8), (4, 5, 6)).save(output, format="PNG")
+    task = image_task_service.submit_generation(
+        IDENTITY,
+        client_task_id="remote-result-read",
+        prompt="cat",
+        model="gpt-image-2",
+    )
+    candidate = ImageAccountCandidate(
+        account_id=__import__("uuid").UUID("10000000-0000-0000-0000-000000000001"),
+        access_token="token",
+    )
+    claim = image_task_service.repository.claim_next_job("worker-1", [candidate], 1)
+    assert claim is not None
+    artifact = image_task_service.artifact_service.persist_final(
+        claim.job.task_id,
+        claim.job.id,
+        output.getvalue(),
+        "https://images.example",
+    )
+    assert image_task_service.repository.record_artifact(claim, artifact) is True
+    assert artifact.absolute_path is not None
+    remote_payload = artifact.absolute_path.read_bytes()
+    artifact.absolute_path.write_bytes(b"corrupt-local-copy")
+
+    class RemoteStorage:
+        def get_artifact_bytes(self, relative_path: str) -> bytes:
+            return b"corrupt-local-copy"
+
+        def get_remote_bytes(self, relative_path: str) -> bytes:
+            return remote_payload
+
+    image_task_service.artifact_service.storage_service = RemoteStorage()
+
+    assert image_task_service.read_result_artifact(
+        IDENTITY,
+        task["task_id"],
+        artifact.relative_path,
+    ) == remote_payload
 
 
 def test_missing_ready_recovery_artifact_is_invalidated_before_remote_access(

@@ -108,6 +108,34 @@ def test_mismatched_idempotency_key_and_client_task_id_conflicts(
         repository.enqueue_task(mismatched)
 
 
+def test_ambiguous_non_uuid_identifier_raises_conflict(
+    repository: ImageQueueRepository,
+    generation_request: EnqueueRequest,
+) -> None:
+    repository.enqueue_task(replace(
+        generation_request,
+        idempotency_key="first-key",
+        client_task_id="shared-alias",
+    ))
+    second = repository.enqueue_task(replace(
+        generation_request,
+        idempotency_key="second-key",
+        client_task_id="second-client",
+        task_id=uuid4(),
+        request_hash="b" * 64,
+    ))
+    with repository.database.session() as session:
+        stored = session.get(ImageTask, second.task.id)
+        assert stored is not None
+        stored.idempotency_key = "shared-alias"
+
+    with pytest.raises(IdempotencyConflict):
+        repository.get_task(generation_request.owner_key, "shared-alias")
+
+    with pytest.raises(IdempotencyConflict):
+        repository.list_tasks(generation_request.owner_key, ["shared-alias"])
+
+
 def test_terminal_retention_preserves_never_delivered_success(
     repository: ImageQueueRepository,
     generation_request: EnqueueRequest,
@@ -169,6 +197,7 @@ def test_artifact_protection_matches_terminal_database_retention(
         artifact,
         {"url": artifact.public_url, "width": 64, "height": 32},
     )
+    assert repository.mark_quota_accounted(claim.job.id, account_candidates[0].account_id)
     repository.mark_response_attempted(generation_request.owner_key, task.id)
     repository.delivery_grace_seconds = 7 * 24 * 60 * 60
     repository.terminal_retention_seconds = 30 * 24 * 60 * 60
@@ -246,6 +275,73 @@ def test_response_attempt_cannot_regress_acknowledged_delivery(
 
     assert attempted is not None
     assert attempted.delivery_status.value == "acknowledged"
+
+
+def test_delete_public_final_artifact_removes_ready_success_artifact_index(
+    repository: ImageQueueRepository,
+    generation_request: EnqueueRequest,
+    account_candidates: list[ImageAccountCandidate],
+) -> None:
+    task = repository.enqueue_task(generation_request).task
+    claim = repository.claim_next_job("worker-1", account_candidates[:1], 1, FIXED_NOW)
+    assert claim is not None
+    artifact = _artifact(claim, "gallery-delete")
+    repository.complete_job(
+        claim,
+        artifact,
+        {"url": artifact.public_url, "width": 64, "height": 32},
+    )
+
+    descriptor = repository.public_final_artifact_descriptor(artifact.relative_path)
+    assert descriptor is not None
+    assert descriptor.relative_path == artifact.relative_path
+
+    assert repository.delete_public_final_artifact(artifact.relative_path) is True
+
+    assert repository.public_final_artifact_descriptor(artifact.relative_path) is None
+    assert repository.is_public_final_artifact(artifact.relative_path) is False
+    assert [
+        item.relative_path
+        for item in repository.list_artifacts(task.id)
+        if item.relative_path == artifact.relative_path
+    ] == []
+    refreshed = repository.get_task(generation_request.owner_key, task.id)
+    assert refreshed is not None
+    assert refreshed.data == []
+    with pytest.raises(TaskStateConflict, match="deliverable image result is no longer available"):
+        repository.acknowledge(generation_request.owner_key, task.id)
+
+
+def test_invalidate_public_final_artifact_keeps_cleanup_work_for_owner_worker(
+    repository: ImageQueueRepository,
+    generation_request: EnqueueRequest,
+    account_candidates: list[ImageAccountCandidate],
+) -> None:
+    task = repository.enqueue_task(generation_request).task
+    claim = repository.claim_next_job("worker-1", account_candidates[:1], 1, FIXED_NOW)
+    assert claim is not None
+    artifact = _artifact(claim, "cluster-delete")
+    repository.complete_job(
+        claim,
+        artifact,
+        {"url": artifact.public_url, "width": 64, "height": 32},
+    )
+
+    invalidated = repository.invalidate_public_final_artifact(artifact.relative_path)
+
+    assert invalidated is not None
+    assert invalidated.status == ArtifactStatus.INVALID
+    assert repository.is_public_final_artifact(artifact.relative_path) is False
+    assert [
+        item.relative_path
+        for item in repository.list_invalid_artifacts(worker_id="worker-1")
+    ] == [artifact.relative_path]
+    assert repository.list_invalid_artifacts(worker_id="worker-2") == []
+    refreshed = repository.get_task(generation_request.owner_key, task.id)
+    assert refreshed is not None
+    assert refreshed.data == []
+    with pytest.raises(TaskStateConflict, match="deliverable image result is no longer available"):
+        repository.acknowledge(generation_request.owner_key, task.id)
 
 
 def test_release_after_cancel_keeps_running_job_canceled(
@@ -706,6 +802,7 @@ def test_failed_multi_image_task_can_acknowledge_partial_artifact_delivery(
         successful_artifact,
         {"url": successful_artifact.public_url, "width": 64, "height": 32},
     )
+    assert repository.mark_quota_accounted(first.job.id, account_candidates[0].account_id)
     failed = repository.fail_job(
         second,
         error_code="no_image_generated",
@@ -735,6 +832,7 @@ def test_unacknowledged_standard_result_has_bounded_protection(
         artifact,
         {"url": artifact.public_url, "width": 64, "height": 32},
     )
+    assert repository.mark_quota_accounted(claim.job.id, account_candidates[0].account_id)
     repository.mark_response_attempted(generation_request.owner_key, task.id)
     with repository.database.session() as session:
         stored = session.get(ImageTask, task.id)

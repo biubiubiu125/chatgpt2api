@@ -119,6 +119,41 @@ def test_backup_uses_logical_database_export_not_legacy_json() -> None:
     assert exported["tasks"][0]["id"] == "task-1"
 
 
+def test_restore_backup_downloads_then_restores_and_cleans_up(tmp_path, monkeypatch) -> None:
+    backup = BackupService()
+    source = tmp_path / "backup.tar.gz"
+    source.write_bytes(b"payload")
+    cleaned = []
+    restored = []
+
+    monkeypatch.setattr(
+        backup,
+        "prepare_backup_download",
+        lambda key, passphrase="": {
+            "key": key,
+            "name": "backup.tar.gz",
+            "path": source,
+            "cleanup": lambda: cleaned.append(True),
+        },
+    )
+    monkeypatch.setattr(
+        backup,
+        "restore_archive_file",
+        lambda path, artifact_root=None: restored.append((path, artifact_root)) or {
+            "restored_images": 1,
+            "image_queue": {"tasks": 2},
+        },
+    )
+
+    result = backup.restore_backup("backups/backup.tar.gz.enc", passphrase="secret")
+
+    assert restored and restored[0][0] == source
+    assert cleaned == [True]
+    assert result["encrypted"] is True
+    assert result["restored_images"] == 1
+    assert result["image_queue"] == {"tasks": 2}
+
+
 def test_backup_defaults_include_durable_image_artifacts(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("services.config.DATA_DIR", tmp_path)
     store = ConfigStore(tmp_path / "config.json")
@@ -147,6 +182,21 @@ def test_backup_archive_restores_queue_payload_and_image_files(tmp_path) -> None
     assert restored_payloads == [queue_payload]
     assert (tmp_path / "images" / "task-1" / "job-1" / "image.png").read_bytes() == image_payload
     assert result["restored_images"] == 1
+
+
+def test_backup_detail_rejects_archive_without_chatgpt2api_metadata(tmp_path) -> None:
+    buffer = BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        payload = b"not a chatgpt2api backup"
+        info = tarfile.TarInfo("data/anything.txt")
+        info.size = len(payload)
+        archive.addfile(info, BytesIO(payload))
+
+    source = tmp_path / "backup.tar.gz"
+    source.write_bytes(buffer.getvalue())
+
+    with pytest.raises(BackupError, match="metadata"):
+        BackupService()._decode_archive_detail_file(source)
 
 
 def test_backup_restore_rolls_back_image_files_when_queue_restore_fails(tmp_path) -> None:
@@ -182,6 +232,46 @@ def test_backup_restore_rolls_back_image_files_when_queue_restore_fails(tmp_path
         backup.restore_archive_payload(buffer.getvalue(), artifact_root=root)
 
     assert not (root / relative_path).exists()
+
+
+def test_backup_restore_rejects_oversized_local_file_before_reading(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "oversized.tar.gz"
+    source.write_bytes(b"12345")
+    monkeypatch.setattr(
+        "services.backup_service.BACKUP_MAX_DOWNLOAD_BYTES",
+        4,
+    )
+
+    with pytest.raises(BackupError, match="maximum download size"):
+        BackupService().restore_archive_file(source)
+
+
+def test_backup_restore_rejects_unsupported_tar_member_type(tmp_path) -> None:
+    buffer = BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        queue_bytes = json.dumps({
+            "version": 2,
+            "tasks": [],
+            "jobs": [],
+            "events": [],
+            "artifacts": [],
+        }).encode("utf-8")
+        queue_info = tarfile.TarInfo("data/image-queue.json")
+        queue_info.size = len(queue_bytes)
+        archive.addfile(queue_info, BytesIO(queue_bytes))
+        link = tarfile.TarInfo("data/untrusted-link")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/etc/passwd"
+        archive.addfile(link)
+
+    with pytest.raises(BackupError, match="unsupported member type"):
+        BackupService().restore_archive_payload(
+            buffer.getvalue(),
+            artifact_root=tmp_path / "images",
+        )
 
 
 def test_backup_uses_configured_queue_artifact_root(tmp_path) -> None:
@@ -547,6 +637,10 @@ def test_repository_backup_and_retention_protect_unacknowledged_result(image_tas
         claim,
         artifact,
         {"url": artifact.public_url, "relative_path": artifact.relative_path, "width": 5, "height": 4},
+    )
+    assert image_task_service.repository.mark_quota_accounted(
+        claim.job.id,
+        candidate.account_id,
     )
 
     backup = image_task_service.repository.logical_backup()

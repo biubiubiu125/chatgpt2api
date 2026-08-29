@@ -180,7 +180,10 @@ def test_postgres_streaming_backup_uses_one_repeatable_snapshot(postgres_databas
 
     def pause_before_jobs(_connection, _cursor, statement, _parameters, _context, _executemany):
         normalized = " ".join(str(statement).lower().split())
-        if current_thread().name.startswith("queue-stream") and "from image_jobs" in normalized:
+        if (
+            current_thread().name.startswith("queue-stream")
+            and normalized.startswith("select image_jobs.id, image_jobs.task_id")
+        ):
             jobs_select_reached.set()
             assert continue_backup.wait(5)
 
