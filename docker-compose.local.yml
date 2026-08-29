@@ -147,11 +147,11 @@ services:
       timeout: 6s
       retries: 5
       start_period: 30s
-    # 存储后端配置 (可选值: json, sqlite, postgres, git)
+    # 本地试跑配置固定使用 SQLite；生产/一键安装请使用标准 Compose 的 PostgreSQL 配置。
     # environment:
-    #   STORAGE_BACKEND: json
+    #   STORAGE_BACKEND: sqlite
 
-    # 数据库配置 (当 STORAGE_BACKEND=sqlite/postgres 时使用)
+    # 数据库配置（本地试跑固定使用 SQLite）
     #   DATABASE_URL: postgresql://user:password@host:5432/dbname
     #   DATABASE_URL: sqlite:////app/data/accounts.db
 

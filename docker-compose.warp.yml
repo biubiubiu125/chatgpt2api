@@ -22,7 +22,7 @@ services:
       - ./scripts/bootstrap_database_roles.py:/app/scripts/bootstrap_database_roles.py:ro
       - ./scripts/env_loader.py:/app/scripts/env_loader.py:ro
     environment:
-      STORAGE_BACKEND: ${STORAGE_BACKEND:-json}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-postgres}
       APP_DATABASE_URL: ${APP_DATABASE_URL:-}
       DATABASE_URL: ${DATABASE_URL:-}
       IMAGE_QUEUE_DATABASE_URL: "${IMAGE_QUEUE_DATABASE_URL:?IMAGE_QUEUE_DATABASE_URL is required for durable image APIs}"
@@ -143,7 +143,7 @@ services:
       CHATGPT2API_WORKER_ID: ${CHATGPT2API_WORKER_ID:-}
       CHATGPT2API_WIREGUARD_IP: ${CHATGPT2API_WIREGUARD_IP:-}
       CHATGPT2API_IMAGE_BASE_URL: ${CHATGPT2API_IMAGE_BASE_URL:-}
-      STORAGE_BACKEND: ${STORAGE_BACKEND:-json}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-postgres}
       APP_DATABASE_URL: ${APP_DATABASE_URL:-}
       DATABASE_URL: ${DATABASE_URL:-}
       IMAGE_QUEUE_DATABASE_URL: "${IMAGE_QUEUE_DATABASE_URL:?IMAGE_QUEUE_DATABASE_URL is required for durable image APIs}"

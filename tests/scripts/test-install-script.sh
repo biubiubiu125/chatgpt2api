@@ -762,9 +762,9 @@ grep -Fq 'test: ["CMD", "/healthcheck/index.sh"]' "${ROOT_DIR}/docker-compose.wa
 if grep -Fq 'python3 -c' "${ROOT_DIR}/docker-compose.warp.yml"; then
   fail 'WARP healthcheck depends on an unbundled Python runtime'
 fi
-grep -q 'STORAGE_BACKEND: ${STORAGE_BACKEND:-postgres}' "${ROOT_DIR}/docker-compose.yml" \
+grep -Fq 'STORAGE_BACKEND: ${STORAGE_BACKEND:-postgres}' "${ROOT_DIR}/docker-compose.yml" \
   || fail 'standard database bootstrap does not receive STORAGE_BACKEND'
-grep -q 'STORAGE_BACKEND: ${STORAGE_BACKEND:-postgres}' "${ROOT_DIR}/docker-compose.warp.yml" \
+grep -Fq 'STORAGE_BACKEND: ${STORAGE_BACKEND:-postgres}' "${ROOT_DIR}/docker-compose.warp.yml" \
   || fail 'WARP database bootstrap does not receive STORAGE_BACKEND'
 
 INSTALL_DIR="${TMP_DIR}/optional-download"
@@ -1243,7 +1243,7 @@ test_install_summary_contains_credentials() {
 
 assert_command_passes 'install summary contains credentials' test_install_summary_contains_credentials
 
-grep -q 'STORAGE_BACKEND="${STORAGE_BACKEND:-postgres}"' "${INSTALL_SCRIPT}" \
+grep -Fq 'STORAGE_BACKEND="${STORAGE_BACKEND:-postgres}"' "${INSTALL_SCRIPT}" \
   || fail 'installer default storage backend is not PostgreSQL'
 grep -q 'prompt_install_target' "${INSTALL_SCRIPT}" \
   || fail 'interactive installer has no deployment target prompt'
