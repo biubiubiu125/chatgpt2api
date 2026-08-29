@@ -414,6 +414,7 @@ prompt_input() {
   local label="$1"
   local default="${2-}"
   local answer=""
+  local used_default="0"
 
   if is_noninteractive; then
     printf '%s' "${default}"
@@ -429,6 +430,12 @@ prompt_input() {
   IFS= read -r answer <"${UI_IN}" || true
   if [[ -z "${answer}" ]]; then
     answer="${default}"
+    used_default="1"
+  fi
+  if [[ "${used_default}" == "1" && -n "${default}" ]]; then
+    ui_println "${label}: ${answer}（默认）"
+  else
+    ui_println "${label}: ${answer}"
   fi
   printf '%s' "${answer}"
 }
@@ -746,6 +753,7 @@ print_install_summary() {
   printf '\n[%s] %s\n' "$(text prefix_done)" "$(text done_ready)"
   printf '%s: %s\n' "$(text summary_target)" "$(install_target_label)"
   printf '%s: %s\n' "$(text summary_url)" "${public_url}"
+  printf '%s: %s\n' "$(text prompt_thread_tokens)" "${THREAD_TOKENS}"
   if [[ "${NODE_ROLE:-standalone}" == "api-main" ]]; then
     printf '运行状态: API 存活；Worker 运行态需加入 Worker 后验证\n'
   fi
@@ -1856,6 +1864,31 @@ ensure_uv() {
   "${bootstrap_venv}/bin/python" -m pip install --disable-pip-version-check --no-input "uv==${UV_VERSION}"
   UV_BIN="${bootstrap_venv}/bin/uv"
   [[ -x "${UV_BIN}" ]] || { echo "[$(text prefix_error)] uv bootstrap failed." >&2; exit 1; }
+}
+
+preflight_install_environment() {
+  case "${MODE}" in
+    docker)
+      need_cmd docker
+      if ! docker compose version >/dev/null 2>&1; then
+        echo "[$(text prefix_error)] $(text err_compose)" >&2
+        return 1
+      fi
+      if ! docker info >/dev/null 2>&1; then
+        echo "[$(text prefix_error)] Docker daemon is unavailable." >&2
+        return 1
+      fi
+      need_cmd curl
+      ;;
+    python)
+      if ! ensure_python_version; then
+        return 1
+      fi
+      need_cmd git
+      need_cmd curl
+      need_cmd npm
+      ;;
+  esac
 }
 
 prepare_docker_data_permissions() {
@@ -5015,6 +5048,8 @@ main() {
       fi
     fi
   fi
+
+  preflight_install_environment
 
   if [[ "${MODE}" == "docker" && "${RELEASE_REF_SELECTED}" == "1" ]]; then
     load_release_manifest

@@ -429,6 +429,50 @@ class ResourceController:
         self._recovering = True
         return ResourceDecision(False, reason, 0)
 
+    def recommend_thread_tokens(
+        self,
+        snapshot: ResourceSnapshot,
+        *,
+        ceiling: int,
+        current_tokens: int,
+    ) -> int:
+        with self._lock:
+            if snapshot.cpu_percent >= self.settings.cpu_pause_percent:
+                self._cpu_paused = True
+            elif self._cpu_paused and snapshot.cpu_percent < self.settings.cpu_resume_percent:
+                self._cpu_paused = False
+
+            ceiling = max(1, int(ceiling))
+            current_tokens = max(1, int(current_tokens))
+            safe_cap = max(
+                1,
+                min(
+                    ceiling,
+                    self.settings.absolute_guard,
+                    max(1, self.settings.absolute_guard - int(snapshot.thread_count)),
+                ),
+            )
+            if (
+                self._cpu_paused
+                or self._swap_pressure(snapshot)
+                or self._disk_pressure(snapshot)
+                or self._memory_pressure(snapshot)
+                or snapshot.database_pool_percent >= 95.0
+                or snapshot.file_handle_count >= self.FILE_HANDLE_GUARD
+                or self.upstream_error_rate() >= self.UPSTREAM_ERROR_RATE_THRESHOLD
+                or self._memory_used_percent(snapshot) >= self.settings.memory_pause_percent
+            ):
+                return max(1, min(safe_cap, max(1, current_tokens // 2)))
+            if (
+                snapshot.cpu_percent >= self.settings.cpu_throttle_percent
+                or self._memory_used_percent(snapshot) >= self.settings.memory_throttle_percent
+                or snapshot.database_pool_percent >= 85.0
+            ):
+                return max(1, min(safe_cap, max(1, current_tokens - max(1, current_tokens // 4))))
+            if current_tokens < safe_cap:
+                return min(safe_cap, current_tokens + 1)
+            return safe_cap
+
     def allow_new_submission(self, snapshot: ResourceSnapshot) -> ResourceDecision:
         if snapshot.disk_free_bytes < 5 * 1024**3 or snapshot.disk_free_percent < 5.0:
             return ResourceDecision(False, "resource_disk", 0)

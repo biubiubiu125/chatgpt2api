@@ -141,6 +141,20 @@ def test_adaptive_limit_uses_memory_budget_and_aimd() -> None:
     assert recovered.allowed is True and recovered.effective_limit == 2
 
 
+def test_recommend_thread_tokens_shrinks_under_pressure() -> None:
+    controller = ResourceController(ImageQueueSettings(database_url="postgresql://test"))
+    pressured = snapshot(cpu_percent=96, available_memory_bytes=256 * 1024**2, memory_limit_bytes=16 * 1024**3)
+
+    assert controller.recommend_thread_tokens(pressured, ceiling=80, current_tokens=80) == 40
+
+
+def test_recommend_thread_tokens_recovers_by_one_when_healthy() -> None:
+    controller = ResourceController(ImageQueueSettings(database_url="postgresql://test"))
+    healthy = snapshot(cpu_percent=20, available_memory_bytes=8 * 1024**3, memory_limit_bytes=16 * 1024**3)
+
+    assert controller.recommend_thread_tokens(healthy, ceiling=80, current_tokens=40) == 41
+
+
 def test_registration_pressure_check_does_not_mutate_generation_limit() -> None:
     controller = ResourceController(ImageQueueSettings(database_url="postgresql://test"))
     controller._adaptive_limit = 7

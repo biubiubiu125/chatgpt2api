@@ -950,6 +950,71 @@ prompt_value="$(prompt_input 'noninteractive prompt' 'default-value')"
 confirm 'noninteractive confirmation' 'Y' || fail 'noninteractive affirmative confirmation did not use its default'
 [[ ! -s "${UI_OUT}" ]] || fail 'noninteractive confirmation wrote interactive output'
 
+test_interactive_prompt_echoes_default() {
+  INSTALL_LANG='zh'
+  NONINTERACTIVE='0'
+  printf '\n' >"${UI_IN}"
+  : >"${UI_OUT}"
+  local prompt_value=''
+  prompt_value="$(prompt_input "$(text prompt_thread_tokens)" '80')"
+  [[ "${prompt_value}" == '80' ]] || fail 'interactive prompt did not return its default'
+  [[ "$(cat "${UI_OUT}")" == '后端线程池容量: 80（默认）' ]] \
+    || fail 'interactive prompt did not echo the accepted default'
+}
+assert_command_passes 'interactive prompt echoes default' test_interactive_prompt_echoes_default
+
+test_docker_preflight_requires_daemon() {
+  MODE='docker'
+  local fake_docker_dir="${TMP_DIR}/fake-docker"
+  mkdir -p "${fake_docker_dir}"
+  cat >"${fake_docker_dir}/docker" <<'EOF'
+#!/bin/sh
+case "${1:-} ${2:-}" in
+  "compose version")
+    exit 0
+    ;;
+esac
+case "${1:-}" in
+  info)
+    exit 1
+    ;;
+esac
+exit 0
+EOF
+  chmod +x "${fake_docker_dir}/docker"
+  PATH="${fake_docker_dir}"
+  preflight_install_environment
+}
+assert_command_fails 'docker daemon preflight' test_docker_preflight_requires_daemon
+
+test_python_preflight_requires_npm() {
+  MODE='python'
+  PYTHON_BIN='python3'
+  local fake_tool_dir="${TMP_DIR}/fake-python-preflight"
+  mkdir -p "${fake_tool_dir}"
+  cat >"${fake_tool_dir}/python3" <<'EOF'
+#!/bin/sh
+case "${1:-}" in
+  -c)
+    exit 0
+    ;;
+esac
+exit 0
+EOF
+  cat >"${fake_tool_dir}/git" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  cat >"${fake_tool_dir}/curl" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "${fake_tool_dir}/python3" "${fake_tool_dir}/git" "${fake_tool_dir}/curl"
+  PATH="${fake_tool_dir}"
+  preflight_install_environment
+}
+assert_command_fails 'python preflight npm check' test_python_preflight_requires_npm
+
 test_cli_install_target_precedence() {
   INSTALL_TARGET='api-main'
   NODE_ROLE='standalone'
@@ -1225,7 +1290,9 @@ assert_command_fails 'manual administrator auth key is required' test_manual_aut
 test_install_summary_contains_credentials() {
   INSTALL_TARGET='standalone'
   NODE_ROLE='standalone'
+  INSTALL_LANG='zh'
   PORT='3000'
+  THREAD_TOKENS='80'
   AUTH_KEY='manual-admin-key'
   DATABASE_URL='postgresql://user:password@db/chatgpt2api_app'
   APP_DATABASE_URL="${DATABASE_URL}"
@@ -1235,6 +1302,7 @@ test_install_summary_contains_credentials() {
   local output=''
   output="$(print_install_summary)"
   [[ "${output}" == *'manual-admin-key'* ]] || fail 'install summary omitted administrator auth key'
+  [[ "${output}" == *'后端线程池容量: 80'* ]] || fail 'install summary omitted thread tokens'
   [[ "${output}" == *'postgresql://user:password@db/chatgpt2api_app'* ]] \
     || fail 'install summary omitted PostgreSQL DATABASE_URL'
   [[ "${output}" == *'postgresql://user:password@db/chatgpt2api_image_queue'* ]] \

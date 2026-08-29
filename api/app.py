@@ -31,6 +31,7 @@ from services.image_task_service import image_task_service
 from services.log_service import cleanup_old_logs, start_log_cleanup_scheduler
 from services.register_service import register_service
 from services.realtime_monitor_service import realtime_monitor_service
+from services.threadpool_governor import ThreadPoolGovernor
 from utils.log import logger
 
 
@@ -61,13 +62,17 @@ def _env_float(
     return value
 
 
-def _configure_threadpool() -> None:
+def _resolve_threadpool_ceiling() -> int:
     runtime = config.get_runtime_capacity_settings()
-    tokens = _env_int(
+    return _env_int(
         "CHATGPT2API_THREAD_TOKENS",
         int(runtime.get("text_concurrency_limit") or 80),
         1,
     )
+
+
+def _configure_threadpool() -> int:
+    tokens = _resolve_threadpool_ceiling()
     limiter = current_default_thread_limiter()
     previous = int(getattr(limiter, "total_tokens", 0) or 0)
     if previous != tokens:
@@ -78,9 +83,34 @@ def _configure_threadpool() -> None:
         "previous_tokens": previous,
         "tokens": tokens,
     })
+    return tokens
 
 
-def _configure_image_queue_integrations(cluster_settings=None) -> None:
+def _build_threadpool_governor(
+    *,
+    resource_controller,
+    limiter,
+    ceiling: int,
+) -> ThreadPoolGovernor:
+    def on_update(*, previous_tokens: int, tokens: int, snapshot, ceiling: int) -> None:
+        realtime_monitor_service.set_threadpool(tokens=tokens, previous_tokens=previous_tokens)
+        logger.info({
+            "event": "runtime_threadpool_adjusted",
+            "previous_tokens": previous_tokens,
+            "tokens": tokens,
+            "ceiling": ceiling,
+            "cpu_percent": getattr(snapshot, "cpu_percent", None),
+        })
+
+    return ThreadPoolGovernor(
+        resource_controller=resource_controller,
+        limiter=limiter,
+        ceiling=ceiling,
+        on_update=on_update,
+    )
+
+
+def _configure_image_queue_integrations(cluster_settings=None, *, on_resource_controller=None) -> None:
     repository = getattr(image_task_service, "repository", None)
     if repository is not None:
         realtime_monitor_service.set_image_queue_provider(repository.queue_snapshot)
@@ -95,6 +125,8 @@ def _configure_image_queue_integrations(cluster_settings=None) -> None:
     resource_controller = getattr(worker, "resource_controller", None) if worker is not None else None
     register_service.set_resource_controller(resource_controller)
     editable_file_task_service.set_resource_controller(resource_controller)
+    if on_resource_controller is not None:
+        on_resource_controller(resource_controller)
     register_service.set_registration_submitter(
         getattr(worker, "submit_registration", None) if worker is not None else None
     )
@@ -152,15 +184,35 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        _configure_threadpool()
+        threadpool_ceiling = _configure_threadpool() or _resolve_threadpool_ceiling()
+        thread_limiter = current_default_thread_limiter()
         stop_event = Event()
         retry_thread: Thread | None = None
         register_scheduler_thread: Thread | None = None
         account_watcher_thread: Thread | None = None
         image_cleanup_thread: Thread | None = None
         log_cleanup_thread: Thread | None = None
+        threadpool_governor: ThreadPoolGovernor | None = None
         run_main_services = not cluster_settings.is_worker
         queue_started = False
+
+        def start_threadpool_governor(resource_controller) -> None:
+            nonlocal threadpool_governor
+            if resource_controller is None or threadpool_governor is not None:
+                return
+            try:
+                threadpool_governor = _build_threadpool_governor(
+                    resource_controller=resource_controller,
+                    limiter=thread_limiter,
+                    ceiling=threadpool_ceiling,
+                )
+                threadpool_governor.start()
+            except Exception as exc:
+                logger.error({
+                    "event": "runtime_threadpool_governor_start_failed",
+                    "error": str(exc),
+                })
+                threadpool_governor = None
 
         def start_register_scheduler_once() -> None:
             nonlocal register_scheduler_thread
@@ -186,7 +238,10 @@ def create_app() -> FastAPI:
             if worker_queue_ready:
                 image_task_service.start()
                 queue_started = True
-                _configure_image_queue_integrations(cluster_settings)
+                _configure_image_queue_integrations(
+                    cluster_settings,
+                    on_resource_controller=start_threadpool_governor,
+                )
                 logger.info({
                     "event": "image_queue_integrations_ready",
                     "note": (
@@ -243,6 +298,8 @@ def create_app() -> FastAPI:
             ):
                 if thread is not None:
                     thread.join(timeout=1)
+            if threadpool_governor is not None:
+                threadpool_governor.stop(timeout=5)
             if run_main_services:
                 try:
                     dashboard_metrics_service.flush()

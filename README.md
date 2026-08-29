@@ -671,7 +671,7 @@ register_offpeak:
 | `CHATGPT2API_PRIVOXY_IMAGE` | `vimagick/privoxy@sha256:8db03d3e5a36800e2c7e32f17b47e21e18f476bf492f0a50e2fc43073f6bb21f` | WARP 代理镜像；启用 WARP 时默认使用固定 digest。 |
 | `CHATGPT2API_FLARESOLVERR_IMAGE` | `flaresolverr/flaresolverr@sha256:139dfee1c6f89249c8d665d1333a42e8ec74ec0a86bc6bb1c8461e10d3a66a47` | WARP 运行时的 Cloudflare 清障服务镜像。 |
 | `CHATGPT2API_BASE_URL` | 无 | standalone 对外 API/图片基础地址；公网部署必须显式设置，避免信任任意请求 `Host`。 |
-| `CHATGPT2API_THREAD_TOKENS` | `80` | AnyIO 后端线程池容量。 |
+| `CHATGPT2API_THREAD_TOKENS` | `80` | AnyIO 后端线程池容量上限 / 初始值；运行时会跟随资源控制器自动联动。 |
 | `STORAGE_BACKEND` | `postgres` | 新安装的账号池和认证密钥存储后端；旧部署可显式保留其他值。 |
 | `DATABASE_URL` | 无 | PostgreSQL 账号库地址，必须指向 `chatgpt2api_app`；集群主从由 `APP_DATABASE_URL` 承担应用库。 |
 | `APP_DATABASE_URL` | 无 | 集群应用库，必须指向 `chatgpt2api_app`。 |

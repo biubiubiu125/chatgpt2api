@@ -488,6 +488,68 @@ def test_application_lifespan_reconnects_image_queue_after_database_recovers(mon
     assert "backup" in configured
 
 
+def test_application_lifespan_starts_resource_linked_threadpool_governor(monkeypatch) -> None:
+    order: list[str] = []
+    captured: dict[str, object] = {}
+
+    class JoinedThread:
+        def join(self, timeout=None):
+            order.append("governor_stop")
+            return None
+
+    class FakeGovernor:
+        def start(self):
+            order.append("governor_start")
+            return None
+
+        def stop(self, timeout=None):
+            return JoinedThread().join(timeout=timeout)
+
+    class FakeController:
+        def sample(self):
+            return SimpleNamespace()
+
+        def recommend_thread_tokens(self, snapshot, *, ceiling, current_tokens):
+            return 40
+
+    monkeypatch.setattr(app_module, "_configure_threadpool", lambda: None)
+    monkeypatch.setattr(app_module, "_build_threadpool_governor", lambda **kwargs: captured.update(kwargs) or FakeGovernor())
+    monkeypatch.setattr(app_module.account_service, "cleanup_auto_remove_accounts", lambda: None)
+    monkeypatch.setattr(app_module, "start_limited_account_watcher", lambda event: JoinedThread())
+    monkeypatch.setattr(app_module, "start_image_cleanup_scheduler", lambda event: JoinedThread())
+    monkeypatch.setattr(app_module, "start_log_cleanup_scheduler", lambda event: JoinedThread())
+    monkeypatch.setattr(app_module.backup_service, "start", lambda: None)
+    monkeypatch.setattr(app_module.backup_service, "stop", lambda: None)
+    monkeypatch.setattr(app_module.config, "cleanup_old_images", lambda: None)
+    monkeypatch.setattr(app_module, "cleanup_old_logs", lambda: None)
+    monkeypatch.setattr(app_module.dashboard_metrics_service, "flush", lambda: None)
+    monkeypatch.setattr(
+        app_module,
+        "image_task_service",
+        SimpleNamespace(
+            start=lambda: None,
+            stop=lambda timeout=None: None,
+            repository=SimpleNamespace(
+                queue_snapshot=lambda: {},
+                logical_backup=lambda: {},
+                restore_logical_backup=lambda payload: {},
+                protected_artifact_paths=lambda: set(),
+            ),
+            artifact_service=SimpleNamespace(root=None),
+            worker=SimpleNamespace(resource_controller=FakeController(), submit_registration=lambda callback: None),
+        ),
+        raising=False,
+    )
+
+    with TestClient(app_module.create_app()):
+        assert order[0] == "governor_start"
+
+    assert captured["ceiling"] == 80
+    assert "resource_controller" in captured
+    assert "limiter" in captured
+    assert "governor_stop" in order
+
+
 def test_image_queue_unavailable_returns_503(monkeypatch) -> None:
     from fastapi import FastAPI
     from services.image_queue.database import ImageQueueUnavailableError
