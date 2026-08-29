@@ -435,6 +435,7 @@ def test_application_lifespan_reconnects_image_queue_after_database_recovers(mon
 
     attempts = 0
     reconnected = Event()
+    governor_started = Event()
     configured = []
 
     class JoinedThread:
@@ -456,6 +457,13 @@ def test_application_lifespan_reconnects_image_queue_after_database_recovers(mon
             raise ImageQueueUnavailableError("postgres is unavailable")
         reconnected.set()
 
+    class FakeGovernor:
+        def start(self):
+            governor_started.set()
+
+        def stop(self, timeout=None):
+            return None
+
     queue = SimpleNamespace(
         start=start_queue,
         stop=lambda timeout=None: None,
@@ -476,6 +484,7 @@ def test_application_lifespan_reconnects_image_queue_after_database_recovers(mon
         "set_image_queue_provider",
         lambda value: configured.append("backup"),
     )
+    monkeypatch.setattr(app_module, "_build_threadpool_governor", lambda **kwargs: FakeGovernor())
     monkeypatch.setattr(app_module.config, "cleanup_old_images", lambda: None)
     monkeypatch.setattr(app_module, "cleanup_old_logs", lambda: None)
     monkeypatch.setattr(app_module.dashboard_metrics_service, "flush", lambda: None)
@@ -483,6 +492,7 @@ def test_application_lifespan_reconnects_image_queue_after_database_recovers(mon
 
     with TestClient(app_module.create_app()):
         assert reconnected.wait(2)
+        assert governor_started.wait(2)
 
     assert attempts >= 2
     assert "backup" in configured

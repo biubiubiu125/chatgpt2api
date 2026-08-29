@@ -139,6 +139,7 @@ def _start_image_queue_retry(
     cluster_settings=None,
     *,
     on_recovered=None,
+    on_resource_controller=None,
 ) -> Thread:
     retry_seconds = _env_float("IMAGE_QUEUE_STARTUP_RETRY_SECONDS", 5.0, 0.05, 300.0)
     resolved_cluster_settings = cluster_settings or load_cluster_settings()
@@ -156,7 +157,10 @@ def _start_image_queue_retry(
                         })
                         continue
                 image_task_service.start()
-                _configure_image_queue_integrations(resolved_cluster_settings)
+                _configure_image_queue_integrations(
+                    resolved_cluster_settings,
+                    on_resource_controller=on_resource_controller,
+                )
                 if on_recovered is not None:
                     on_recovered()
             except (
@@ -254,6 +258,7 @@ def create_app() -> FastAPI:
                     stop_event,
                     cluster_settings,
                     on_recovered=start_register_scheduler_once,
+                    on_resource_controller=start_threadpool_governor,
                 )
         except (ImageQueueUnavailableError, ImageQueueConfigurationError, SQLAlchemyError) as exc:
             logger.error({
@@ -265,6 +270,7 @@ def create_app() -> FastAPI:
                 stop_event,
                 cluster_settings,
                 on_recovered=start_register_scheduler_once,
+                on_resource_controller=start_threadpool_governor,
             )
         if run_main_services:
             account_service.cleanup_auto_remove_accounts()
