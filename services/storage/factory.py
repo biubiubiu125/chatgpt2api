@@ -20,14 +20,18 @@ def create_storage_backend(data_dir: Path) -> StorageBackend:
     根据环境变量创建存储后端
     
     环境变量：
-    - STORAGE_BACKEND: json|sqlite|postgres|git (默认 json)
+    - STORAGE_BACKEND: json|sqlite|postgres|git (默认 postgres)
     - DATABASE_URL: 数据库连接字符串 (用于 sqlite/postgres)
     - GIT_REPO_URL: Git 仓库地址 (用于 git)
     - GIT_TOKEN: Git 访问令牌 (用于 git)
     - GIT_BRANCH: Git 分支 (默认 main)
     - GIT_FILE_PATH: Git 仓库中的文件路径 (默认 accounts.json)
     """
-    backend_type = os.getenv("STORAGE_BACKEND", "json").lower().strip()
+    backend_type = os.getenv("STORAGE_BACKEND", "").lower().strip() or "postgres"
+    database_url_env = os.getenv("DATABASE_URL", "").strip()
+    app_database_url = os.getenv("APP_DATABASE_URL", "").strip()
+    if backend_type in {"postgres", "postgresql", "mysql", "database"} and not app_database_url and is_sqlite_database_url(database_url_env):
+        backend_type = "sqlite"
     
     print(f"[storage] Initializing storage backend: {backend_type}")
     
@@ -42,20 +46,20 @@ def create_storage_backend(data_dir: Path) -> StorageBackend:
         # 数据库存储
         if backend_type in {"postgres", "postgresql"}:
             database_url = select_named_postgres_database(
-                dedicated_url=os.getenv("APP_DATABASE_URL"),
-                fallback_url=os.getenv("DATABASE_URL"),
+                dedicated_url=app_database_url,
+                fallback_url=database_url_env,
                 expected_name=APP_DATABASE_NAME,
                 role="app",
             )
-        elif backend_type == "database" and os.getenv("APP_DATABASE_URL", "").strip():
+        elif backend_type == "database" and app_database_url:
             database_url = select_named_postgres_database(
-                dedicated_url=os.getenv("APP_DATABASE_URL"),
+                dedicated_url=app_database_url,
                 fallback_url="",
                 expected_name=APP_DATABASE_NAME,
                 role="app",
             )
         else:
-            database_url = os.getenv("DATABASE_URL", "").strip()
+            database_url = database_url_env
             if database_url.lower().startswith(("postgres://", "postgresql://", "postgresql+")):
                 database_url = select_named_postgres_database(
                     dedicated_url=database_url,

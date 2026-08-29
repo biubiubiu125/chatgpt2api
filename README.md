@@ -121,7 +121,7 @@ flowchart TB
 | 主从集群脚本 | API 主节点与图片 Worker 分机部署 | 否 | 主节点 `3000` |
 | 源码运行 | 二次开发、调试和前端开发 | 是 | 按 `PORT` 设置 |
 
-所有标准 Docker 方式都要求提供可连接且允许应用用户建表的 PostgreSQL 图片队列。账号存储使用 `json` 时，账号数据可以继续保存在 `data/`，但 `IMAGE_QUEUE_DATABASE_URL` 仍不能省略。
+所有标准 Docker 方式都要求提供可连接且允许应用用户建表的 PostgreSQL 图片队列；新安装的账号存储也统一使用 PostgreSQL。已有 `json`、SQLite 或 Git 部署可继续保留原配置，但 `IMAGE_QUEUE_DATABASE_URL` 仍不能省略。
 
 使用外部 PostgreSQL 时，应用用户需要对 `chatgpt2api_app` 和 `chatgpt2api_image_queue` 具备连接权限，并能在各自数据库的 `public` schema 创建表、序列和索引。管理员可以按实际用户名执行：
 
@@ -142,7 +142,7 @@ GRANT USAGE, CREATE ON SCHEMA public TO chatgpt2api_runtime;
 
 ### 一键安装脚本
 
-一键脚本位于 `deploy/install.sh`，支持交互式安装和真正的非交互式安装。脚本会生成认证密钥，写入 `.env` 与 `data/config.json`，下载对应 Compose 文件，拉取镜像并等待应用健康检查通过。
+一键脚本位于 `deploy/install.sh`，支持交互式安装和真正的非交互式安装。首次启动会先选择部署端：单机端、主控/监控端或生图端 Worker；新安装统一使用 PostgreSQL。管理员密钥必须手动填写，安装完成时会显示管理员密钥、PostgreSQL `DATABASE_URL` 和图片队列数据库地址。
 
 #### 交互式安装（推荐第一次使用）
 
@@ -153,16 +153,40 @@ curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b
 sudo bash /tmp/chatgpt2api-install.sh
 ```
 
-脚本会依次询问运行模式、端口、线程池容量、安装目录和 Release 引用；Docker 模式要求固定提交 SHA，Python 模式可使用版本标签。随后脚本会询问账号存储后端、图片队列 PostgreSQL 地址和是否启用 WARP。默认安装目录是 `/opt/chatgpt2api`，默认端口是 `3000`。
+公共顺序为：选择语言 → 选择部署端 → 填写对应配置 → 显示安装摘要 → 确认安装 → 执行安装 → 健康检查 → 显示最终连接信息。部署端含义如下：
+
+- `1` 单机端：API、监控和生图 Worker 同机运行。
+- `2` 主控/监控端：运行 API、管理台、账号库和队列调度，不运行生图 Worker。
+- `3` 生图端 Worker：通过主控端生成的 join 文件加入集群，只运行生图任务。
+
+各端的交互顺序如下：
+
+- 单机端：Docker/Python → 管理员密钥 → API/图片公网地址 → 端口 → 线程池容量 → PostgreSQL `DATABASE_URL` → 图片队列 `IMAGE_QUEUE_DATABASE_URL` → 安装目录 → Release → WARP → 安装摘要 → 确认安装。
+- 主控/监控端：管理员密钥 → API 域名 → API 端口 → PostgreSQL 密码 → PostgreSQL 管理员密码 → WireGuard 公网 IP/域名 → WireGuard 端口 → 安装目录 → Release → 首次交互式安装时选择是否生成第一个 Worker → 安装摘要 → 确认安装。
+- 生图端：自动查找或填写 join 文件 → 显示 Worker/集群/数据库信息 → 图片公网 URL → `direct` 或 `proxy` → 图片端口 → 安装目录 → 显示两个 PostgreSQL 地址 → 安装摘要 → 确认安装。
+
+主控端默认不会在非交互安装或已有安装重跑时生成第一个 Worker；需要显式追加 `--create-first-worker`，也可以用 `--no-first-worker` 明确禁止生成。
+
+Docker 模式要求固定提交 SHA，Python 模式可使用版本标签。默认安装目录是 `/opt/chatgpt2api`，默认端口是 `3000`。已有安装目录会保留原存储后端，JSON、SQLite、Git 仅继续兼容旧部署。
+
+安装完成摘要示例：
+
+```text
+管理员密钥: <手动填写的密钥>
+PostgreSQL DATABASE_URL: postgresql+psycopg2://.../chatgpt2api_app
+图片队列 DATABASE_URL: postgresql+psycopg2://.../chatgpt2api_image_queue
+```
 
 #### 非交互式一键安装
 
-只需要准备一个可用的 PostgreSQL 图片队列地址：
+需要准备管理员密钥、账号库 PostgreSQL 地址和图片队列 PostgreSQL 地址：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b77abfcfc210814a4ed125b8a3cb8b0/deploy/install.sh -o /tmp/chatgpt2api-install.sh
   sudo env NONINTERACTIVE=1 MODE=docker INSTALL_DIR=/opt/chatgpt2api PORT=3000 \
-  STORAGE_BACKEND=json \
+  CHATGPT2API_INSTALL_TARGET=standalone \
+  CHATGPT2API_AUTH_KEY='replace-with-a-manual-admin-key' \
+  DATABASE_URL='postgresql+psycopg2://user:password@postgres-host:5432/chatgpt2api_app' \
   CHATGPT2API_BASE_URL='https://api.example.com' \
   IMAGE_QUEUE_DATABASE_URL='postgresql+psycopg2://user:password@postgres-host:5432/chatgpt2api_image_queue' \
   bash /tmp/chatgpt2api-install.sh --non-interactive
@@ -170,12 +194,13 @@ curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b
 
 非交互模式下：
 
-- `CHATGPT2API_AUTH_KEY` 留空时自动生成管理员密钥，并写入 `/opt/chatgpt2api/data/config.json` 和 `.env`。
+- `CHATGPT2API_AUTH_KEY` 必须手动提供；交互式安装会隐藏输入并要求确认两次，非交互式安装缺少该值会直接失败。
 - `CHATGPT2API_IMAGE` 留空时使用 `ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a`。
 - `CHATGPT2API_WARP_IMAGE`、`CHATGPT2API_PRIVOXY_IMAGE` 和 `CHATGPT2API_FLARESOLVERR_IMAGE` 也默认使用固定 digest。
 - `CHATGPT2API_RELEASE_REF` 默认固定到当前 Release 提交；不要改成 `main` 等可变分支。Docker 模式的自定义引用必须是 40 位提交 SHA，Python 模式才允许使用版本标签。
-- `STORAGE_BACKEND=json` 时不要求账号存储数据库；`postgres` 需要 `DATABASE_URL`，`git` 需要 `GIT_REPO_URL` 和 `GIT_TOKEN`。
+- 新安装固定使用 `STORAGE_BACKEND=postgres`，必须提供指向 `chatgpt2api_app` 的 `DATABASE_URL`；JSON、SQLite、Git 仅兼容已有部署。
 - `IMAGE_QUEUE_DATABASE_URL` 始终必填，脚本会在启动前校验。
+- 主控端的 `--create-first-worker` 与 `--no-first-worker` 只控制当前安装动作，不会写入 `.env`，避免已有安装重跑时重复创建 Worker。
 - standalone 模式必须提供 `CHATGPT2API_BASE_URL` 或 `CHATGPT2API_IMAGE_BASE_URL`；脚本不会再把任意请求 `Host` 当作图片公网地址。
 - 可用 `INSTALL_DIR`、`PORT`、`CHATGPT2API_AUTH_KEY`、`CHATGPT2API_IMAGE`、`CHATGPT2API_BASE_URL` 和 `CHATGPT2API_IMAGE_BASE_URL` 覆盖默认值。
 
@@ -184,6 +209,9 @@ curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b
 ```bash
 curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b77abfcfc210814a4ed125b8a3cb8b0/deploy/install.sh -o /tmp/chatgpt2api-install.sh
   sudo env NONINTERACTIVE=1 MODE=docker WITH_WARP=1 INSTALL_DIR=/opt/chatgpt2api \
+  CHATGPT2API_INSTALL_TARGET=standalone \
+  CHATGPT2API_AUTH_KEY='replace-with-a-manual-admin-key' \
+  DATABASE_URL='postgresql+psycopg2://user:password@postgres-host:5432/chatgpt2api_app' \
   CHATGPT2API_BASE_URL='https://api.example.com' \
   IMAGE_QUEUE_DATABASE_URL='postgresql+psycopg2://user:password@postgres-host:5432/chatgpt2api_image_queue' \
   bash /tmp/chatgpt2api-install.sh --non-interactive --with-warp
@@ -221,7 +249,7 @@ sudo bash /tmp/chatgpt2api-install.sh status --install-dir /opt/chatgpt2api
 
 ### Docker 运行
 
-推荐直接使用 GHCR（GitHub Container Registry）镜像。标准 Compose 不会自动创建 PostgreSQL；它会先执行数据目录权限和数据库角色初始化任务，再启动应用：
+推荐直接使用 GHCR（GitHub Container Registry）镜像。标准 Compose 不会自动创建 PostgreSQL；新配置默认使用 PostgreSQL 账号库和图片队列库，必须分别填写 `DATABASE_URL` 与 `IMAGE_QUEUE_DATABASE_URL`。Compose 会先执行数据目录权限和数据库角色初始化任务，再启动应用：
 
 ```bash
 git clone https://github.com/biubiubiu125/chatgpt2api.git
@@ -230,10 +258,10 @@ mkdir -p data
 cp .env.example .env
 ```
 
-生成管理员密钥并写入 Docker 配置：
+手动设置管理员密钥并写入 Docker 配置：
 
 ```bash
-CHATGPT2API_AUTH_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+CHATGPT2API_AUTH_KEY='replace-with-a-manual-admin-key'
 printf '{"auth-key":"%s"}\n' "$CHATGPT2API_AUTH_KEY" > data/config.json
 ```
 
@@ -242,6 +270,8 @@ printf '{"auth-key":"%s"}\n' "$CHATGPT2API_AUTH_KEY" > data/config.json
 ```dotenv
 CHATGPT2API_AUTH_KEY=
 CHATGPT2API_IMAGE=ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a
+STORAGE_BACKEND=postgres
+DATABASE_URL=postgresql+psycopg2://user:password@postgres-host:5432/chatgpt2api_app
 IMAGE_QUEUE_DATABASE_URL=postgresql+psycopg2://user:password@postgres-host:5432/chatgpt2api_image_queue
 ```
 
@@ -262,7 +292,7 @@ curl -fsS 'http://127.0.0.1:3000/health/live?format=json'
 - 运行配置：`./data/config.json`
 - 容器内服务端口：`3000`
 
-`CHATGPT2API_AUTH_KEY` 和 `data/config.json` 中的 `auth-key` 二选一即可，环境变量优先。`config.example.yaml` 只用于说明配置结构，示例密钥不能直接用于生产。账号存储的 `DATABASE_URL` 与图片队列的 `IMAGE_QUEUE_DATABASE_URL` 是两个独立配置。
+运行时可以从 `CHATGPT2API_AUTH_KEY` 或 `data/config.json` 的 `auth-key` 读取管理员密钥，环境变量优先；一键安装时必须先手动填写该密钥。`config.example.yaml` 只用于说明配置结构，示例密钥不能直接用于生产。账号存储的 `DATABASE_URL` 与图片队列的 `IMAGE_QUEUE_DATABASE_URL` 是两个独立配置。
 
 如果 GHCR 包设置为私有，部署机先登录：
 
@@ -290,12 +320,14 @@ docker compose -f docker-compose.local.yml up -d --build
 - Worker 通过 WireGuard 私网访问两个 PostgreSQL 数据库，只处理图片队列。
 - Worker 公网只暴露 `/images/`、`/image-thumbnails/` 和健康检查路径。
 - Worker 返回图片 URL 后，主节点会校验 URL 归属和可达性，再返回给客户端。
+- Worker 不提供管理台和普通 API，不需要填写管理员密钥；脚本只为 Worker 生成内部运行密钥。
 
 主节点准备：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b77abfcfc210814a4ed125b8a3cb8b0/deploy/install.sh -o /tmp/chatgpt2api-install.sh
 sudo env WIREGUARD_SERVER_ENDPOINT=主节点公网IP或域名 \
+  CHATGPT2API_AUTH_KEY='replace-with-a-manual-admin-key' \
   POSTGRES_PASSWORD='主节点数据库密码' \
   POSTGRES_ADMIN_PASSWORD='主节点管理密码' \
   bash /tmp/chatgpt2api-install.sh main
@@ -497,19 +529,20 @@ npm run build
 
 ### 账号存储后端
 
-`STORAGE_BACKEND` 控制账号池和认证密钥的存储方式：
+新安装和生产部署默认使用 PostgreSQL，账号库数据库名固定为 `chatgpt2api_app`；图片队列数据库名固定为 `chatgpt2api_image_queue`。`STORAGE_BACKEND` 仍保留旧部署兼容能力：
 
 | 值 | 说明 |
 | :--- | :--- |
-| `json` | 本地 JSON 文件，默认使用 `data/accounts.json` 和 `data/auth_keys.json`。 |
-| `sqlite` | SQLite 数据库，默认可使用 `data/accounts.db`。 |
-| `postgres` | 外部 PostgreSQL，需要配置指向 `chatgpt2api_app` 的 `DATABASE_URL`。 |
-| `git` | Git 私有仓库，需要配置 `GIT_REPO_URL` 和 `GIT_TOKEN`。 |
+| `postgres` | 默认后端，需要配置指向 `chatgpt2api_app` 的 `DATABASE_URL`。 |
+| `json` | 旧部署兼容：本地 JSON 文件，默认使用 `data/accounts.json` 和 `data/auth_keys.json`。 |
+| `sqlite` | 旧部署兼容：SQLite 数据库，默认可使用 `data/accounts.db`。 |
+| `git` | 旧部署兼容：Git 私有仓库，需要配置 `GIT_REPO_URL` 和 `GIT_TOKEN`。 |
 
 说明：
 
 - 账号存储后端只负责账号池和认证密钥。
 - 系统设置、日志、概览统计、图片索引、注册配置和图片队列按各自模块保存。
+- 一键安装向导不再让新安装选择 JSON、SQLite 或 Git；显式保留旧值的已有部署可以继续运行。
 - 使用 `sqlite` 时，若未设置 `DATABASE_URL`，会自动使用 `data/accounts.db`。
 - 使用 `postgres` 时必须设置指向 `chatgpt2api_app` 的 PostgreSQL `DATABASE_URL`。
 - 使用 `git` 时还可以通过 `GIT_BRANCH`、`GIT_FILE_PATH` 和 `GIT_AUTH_KEYS_FILE_PATH` 指定分支和文件路径。
@@ -639,9 +672,10 @@ register_offpeak:
 | `CHATGPT2API_FLARESOLVERR_IMAGE` | `flaresolverr/flaresolverr@sha256:139dfee1c6f89249c8d665d1333a42e8ec74ec0a86bc6bb1c8461e10d3a66a47` | WARP 运行时的 Cloudflare 清障服务镜像。 |
 | `CHATGPT2API_BASE_URL` | 无 | standalone 对外 API/图片基础地址；公网部署必须显式设置，避免信任任意请求 `Host`。 |
 | `CHATGPT2API_THREAD_TOKENS` | `80` | AnyIO 后端线程池容量。 |
-| `STORAGE_BACKEND` | `json` | 账号池和认证密钥存储后端。 |
-| `DATABASE_URL` | 无 | `postgres` 账号存储后端使用；集群主从由 `APP_DATABASE_URL` 承担应用库。 |
+| `STORAGE_BACKEND` | `postgres` | 新安装的账号池和认证密钥存储后端；旧部署可显式保留其他值。 |
+| `DATABASE_URL` | 无 | PostgreSQL 账号库地址，必须指向 `chatgpt2api_app`；集群主从由 `APP_DATABASE_URL` 承担应用库。 |
 | `APP_DATABASE_URL` | 无 | 集群应用库，必须指向 `chatgpt2api_app`。 |
+| `CHATGPT2API_INSTALL_TARGET` | `standalone` | 一键安装向导目标：`standalone`、`api-main` 或 `worker`。 |
 | `CHATGPT2API_NODE_ROLE` | `standalone` | 节点角色：`standalone`、`api-main` 或 `worker`。 |
 | `CHATGPT2API_WORKER_ID` | 无 | Worker 稳定编号，例如 `worker-1`。 |
 | `CHATGPT2API_WIREGUARD_IP` | 无 | Worker WireGuard 私网 IP，例如 `10.77.0.11`。 |

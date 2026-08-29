@@ -28,6 +28,9 @@ IMAGE_BASE_URL="${CHATGPT2API_IMAGE_BASE_URL:-${IMAGE_BASE_URL:-}}"
 PYTHON_BIN="${CHATGPT2API_PYTHON_BIN:-${PYTHON_BIN:-python3}}"
 IMAGE_PORT="${CHATGPT2API_IMAGE_PORT:-${IMAGE_PORT:-3000}}"
 NODE_ROLE="${CHATGPT2API_NODE_ROLE:-${NODE_ROLE:-standalone}}"
+INSTALL_TARGET="${CHATGPT2API_INSTALL_TARGET:-${INSTALL_TARGET:-}}"
+INSTALL_EXISTING="${INSTALL_EXISTING:-0}"
+CREATE_FIRST_WORKER="${CHATGPT2API_CREATE_FIRST_WORKER:-${CREATE_FIRST_WORKER:-}}"
 RUN_API="${CHATGPT2API_RUN_API:-${RUN_API:-}}"
 RUN_WORKER="${CHATGPT2API_RUN_WORKER:-${RUN_WORKER:-}}"
 WORKER_ID="${CHATGPT2API_WORKER_ID:-${WORKER_ID:-}}"
@@ -52,7 +55,7 @@ CHATGPT2API_RUNTIME_LOG_FILE="${CHATGPT2API_RUNTIME_LOG_FILE:-}"
 HOST="${HOST:-0.0.0.0}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 UVICORN_WORKERS="${UVICORN_WORKERS:-}"
-STORAGE_BACKEND="${STORAGE_BACKEND:-json}"
+STORAGE_BACKEND="${STORAGE_BACKEND:-postgres}"
 APP_DATABASE_URL="${APP_DATABASE_URL:-}"
 DATABASE_URL="${DATABASE_URL:-}"
 IMAGE_QUEUE_DATABASE_URL="${IMAGE_QUEUE_DATABASE_URL:-}"
@@ -134,6 +137,7 @@ GIT_FILE_PATH="${GIT_FILE_PATH:-accounts.json}"
 GIT_AUTH_KEYS_FILE_PATH="${GIT_AUTH_KEYS_FILE_PATH:-auth_keys.json}"
 CLI_BRANCH_SET="${CLI_BRANCH_SET:-0}"
 CLI_BRANCH_VALUE="${CLI_BRANCH_VALUE:-}"
+CLI_INSTALL_TARGET_SET="${CLI_INSTALL_TARGET_SET:-0}"
 RELEASE_REF_SELECTED="${RELEASE_REF_SELECTED:-0}"
 
 UI_IN="${UI_IN:-/dev/tty}"
@@ -169,6 +173,8 @@ EOF
   CHATGPT2API_IMAGE_BASE_URL=https://img-1.example.com/images
   CHATGPT2API_IMAGE_PORT=3000
   CHATGPT2API_NODE_ROLE=standalone|api-main|worker
+  CHATGPT2API_INSTALL_TARGET=standalone|api-main|worker
+  CHATGPT2API_CREATE_FIRST_WORKER=0|1
   CHATGPT2API_RUN_API=true|false
   CHATGPT2API_RUN_WORKER=true|false
   CHATGPT2API_WORKER_ID=worker-1
@@ -184,7 +190,7 @@ EOF
   WITH_WARP=0|1
   NONINTERACTIVE=0|1
   AUTH_KEY=your-auth-key
-  STORAGE_BACKEND=json|sqlite|postgres|git
+  STORAGE_BACKEND=postgres
   DATABASE_URL=postgresql://...
   IMAGE_QUEUE_DATABASE_URL=postgresql+psycopg2://...
   IMAGE_QUEUE_INSTANCE_ID=worker-1-join-nonce
@@ -218,7 +224,10 @@ EOF
   --install-dir /opt/chatgpt2api
   --branch d887be015b77abfcfc210814a4ed125b8a3cb8b0
   --auth-key your-auth-key
-  --storage-backend json|sqlite|postgres|git
+  --install-target standalone|api-main|worker
+  --create-first-worker
+  --no-first-worker
+  --storage-backend postgres
   --database-url postgresql://...
   --image-queue-database-url postgresql+psycopg2://...
   --git-repo-url https://github.com/your/private-storage.git
@@ -317,6 +326,8 @@ text() {
       err_unknown_arg) printf 'Unknown argument' ;;
       err_mode) printf 'MODE must be docker or python.' ;;
       err_storage) printf 'STORAGE_BACKEND must be json, sqlite, postgres or git.' ;;
+      err_install_target) printf 'INSTALL_TARGET must be standalone, api-main or worker.' ;;
+      err_auth_key) printf 'A manually entered administrator auth key is required.' ;;
       err_port) printf 'PORT must be a number.' ;;
       err_thread_tokens) printf 'CHATGPT2API_THREAD_TOKENS must be a positive number.' ;;
       err_not_git) printf 'exists but is not a git repository.' ;;
@@ -336,9 +347,16 @@ text() {
       prompt_branch) printf 'Release commit SHA (Docker) or version tag (Python)' ;;
       prompt_storage) printf 'Storage backend' ;;
       prompt_auth) printf 'Admin auth key' ;;
+      prompt_install_target) printf 'Deployment target' ;;
       prompt_warp) printf 'Enable WARP / Privoxy / FlareSolverr compose' ;;
       done_ready) printf 'ChatGPT2API is ready' ;;
       done_auth) printf 'Admin auth key' ;;
+      summary_target) printf 'Deployment target' ;;
+      summary_url) printf 'Public URL' ;;
+      summary_database) printf 'PostgreSQL DATABASE_URL' ;;
+      summary_queue_database) printf 'Image queue DATABASE_URL' ;;
+      prompt_confirm_install) printf 'Start installation with the above settings' ;;
+      done_cancelled) printf 'Installation cancelled' ;;
       *) printf '%s' "${key}" ;;
     esac
     return
@@ -359,6 +377,8 @@ text() {
     err_unknown_arg) printf '未知参数' ;;
     err_mode) printf '运行模式只能是 docker 或 python。' ;;
     err_storage) printf '存储后端只能是 json、sqlite、postgres 或 git。' ;;
+    err_install_target) printf '安装端只能是 standalone、api-main 或 worker。' ;;
+    err_auth_key) printf '必须手动填写管理员登录密钥，不能自动生成。' ;;
     err_port) printf '端口必须是数字。' ;;
     err_not_git) printf '已存在，但不是 Git 仓库。' ;;
     err_compose) printf '未找到 docker compose 插件，请先安装 Docker Compose v2。' ;;
@@ -376,9 +396,16 @@ text() {
     prompt_branch) printf 'Release 提交 SHA（Docker）或版本标签（Python）' ;;
     prompt_storage) printf '存储后端' ;;
     prompt_auth) printf '管理员登录密钥' ;;
+    prompt_install_target) printf '部署端类型' ;;
     prompt_warp) printf '启用 WARP / Privoxy / FlareSolverr 清障编排' ;;
     done_ready) printf 'ChatGPT2API 已就绪' ;;
-    done_auth) printf '管理员登录密钥' ;;
+    done_auth) printf '管理员密钥' ;;
+    summary_target) printf '部署端' ;;
+    summary_url) printf '公开访问地址' ;;
+    summary_database) printf 'PostgreSQL DATABASE_URL' ;;
+    summary_queue_database) printf '图片队列 DATABASE_URL' ;;
+    prompt_confirm_install) printf '确认以上配置并开始安装' ;;
+    done_cancelled) printf '已取消安装' ;;
     *) printf '%s' "${key}" ;;
   esac
 }
@@ -404,6 +431,63 @@ prompt_input() {
     answer="${default}"
   fi
   printf '%s' "${answer}"
+}
+
+prompt_secret() {
+  local label="$1"
+  local answer=""
+
+  if is_noninteractive; then
+    printf '%s' ""
+    return
+  fi
+
+  ui_print "${label}: "
+  IFS= read -r -s answer <"${UI_IN}" || true
+  ui_println ""
+  printf '%s' "${answer}"
+}
+
+auth_key_is_placeholder() {
+  [[ -z "${1:-}" || "${1}" == "your_secret_key_here" || "${1}" == "your-auth-key" ]]
+}
+
+ensure_admin_auth_key() {
+  if ! auth_key_is_placeholder "${AUTH_KEY}"; then
+    return 0
+  fi
+
+  if is_noninteractive; then
+    echo "[$(text prefix_error)] $(text err_auth_key)" >&2
+    return 1
+  fi
+
+  local first_key=""
+  local second_key=""
+  while true; do
+    first_key="$(prompt_secret "$(text prompt_auth)")"
+    if [[ -z "${first_key}" ]]; then
+      ui_println "[$(text prefix_error)] $(text err_auth_key)"
+      continue
+    fi
+    second_key="$(prompt_secret "再次输入管理员登录密钥")"
+    if [[ "${first_key}" != "${second_key}" ]]; then
+      ui_println "[$(text prefix_error)] 两次输入的管理员登录密钥不一致，请重新输入。"
+      continue
+    fi
+    AUTH_KEY="${first_key}"
+    return 0
+  done
+}
+
+confirm_installation() {
+  if is_noninteractive; then
+    return 0
+  fi
+  if ! confirm "$(text prompt_confirm_install)" "N"; then
+    ui_println "[$(text prefix_warn)] $(text done_cancelled)"
+    exit 0
+  fi
 }
 
 confirm() {
@@ -449,6 +533,84 @@ normalize_mode_choice() {
   esac
 }
 
+normalize_install_target() {
+  local value="${1:-}"
+  value="${value,,}"
+  value="${value//[[:space:]]/}"
+  case "${value}" in
+    1|standalone|single|single-node|single-node-install)
+      printf 'standalone'
+      ;;
+    2|main|api-main|monitor|monitoring|control|control-plane)
+      printf 'api-main'
+      ;;
+    3|worker|image|image-worker|generation|generation-worker)
+      printf 'worker'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+resolve_install_target() {
+  local noninteractive="${1:-0}"
+  local requested="${INSTALL_TARGET:-${NODE_ROLE:-standalone}}"
+
+  if [[ "${noninteractive}" == "1" || "${CLI_INSTALL_TARGET_SET:-0}" == "1" || -n "${CHATGPT2API_INSTALL_TARGET:-}" || "${NODE_ROLE:-standalone}" != "standalone" ]]; then
+    normalize_install_target "${requested}"
+    return
+  fi
+  prompt_install_target
+}
+
+prompt_install_target() {
+  local answer=""
+  local normalized=""
+  while true; do
+    if is_en; then
+      ui_println "Deployment target"
+      ui_println "  1) Standalone node (API + monitoring + image generation)"
+      ui_println "  2) API main / monitoring node"
+      ui_println "  3) Image generation Worker node"
+      answer="$(prompt_input "Select" "1")"
+    else
+      ui_println "部署端类型"
+      ui_println "  1) 单机端（API + 监控 + 生图）"
+      ui_println "  2) 主控/监控端（API + 监控，不运行生图）"
+      ui_println "  3) 生图端 Worker（只运行生图任务）"
+      answer="$(prompt_input "请选择" "1")"
+    fi
+    normalized="$(normalize_install_target "${answer}")" && {
+      printf '%s' "${normalized}"
+      return
+    }
+    ui_println "[$(text prefix_error)] $(text err_install_target)"
+  done
+}
+
+resolve_create_first_worker() {
+  case "${CREATE_FIRST_WORKER:-}" in
+    1|true|TRUE|yes|YES|y|Y|on|ON)
+      return 0
+      ;;
+    0|false|FALSE|no|NO|n|N|off|OFF)
+      return 1
+      ;;
+    "")
+      if is_noninteractive || [[ "${INSTALL_EXISTING}" == "1" ]]; then
+        return 1
+      fi
+      confirm "是否自动生成第一个从节点配置" "Y"
+      return
+      ;;
+    *)
+      echo "[$(text prefix_error)] CHATGPT2API_CREATE_FIRST_WORKER must be 0 or 1." >&2
+      return 2
+      ;;
+  esac
+}
+
 normalize_storage_choice() {
   local value="${1:-}"
   value="${value,,}"
@@ -488,37 +650,9 @@ prompt_mode_choice() {
 }
 
 prompt_storage_choice() {
-  local default="${1:-json}"
-  local normalized=""
-  local answer=""
-  normalized="$(normalize_storage_choice "${default}")" || normalized="json"
-  local default_choice="1"
-  case "${normalized}" in
-    json) default_choice="1" ;;
-    sqlite) default_choice="2" ;;
-    postgres) default_choice="3" ;;
-    git) default_choice="4" ;;
-  esac
-
-  while true; do
-    if is_en; then
-      ui_println "Storage backend"
-      ui_println "  1) json     - local JSON files (simple/default)"
-      ui_println "  2) sqlite   - local SQLite database"
-      ui_println "  3) postgres - external PostgreSQL database"
-      ui_println "  4) git      - private Git repository"
-      answer="$(prompt_input "Select" "${default_choice}")"
-    else
-      ui_println "存储后端"
-      ui_println "  1) json     - 本地 JSON 文件（简单/默认）"
-      ui_println "  2) sqlite   - 本地 SQLite 数据库"
-      ui_println "  3) postgres - 外部 PostgreSQL 数据库"
-      ui_println "  4) git      - 私有 Git 仓库存储"
-      answer="$(prompt_input "请选择" "${default_choice}")"
-    fi
-    normalized="$(normalize_storage_choice "${answer}")" && { printf '%s' "${normalized}"; return; }
-    ui_println "[$(text prefix_error)] $(text err_storage)"
-  done
+  # Kept for callers from older installer revisions.  New installations do
+  # not expose a storage backend menu and always select PostgreSQL.
+  printf 'postgres'
 }
 
 prompt_storage_details() {
@@ -594,6 +728,50 @@ generate_auth_key() {
   date +%s%N
 }
 
+install_target_label() {
+  case "${INSTALL_TARGET:-${NODE_ROLE:-standalone}}" in
+    api-main) printf '主控/监控端' ;;
+    worker) printf '生图端 Worker' ;;
+    *) printf '单机端' ;;
+  esac
+}
+
+print_install_summary() {
+  local config_path="${INSTALL_DIR}/data/config.json"
+  local public_url="${BASE_URL:-${IMAGE_BASE_URL:-http://localhost:${PORT}}}"
+  if [[ "${MODE}" == "python" ]]; then
+    config_path="${INSTALL_DIR}/config.json"
+  fi
+
+  printf '\n[%s] %s\n' "$(text prefix_done)" "$(text done_ready)"
+  printf '%s: %s\n' "$(text summary_target)" "$(install_target_label)"
+  printf '%s: %s\n' "$(text summary_url)" "${public_url}"
+  if [[ "${NODE_ROLE:-standalone}" == "api-main" ]]; then
+    printf '运行状态: API 存活；Worker 运行态需加入 Worker 后验证\n'
+  fi
+  if [[ "${NODE_ROLE:-standalone}" != "worker" ]]; then
+    printf '%s: %s\n' "$(text done_auth)" "${AUTH_KEY}"
+  fi
+  if [[ -n "${DATABASE_URL:-}" ]]; then
+    local database_label="$(text summary_database)"
+    if [[ "${STORAGE_BACKEND:-postgres}" != "postgres" ]]; then
+      database_label="DATABASE_URL"
+    fi
+    printf '%s: %s\n' "${database_label}" "${DATABASE_URL}"
+  fi
+  if [[ -n "${IMAGE_QUEUE_DATABASE_URL:-}" ]]; then
+    printf '%s: %s\n' "$(text summary_queue_database)" "${IMAGE_QUEUE_DATABASE_URL}"
+  fi
+  printf '配置文件: %s\n' "${config_path}"
+  printf '环境文件: %s/.env\n' "${INSTALL_DIR}"
+}
+
+apply_install_storage_defaults() {
+  if [[ "${INSTALL_EXISTING}" != "1" ]]; then
+    STORAGE_BACKEND="postgres"
+  fi
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -631,6 +809,19 @@ parse_args() {
       --auth-key)
         AUTH_KEY="${2:-}"
         shift 2
+        ;;
+      --install-target)
+        INSTALL_TARGET="${2:-}"
+        CLI_INSTALL_TARGET_SET="1"
+        shift 2
+        ;;
+      --create-first-worker)
+        CREATE_FIRST_WORKER="1"
+        shift
+        ;;
+      --no-first-worker)
+        CREATE_FIRST_WORKER="0"
+        shift
         ;;
       --storage-backend)
         STORAGE_BACKEND="${2:-}"
@@ -695,9 +886,18 @@ parse_args() {
 
 validate_inputs() {
   local normalized=""
+  local install_target_requested="${INSTALL_TARGET:-}"
 
   normalized="$(normalize_mode_choice "${MODE}")" || { echo "[$(text prefix_error)] $(text err_mode)" >&2; exit 1; }
   MODE="${normalized}"
+
+  if [[ -n "${install_target_requested}" ]]; then
+    normalized="$(normalize_install_target "${install_target_requested}")" || {
+      echo "[$(text prefix_error)] $(text err_install_target)" >&2
+      exit 1
+    }
+    INSTALL_TARGET="${normalized}"
+  fi
 
   normalized="$(normalize_storage_choice "${STORAGE_BACKEND}")" || { echo "[$(text prefix_error)] $(text err_storage)" >&2; exit 1; }
   STORAGE_BACKEND="${normalized}"
@@ -722,6 +922,11 @@ validate_inputs() {
 
   if [[ -z "${THREAD_TOKENS}" || ! "${THREAD_TOKENS}" =~ ^[0-9]+$ || "${THREAD_TOKENS}" -lt 1 ]]; then
     echo "[$(text prefix_error)] $(text err_thread_tokens)" >&2
+    exit 1
+  fi
+
+  if [[ -n "${install_target_requested}" && "${NODE_ROLE}" != "worker" ]] && auth_key_is_placeholder "${AUTH_KEY}"; then
+    echo "[$(text prefix_error)] $(text err_auth_key)" >&2
     exit 1
   fi
 
@@ -2228,7 +2433,7 @@ dotenv_key_allowed() {
      CHATGPT2API_PORT|CHATGPT2API_QUOTA_RESERVATION_TTL_SECONDS|CHATGPT2API_RUNTIME_LOG_FILE| \
      CHATGPT2API_THREAD_TOKENS|CHATGPT2API_IMAGE| \
      CHATGPT2API_IMAGE_DIGEST|CHATGPT2API_RELEASE_REF|UV_VERSION| \
-     CHATGPT2API_BASE_URL|CHATGPT2API_IMAGE_BASE_URL|CHATGPT2API_PYTHON_BIN|CHATGPT2API_IMAGE_PORT|CHATGPT2API_NODE_ROLE| \
+     CHATGPT2API_BASE_URL|CHATGPT2API_IMAGE_BASE_URL|CHATGPT2API_PYTHON_BIN|CHATGPT2API_IMAGE_PORT|CHATGPT2API_NODE_ROLE|CHATGPT2API_INSTALL_TARGET|CHATGPT2API_CREATE_FIRST_WORKER| \
     CHATGPT2API_WARP_IMAGE|CHATGPT2API_PRIVOXY_IMAGE|CHATGPT2API_FLARESOLVERR_IMAGE| \
      CHATGPT2API_RUN_API|CHATGPT2API_RUN_WORKER|CHATGPT2API_WORKER_ID|CHATGPT2API_WORKER_PUBLIC_ENTRY_MODE| \
      CHATGPT2API_WORKER_BIND_HOST|CHATGPT2API_WIREGUARD_IP| \
@@ -2384,6 +2589,43 @@ dotenv_read_value() {
   )
 }
 
+dotenv_has_key() {
+  local env_file="$1"
+  local key="$2"
+  grep -Eq "^[[:space:]]*${key}[[:space:]]*=" "${env_file}"
+}
+
+infer_existing_storage_backend() {
+  local configured="${1:-}"
+  if [[ -n "${configured}" ]]; then
+    normalize_storage_choice "${configured}"
+    return
+  fi
+
+  local database_url="${DATABASE_URL:-}"
+  case "${database_url,,}" in
+    sqlite:*|sqlite3:*)
+      printf 'sqlite'
+      return
+      ;;
+    postgresql:*|postgresql+psycopg2:*|postgres://*)
+      printf 'postgres'
+      return
+      ;;
+  esac
+
+  if [[ -f "${INSTALL_DIR}/data/accounts.json" || -f "${INSTALL_DIR}/data/auth_keys.json" ]]; then
+    printf 'json'
+    return
+  fi
+  if [[ -f "${INSTALL_DIR}/data/accounts.db" ]]; then
+    printf 'sqlite'
+    return
+  fi
+
+  printf 'postgres'
+}
+
 cluster_load_env() {
   load_existing_install_env
 }
@@ -2391,6 +2633,8 @@ cluster_load_env() {
 load_existing_install_env() {
   local env_file="${INSTALL_DIR}/.env"
   if [[ -f "${env_file}" ]]; then
+    INSTALL_EXISTING="1"
+    local storage_backend_declared="0"
     local env_release_ref=""
     local release_env_allowed="1"
     local previous_branch="${BRANCH-}"
@@ -2402,6 +2646,9 @@ load_existing_install_env() {
     local previous_flaresolverr_image="${CHATGPT2API_FLARESOLVERR_IMAGE-}"
     local previous_uv_version="${UV_VERSION-}"
 
+    if dotenv_has_key "${env_file}" STORAGE_BACKEND; then
+      storage_backend_declared="1"
+    fi
     if release_ref_override_active; then
       env_release_ref="$(dotenv_read_value "${env_file}" CHATGPT2API_RELEASE_REF || true)"
       if [[ -z "${env_release_ref}" || "${env_release_ref}" != "$(release_ref_override_value)" ]]; then
@@ -2419,8 +2666,10 @@ load_existing_install_env() {
     PYTHON_BIN="${CHATGPT2API_PYTHON_BIN:-${PYTHON_BIN:-python3}}"
     IMAGE_PORT="${CHATGPT2API_IMAGE_PORT:-${IMAGE_PORT:-3000}}"
     NODE_ROLE="${CHATGPT2API_NODE_ROLE:-${NODE_ROLE:-standalone}}"
+    INSTALL_TARGET="${CHATGPT2API_INSTALL_TARGET:-${INSTALL_TARGET:-${NODE_ROLE:-standalone}}}"
     RUN_API="${CHATGPT2API_RUN_API:-${RUN_API:-}}"
     RUN_WORKER="${CHATGPT2API_RUN_WORKER:-${RUN_WORKER:-}}"
+    CREATE_FIRST_WORKER="${CHATGPT2API_CREATE_FIRST_WORKER:-${CREATE_FIRST_WORKER:-}}"
     WORKER_ID="${CHATGPT2API_WORKER_ID:-${WORKER_ID:-}}"
     WIREGUARD_IP="${CHATGPT2API_WIREGUARD_IP:-${WIREGUARD_IP:-}}"
     CLUSTER_ID="${CHATGPT2API_CLUSTER_ID:-${CLUSTER_ID:-}}"
@@ -2439,6 +2688,9 @@ load_existing_install_env() {
     APP_DATABASE_URL="${APP_DATABASE_URL:-}"
     DATABASE_URL="${DATABASE_URL:-}"
     IMAGE_QUEUE_DATABASE_URL="${IMAGE_QUEUE_DATABASE_URL:-}"
+    if [[ "${storage_backend_declared}" != "1" ]]; then
+      STORAGE_BACKEND="$(infer_existing_storage_backend)"
+    fi
     IMAGE_QUEUE_INSTANCE_ID="${IMAGE_QUEUE_INSTANCE_ID:-}"
     CHATGPT2API_DATABASE_BOOTSTRAP_ATTEMPTS="${CHATGPT2API_DATABASE_BOOTSTRAP_ATTEMPTS:-30}"
     CHATGPT2API_DATABASE_BOOTSTRAP_DELAY_SECONDS="${CHATGPT2API_DATABASE_BOOTSTRAP_DELAY_SECONDS:-2}"
@@ -2863,25 +3115,70 @@ cluster_resolve_worker_join_file() {
   printf '%s\n' "${legacy_file}"
 }
 
-cluster_issue_join_token() {
-  local payload_json=""
-  payload_json="$(cluster_join_payload_json)"
-  if ! (cd "${INSTALL_DIR}" && docker compose -f docker-compose.cluster-main.yml exec -T -e CHATGPT2API_JOIN_PAYLOAD_JSON="${payload_json}" app /app/.venv/bin/python - <<'PY'
+cluster_run_join_payload_python() {
+  local compose_file="$1"
+  local mode="$2"
+  local operation="$3"
+  local payload_json="$4"
+  local python_code=""
+  python_code="$(cat <<'PY'
 import json
 import os
 import sys
 
 from services.cluster_join_store import ClusterJoinStore
 
-payload = json.loads(os.environ["CHATGPT2API_JOIN_PAYLOAD_JSON"])
+payload = json.load(sys.stdin)
 store = ClusterJoinStore(os.environ["APP_DATABASE_URL"])
+operation = sys.argv[1]
 try:
-    store.issue_worker_join(payload)
+    if operation == "issue":
+        store.issue_worker_join(payload)
+    elif operation == "revoke":
+        if not store.revoke_worker_join(payload.get("token")):
+            raise SystemExit(1)
+    elif operation == "validate":
+        if store.validate_worker_join(payload) is None:
+            print("join token is invalid, expired, already used, or payload mismatch", file=sys.stderr)
+            raise SystemExit(1)
+    elif operation == "consume":
+        if store.consume_worker_join(payload) is None:
+            print("join token is invalid, expired, already used, or payload mismatch", file=sys.stderr)
+            raise SystemExit(1)
+    elif operation == "activate":
+        if store.activate_worker_join(payload) is None:
+            raise SystemExit(1)
+    elif operation == "mark-failed":
+        if store.mark_activation_failed(payload) is None:
+            raise SystemExit(1)
+    elif operation == "reopen":
+        if store.reopen_worker_join(payload) is None:
+            raise SystemExit(1)
+    else:
+        raise ValueError(f"unsupported join operation: {operation}")
 except Exception as exc:
-    print(f"failed to issue worker join token: {exc}", file=sys.stderr)
+    print(f"join database operation failed: {exc}", file=sys.stderr)
     raise SystemExit(1)
 PY
-  ); then
+)"
+
+  if [[ "${mode}" == "exec" ]]; then
+    printf '%s' "${payload_json}" | (
+      cd "${INSTALL_DIR}" &&
+      docker compose -f "${compose_file}" exec -T app /app/.venv/bin/python -c "${python_code}" "${operation}"
+    )
+  else
+    printf '%s' "${payload_json}" | (
+      cd "${INSTALL_DIR}" &&
+      docker compose -f "${compose_file}" run --rm --no-deps -T app /app/.venv/bin/python -c "${python_code}" "${operation}"
+    )
+  fi
+}
+
+cluster_issue_join_token() {
+  local payload_json=""
+  payload_json="$(cluster_join_payload_json)"
+  if ! cluster_run_join_payload_python docker-compose.cluster-main.yml exec issue "${payload_json}"; then
     echo "[$(text prefix_error)] failed to write worker join token to app database." >&2
     return 1
   fi
@@ -2890,19 +3187,7 @@ PY
 cluster_revoke_join_token() {
   local payload_json=""
   payload_json="$(cluster_join_payload_json)"
-  if ! (cd "${INSTALL_DIR}" && docker compose -f docker-compose.cluster-main.yml exec -T -e CHATGPT2API_JOIN_PAYLOAD_JSON="${payload_json}" app /app/.venv/bin/python - <<'PY'
-import json
-import os
-import sys
-
-from services.cluster_join_store import ClusterJoinStore
-
-payload = json.loads(os.environ["CHATGPT2API_JOIN_PAYLOAD_JSON"])
-store = ClusterJoinStore(os.environ["APP_DATABASE_URL"])
-if not store.revoke_worker_join(payload.get("token")):
-    raise SystemExit(1)
-PY
-  ); then
+  if ! cluster_run_join_payload_python docker-compose.cluster-main.yml exec revoke "${payload_json}"; then
     echo "[$(text prefix_warn)] failed to revoke pending worker join token; please check ${WORKER_ID} manually." >&2
     return 1
   fi
@@ -2935,20 +3220,7 @@ PY
 cluster_validate_join_token() {
   local payload_json=""
   payload_json="$(cluster_join_payload_json)"
-  if ! (cd "${INSTALL_DIR}" && docker compose -f docker-compose.cluster-worker.yml run --rm --no-deps -T -e CHATGPT2API_JOIN_PAYLOAD_JSON="${payload_json}" app /app/.venv/bin/python - <<'PY'
-import json
-import os
-import sys
-
-from services.cluster_join_store import ClusterJoinStore
-
-payload = json.loads(os.environ["CHATGPT2API_JOIN_PAYLOAD_JSON"])
-store = ClusterJoinStore(os.environ["APP_DATABASE_URL"])
-if store.validate_worker_join(payload) is None:
-    print("join token is invalid, expired, already used, or payload mismatch", file=sys.stderr)
-    raise SystemExit(1)
-PY
-  ); then
+  if ! cluster_run_join_payload_python docker-compose.cluster-worker.yml run validate "${payload_json}"; then
     echo "[$(text prefix_error)] failed to validate worker join token against app database." >&2
     return 1
   fi
@@ -2957,20 +3229,7 @@ PY
 cluster_consume_join_token() {
   local payload_json=""
   payload_json="$(cluster_join_payload_json)"
-  if ! (cd "${INSTALL_DIR}" && docker compose -f docker-compose.cluster-worker.yml run --rm --no-deps -T -e CHATGPT2API_JOIN_PAYLOAD_JSON="${payload_json}" app /app/.venv/bin/python - <<'PY'
-import json
-import os
-import sys
-
-from services.cluster_join_store import ClusterJoinStore
-
-payload = json.loads(os.environ["CHATGPT2API_JOIN_PAYLOAD_JSON"])
-store = ClusterJoinStore(os.environ["APP_DATABASE_URL"])
-if store.consume_worker_join(payload) is None:
-    print("join token is invalid, expired, already used, or payload mismatch", file=sys.stderr)
-    raise SystemExit(1)
-PY
-  ); then
+  if ! cluster_run_join_payload_python docker-compose.cluster-worker.yml run consume "${payload_json}"; then
     echo "[$(text prefix_error)] failed to consume worker join token." >&2
     return 1
   fi
@@ -2979,19 +3238,7 @@ PY
 cluster_activate_join_token() {
   local payload_json=""
   payload_json="$(cluster_join_payload_json)"
-  if ! (cd "${INSTALL_DIR}" && docker compose -f docker-compose.cluster-worker.yml exec -T -e CHATGPT2API_JOIN_PAYLOAD_JSON="${payload_json}" app /app/.venv/bin/python - <<'PY'
-import json
-import os
-import sys
-
-from services.cluster_join_store import ClusterJoinStore
-
-payload = json.loads(os.environ["CHATGPT2API_JOIN_PAYLOAD_JSON"])
-store = ClusterJoinStore(os.environ["APP_DATABASE_URL"])
-if store.activate_worker_join(payload) is None:
-    raise SystemExit(1)
-PY
-  ); then
+  if ! cluster_run_join_payload_python docker-compose.cluster-worker.yml exec activate "${payload_json}"; then
     echo "[$(text prefix_error)] failed to finalize worker join activation." >&2
     return 1
   fi
@@ -3000,19 +3247,7 @@ PY
 cluster_mark_activation_failed() {
   local payload_json=""
   payload_json="$(cluster_join_payload_json)"
-  if ! (cd "${INSTALL_DIR}" && docker compose -f docker-compose.cluster-worker.yml run --rm --no-deps -T -e CHATGPT2API_JOIN_PAYLOAD_JSON="${payload_json}" app /app/.venv/bin/python - <<'PY'
-import json
-import os
-import sys
-
-from services.cluster_join_store import ClusterJoinStore
-
-payload = json.loads(os.environ["CHATGPT2API_JOIN_PAYLOAD_JSON"])
-store = ClusterJoinStore(os.environ["APP_DATABASE_URL"])
-if store.mark_activation_failed(payload) is None:
-    raise SystemExit(1)
-PY
-  ); then
+  if ! cluster_run_join_payload_python docker-compose.cluster-worker.yml run mark-failed "${payload_json}"; then
     echo "[$(text prefix_warn)] failed to mark worker join activation as failed; main-node review is required." >&2
     return 1
   fi
@@ -3021,19 +3256,7 @@ PY
 cluster_reopen_join_token() {
   local payload_json=""
   payload_json="$(cluster_join_payload_json)"
-  if ! (cd "${INSTALL_DIR}" && docker compose -f docker-compose.cluster-worker.yml run --rm --no-deps -T -e CHATGPT2API_JOIN_PAYLOAD_JSON="${payload_json}" app /app/.venv/bin/python - <<'PY'
-import json
-import os
-import sys
-
-from services.cluster_join_store import ClusterJoinStore
-
-payload = json.loads(os.environ["CHATGPT2API_JOIN_PAYLOAD_JSON"])
-store = ClusterJoinStore(os.environ["APP_DATABASE_URL"])
-if store.reopen_worker_join(payload) is None:
-    raise SystemExit(1)
-PY
-  ); then
+  if ! cluster_run_join_payload_python docker-compose.cluster-worker.yml run reopen "${payload_json}"; then
     echo "[$(text prefix_warn)] failed to reopen worker join token; rerun can still resume if join status remains activating." >&2
     return 1
   fi
@@ -3124,6 +3347,27 @@ cluster_confirm_worker_image_proxy() {
   ui_println "Worker Nginx config: ${config_file}"
   ui_println "worker-check will verify ${IMAGE_BASE_URL} after activation; activation first verifies the internal Worker chain, and a public proxy failure keeps the Worker running so you can fix Nginx and rerun worker-check."
   return 0
+}
+
+prompt_worker_public_entry_mode() {
+  local answer=""
+  while true; do
+    ui_println "图片公开入口模式"
+    ui_println "  1) direct - Worker 直接暴露图片端口"
+    ui_println "  2) proxy  - 通过 Nginx 反向代理暴露"
+    answer="$(prompt_input "请选择" "1")"
+    case "${answer,,}" in
+      1|direct)
+        printf 'direct'
+        return
+        ;;
+      2|proxy)
+        printf 'proxy'
+        return
+        ;;
+    esac
+    ui_println "[$(text prefix_error)] CHATGPT2API_WORKER_PUBLIC_ENTRY_MODE must be direct or proxy."
+  done
 }
 
 CLUSTER_JOIN_TRANSACTION_ACTIVE="${CLUSTER_JOIN_TRANSACTION_ACTIVE:-0}"
@@ -3421,6 +3665,7 @@ cluster_verify_join_file() {
 
 cluster_read_join_file() {
   local join_file="$1"
+  JOIN_VERSION=""
   WORKER_ID=""
   WORKER_NO=""
   WIREGUARD_IP=""
@@ -3443,6 +3688,7 @@ cluster_read_join_file() {
   JOIN_UV_VERSION=""
   while IFS='=' read -r key value; do
     case "${key}" in
+      VERSION) JOIN_VERSION="${value}" ;;
       WORKER_ID) WORKER_ID="${value}" ;;
       WORKER_NO) WORKER_NO="${value}" ;;
       WIREGUARD_IP) WIREGUARD_IP="${value}" ;;
@@ -3466,11 +3712,15 @@ cluster_read_join_file() {
     esac
   done <"${join_file}"
 
-  if [[ -z "${WORKER_ID:-}" || -z "${WORKER_NO:-}" || -z "${WIREGUARD_IP:-}" || -z "${WIREGUARD_SERVER_IP:-}" || -z "${WIREGUARD_SERVER_ENDPOINT:-}" || -z "${WIREGUARD_PORT:-}" || -z "${WIREGUARD_SERVER_PUBLIC_KEY:-}" || -z "${WIREGUARD_WORKER_PRIVATE_KEY:-}" || -z "${WIREGUARD_WORKER_PUBLIC_KEY:-}" || -z "${APP_DATABASE_URL:-}" || -z "${IMAGE_QUEUE_DATABASE_URL:-}" || -z "${TOKEN:-}" || -z "${CLUSTER_ID:-}" || -z "${JOIN_NONCE:-}" || -z "${JOIN_EXPIRES_AT:-}" || -z "${SIGNING_PUBLIC_KEY_B64:-}" || -z "${JOIN_RELEASE_REF:-}" || -z "${JOIN_CHATGPT2API_IMAGE:-}" || -z "${JOIN_CHATGPT2API_IMAGE_DIGEST:-}" || -z "${JOIN_UV_VERSION:-}" ]]; then
+  if [[ -z "${JOIN_VERSION:-}" || -z "${WORKER_ID:-}" || -z "${WORKER_NO:-}" || -z "${WIREGUARD_IP:-}" || -z "${WIREGUARD_SERVER_IP:-}" || -z "${WIREGUARD_SERVER_ENDPOINT:-}" || -z "${WIREGUARD_PORT:-}" || -z "${WIREGUARD_SERVER_PUBLIC_KEY:-}" || -z "${WIREGUARD_WORKER_PRIVATE_KEY:-}" || -z "${WIREGUARD_WORKER_PUBLIC_KEY:-}" || -z "${APP_DATABASE_URL:-}" || -z "${IMAGE_QUEUE_DATABASE_URL:-}" || -z "${TOKEN:-}" || -z "${CLUSTER_ID:-}" || -z "${JOIN_NONCE:-}" || -z "${JOIN_EXPIRES_AT:-}" || -z "${SIGNING_PUBLIC_KEY_B64:-}" || -z "${JOIN_RELEASE_REF:-}" || -z "${JOIN_CHATGPT2API_IMAGE:-}" || -z "${JOIN_CHATGPT2API_IMAGE_DIGEST:-}" || -z "${JOIN_UV_VERSION:-}" ]]; then
     echo "[$(text prefix_error)] join file is missing required fields." >&2
     exit 1
   fi
 
+  if [[ "${JOIN_VERSION}" != "1" ]]; then
+    echo "[$(text prefix_error)] unsupported join file version: ${JOIN_VERSION}" >&2
+    exit 1
+  fi
   if [[ ! "${WORKER_ID}" =~ ^worker-[0-9]+$ ]]; then
     echo "[$(text prefix_error)] join file contains an invalid worker_id: ${WORKER_ID}" >&2
     exit 1
@@ -3759,33 +4009,42 @@ cluster_reconcile_main_databases() {
 
 cluster_main_cmd() {
   local cli_args=("$@")
+  local create_first_worker="0"
   choose_language
   MODE="docker"
+  INSTALL_TARGET="api-main"
   NODE_ROLE="api-main"
   RUN_API="true"
   RUN_WORKER="false"
   STORAGE_BACKEND="postgres"
-  if [[ -z "${PORT}" ]]; then PORT="$(prompt_input "$(text prompt_port)" "3000")"; fi
-  if [[ -z "${BASE_URL}" ]]; then BASE_URL="$(prompt_input "API 后台域名" "${BASE_URL}")"; fi
-  if [[ -z "${INSTALL_DIR}" ]]; then INSTALL_DIR="$(prompt_input "$(text prompt_dir)" "${INSTALL_DIR}")"; fi
-  load_existing_install_env
-  load_release_manifest
   load_existing_install_env
   parse_args "${cli_args[@]}"
   MODE="docker"
+  INSTALL_TARGET="api-main"
   NODE_ROLE="api-main"
   RUN_API="true"
   RUN_WORKER="false"
   STORAGE_BACKEND="postgres"
-  if [[ -z "${BRANCH}" ]]; then
+  ensure_admin_auth_key || exit 1
+  if ! is_noninteractive; then
+    BASE_URL="$(prompt_input "API 后台域名" "${BASE_URL}")"
+    PORT="$(prompt_input "$(text prompt_port)" "${PORT}")"
+    if [[ -z "${POSTGRES_PASSWORD}" ]]; then
+      POSTGRES_PASSWORD="$(prompt_input "PostgreSQL 密码" "")"
+    fi
+    if [[ -z "${POSTGRES_ADMIN_PASSWORD}" ]]; then
+      POSTGRES_ADMIN_PASSWORD="$(prompt_input "PostgreSQL 管理员密码" "")"
+    fi
+    if [[ -z "${WIREGUARD_SERVER_ENDPOINT}" ]]; then
+      WIREGUARD_SERVER_ENDPOINT="$(prompt_input "WireGuard 主节点公网 IP/域名" "${WIREGUARD_SERVER_ENDPOINT}")"
+    fi
+    WIREGUARD_PORT="$(prompt_input "WireGuard 端口" "${WIREGUARD_PORT}")"
+    INSTALL_DIR="$(prompt_input "$(text prompt_dir)" "${INSTALL_DIR}")"
     BRANCH="$(prompt_input "$(text prompt_branch)" "${BRANCH}")"
     RELEASE_REF_SELECTED="1"
   fi
   if [[ "${RELEASE_REF_SELECTED}" == "1" ]]; then
     load_release_manifest
-  fi
-  if [[ -z "${POSTGRES_PASSWORD}" ]]; then
-    POSTGRES_PASSWORD="$(prompt_input "PostgreSQL 密码" "")"
   fi
   if [[ -z "${POSTGRES_PASSWORD}" ]]; then
     POSTGRES_PASSWORD="$(generate_auth_key)"
@@ -3794,16 +4053,6 @@ cluster_main_cmd() {
     POSTGRES_ADMIN_PASSWORD="$(generate_auth_key)"
   fi
   cluster_ensure_cluster_id
-  if [[ -z "${AUTH_KEY}" || "${AUTH_KEY}" == "your_secret_key_here" ]]; then
-    AUTH_KEY="$(prompt_input "$(text prompt_auth)" "")"
-  fi
-  if [[ -z "${AUTH_KEY}" ]]; then
-    AUTH_KEY="$(generate_auth_key)"
-  fi
-  WIREGUARD_PORT="$(prompt_input "WireGuard 端口" "${WIREGUARD_PORT}")"
-  if [[ -z "${WIREGUARD_SERVER_ENDPOINT}" ]]; then
-    WIREGUARD_SERVER_ENDPOINT="$(prompt_input "WireGuard 主节点公网 IP/域名" "${WIREGUARD_SERVER_ENDPOINT}")"
-  fi
   if [[ -z "${WIREGUARD_SERVER_ENDPOINT}" ]]; then
     echo "[$(text prefix_error)] WIREGUARD_SERVER_ENDPOINT is required." >&2
     exit 1
@@ -3812,7 +4061,17 @@ cluster_main_cmd() {
   DATABASE_URL="${APP_DATABASE_URL}"
   IMAGE_QUEUE_DATABASE_URL="$(cluster_external_queue_db_url)"
 
+  local first_worker_choice_status="0"
+  resolve_create_first_worker || first_worker_choice_status="$?"
+  if [[ "${first_worker_choice_status}" == "2" ]]; then
+    exit 1
+  fi
+  if [[ "${first_worker_choice_status}" == "0" ]]; then
+    create_first_worker="1"
+  fi
   validate_inputs
+  print_install_summary
+  confirm_installation
   cluster_prepare_main_bundle
   write_default_config_json
   write_env_file
@@ -3833,11 +4092,12 @@ cluster_main_cmd() {
   cluster_wait_service_healthy "docker-compose.cluster-main.yml" app 180
   wait_cluster_main_liveness
 
-  if confirm "是否自动生成第一个从节点配置" "Y"; then
+  if [[ "${create_first_worker}" == "1" ]]; then
     local first_worker=""
     first_worker="$(prompt_input "第一个 Worker 编号" "1")"
     cluster_write_join_file "${first_worker}"
   fi
+  print_install_summary
 }
 
 cluster_worker_cmd() {
@@ -3849,6 +4109,7 @@ cluster_worker_cmd() {
   local cli_args=("$@")
   choose_language
   MODE="docker"
+  INSTALL_TARGET="worker"
   NODE_ROLE="worker"
   RUN_API="false"
   RUN_WORKER="true"
@@ -3866,27 +4127,44 @@ cluster_worker_cmd() {
   STORAGE_BACKEND="postgres"
   if [[ -z "${join_file}" ]]; then
     join_file="$(cluster_resolve_worker_join_file)" || exit 1
+    if [[ ! -f "${join_file}" ]] && ! is_noninteractive; then
+      join_file="$(prompt_input "Worker join 文件路径" "${join_file}")"
+    fi
   fi
   cluster_verify_join_file "${join_file}"
   cluster_read_join_file "${join_file}"
   if ! cluster_validate_join_release_metadata; then
     exit 1
   fi
+  ui_println "Worker ID: ${WORKER_ID}"
+  ui_println "WireGuard IP: ${WIREGUARD_IP}"
+  ui_println "集群 ID: ${CLUSTER_ID}"
+  ui_println "PostgreSQL DATABASE_URL: ${APP_DATABASE_URL}"
+  ui_println "图片队列 DATABASE_URL: ${IMAGE_QUEUE_DATABASE_URL}"
   IMAGE_QUEUE_INSTANCE_ID="${IMAGE_QUEUE_INSTANCE_ID:-${WORKER_ID}-${JOIN_NONCE}}"
   if [[ -n "${JOIN_EXPIRES_AT:-}" && "$(date +%s)" -gt "${JOIN_EXPIRES_AT}" ]]; then
     echo "[$(text prefix_error)] join file expired." >&2
     exit 1
   fi
-  if [[ -z "${IMAGE_BASE_URL}" ]]; then IMAGE_BASE_URL="$(prompt_input "请输入当前从节点图片返回 URL" "${IMAGE_BASE_URL}")"; fi
+  if ! is_noninteractive; then
+    IMAGE_BASE_URL="$(prompt_input "请输入当前从节点图片返回 URL" "${IMAGE_BASE_URL}")"
+    CHATGPT2API_WORKER_PUBLIC_ENTRY_MODE="$(prompt_worker_public_entry_mode)"
+    IMAGE_PORT="$(prompt_input "图片端口" "${IMAGE_PORT}")"
+    INSTALL_DIR="$(prompt_input "$(text prompt_dir)" "${INSTALL_DIR}")"
+  fi
   if [[ -z "${IMAGE_BASE_URL}" ]]; then
     echo "[$(text prefix_error)] CHATGPT2API_IMAGE_BASE_URL is required." >&2
     exit 1
   fi
-  AUTH_KEY="${AUTH_KEY:-$(generate_auth_key)}"
+  if auth_key_is_placeholder "${AUTH_KEY}"; then
+    AUTH_KEY="$(generate_auth_key)"
+  fi
   POSTGRES_ADMIN_USER=""
   POSTGRES_ADMIN_PASSWORD=""
   DATABASE_URL="${APP_DATABASE_URL}"
   validate_inputs
+  print_install_summary
+  confirm_installation
   cluster_prepare_worker_bundle
   cluster_write_worker_nginx_config
   if ! cluster_confirm_worker_image_proxy; then
@@ -3977,6 +4255,7 @@ cluster_worker_cmd() {
   WORKER_WIREGUARD_CONFIG_ACTIVE="0"
   trap - INT TERM ERR
   cluster_cleanup_worker_join_file "${join_file}"
+  print_install_summary
 }
 
 cluster_wait_worker_runtime_health() {
@@ -4658,38 +4937,75 @@ main() {
   load_existing_install_env
   # Explicit CLI flags remain the highest-priority source on rerun.
   parse_args "$@"
-  if [[ "${MODE}" != "python" ]]; then
-    load_release_manifest
-  fi
-  load_existing_install_env
-  # Explicit CLI flags remain the highest-priority source after manifest loading.
-  parse_args "$@"
+
+  local noninteractive="0"
   if [[ "${NONINTERACTIVE}" =~ ^(1|true|TRUE|yes|YES|y|Y)$ ]]; then
+    noninteractive="1"
     INSTALL_LANG="${INSTALL_LANG:-zh}"
     normalize_language
-    MODE="${MODE:-docker}"
-    MODE="$(normalize_mode_choice "${MODE}")" || { echo "[$(text prefix_error)] $(text err_mode)" >&2; exit 1; }
-    STORAGE_BACKEND="$(normalize_storage_choice "${STORAGE_BACKEND}")" || { echo "[$(text prefix_error)] $(text err_storage)" >&2; exit 1; }
   else
     choose_language
+  fi
 
+  if [[ -z "${INSTALL_TARGET}" ]]; then
+    INSTALL_TARGET="${NODE_ROLE:-standalone}"
+  fi
+  if ! INSTALL_TARGET="$(resolve_install_target "${noninteractive}")"; then
+    INSTALL_TARGET="$(normalize_install_target "${INSTALL_TARGET}")" || {
+      echo "[$(text prefix_error)] $(text err_install_target)" >&2
+      exit 1
+    }
+  fi
+
+  case "${INSTALL_TARGET}" in
+    api-main)
+      cluster_main_cmd "$@"
+      return $?
+      ;;
+    worker)
+      cluster_worker_cmd "" "$@"
+      return $?
+      ;;
+    standalone)
+      NODE_ROLE="standalone"
+      RUN_API="true"
+      RUN_WORKER="true"
+      ;;
+    *)
+      echo "[$(text prefix_error)] $(text err_install_target)" >&2
+      exit 1
+      ;;
+  esac
+  apply_install_storage_defaults
+
+  if [[ "${noninteractive}" == "1" ]]; then
+    MODE="${MODE:-docker}"
+    MODE="$(normalize_mode_choice "${MODE}")" || { echo "[$(text prefix_error)] $(text err_mode)" >&2; exit 1; }
+  else
     if [[ -z "${MODE}" ]]; then
       MODE="$(prompt_mode_choice "docker")"
     else
       MODE="$(normalize_mode_choice "${MODE}")" || { echo "[$(text prefix_error)] $(text err_mode)" >&2; exit 1; }
     fi
+    ensure_admin_auth_key || exit 1
+    BASE_URL="$(prompt_input "CHATGPT2API_BASE_URL（API/图片公网地址）" "${BASE_URL}")"
     PORT="$(prompt_input "$(text prompt_port)" "${PORT}")"
     THREAD_TOKENS="$(prompt_input "$(text prompt_thread_tokens)" "${THREAD_TOKENS}")"
-    BASE_URL="$(prompt_input "CHATGPT2API_BASE_URL (required for standalone public image delivery)" "${BASE_URL}")"
+    while [[ "${STORAGE_BACKEND}" == "postgres" && -z "${DATABASE_URL}" ]]; do
+      DATABASE_URL="$(prompt_input "PostgreSQL DATABASE_URL" "${DATABASE_URL}")"
+      if [[ -z "${DATABASE_URL}" ]]; then
+        ui_println "[$(text prefix_error)] PostgreSQL DATABASE_URL is required."
+      fi
+    done
+    while [[ -z "${IMAGE_QUEUE_DATABASE_URL}" ]]; do
+      IMAGE_QUEUE_DATABASE_URL="$(prompt_input "Image queue PostgreSQL DATABASE_URL" "${IMAGE_QUEUE_DATABASE_URL}")"
+      if [[ -z "${IMAGE_QUEUE_DATABASE_URL}" ]]; then
+        ui_println "[$(text prefix_error)] Image queue PostgreSQL DATABASE_URL is required."
+      fi
+    done
     INSTALL_DIR="$(prompt_input "$(text prompt_dir)" "${INSTALL_DIR}")"
     BRANCH="$(prompt_input "$(text prompt_branch)" "${BRANCH}")"
     RELEASE_REF_SELECTED="1"
-    STORAGE_BACKEND="$(prompt_storage_choice "${STORAGE_BACKEND}")"
-    prompt_storage_details
-
-    if [[ -z "${IMAGE_QUEUE_DATABASE_URL}" ]]; then
-      IMAGE_QUEUE_DATABASE_URL="$(prompt_input "Image queue PostgreSQL URL" "${IMAGE_QUEUE_DATABASE_URL}")"
-    fi
 
     if [[ "${MODE}" == "docker" ]]; then
       if confirm "$(text prompt_warp)" "${WITH_WARP}"; then
@@ -4704,17 +5020,16 @@ main() {
     load_release_manifest
   fi
 
-  if [[ -z "${AUTH_KEY}" || "${AUTH_KEY}" == "your_secret_key_here" ]]; then
-    AUTH_KEY="$(generate_auth_key)"
+  if [[ "${noninteractive}" == "1" ]]; then
+    ensure_admin_auth_key || exit 1
   fi
   if [[ -z "${POSTGRES_PASSWORD}" ]]; then
     POSTGRES_PASSWORD="$(generate_auth_key)"
   fi
-  if [[ ! "${NONINTERACTIVE}" =~ ^(1|true|TRUE|yes|YES|y|Y)$ ]]; then
-    AUTH_KEY="$(prompt_input "$(text prompt_auth)" "${AUTH_KEY}")"
-  fi
 
   validate_inputs
+  print_install_summary
+  confirm_installation
   if [[ "${MODE}" == "docker" ]]; then
     prepare_docker_bundle
   else
@@ -4729,13 +5044,7 @@ main() {
     run_python
   fi
 
-  local config_path="${INSTALL_DIR}/data/config.json"
-  if [[ "${MODE}" == "python" ]]; then
-    config_path="${INSTALL_DIR}/config.json"
-  fi
-  ui_println ""
-  ui_println "[$(text prefix_done)] $(text done_ready): http://localhost:${PORT}"
-  ui_println "[$(text prefix_done)] 管理员密钥已写入 ${INSTALL_DIR}/.env 和 ${config_path}"
+  print_install_summary
 }
 
 if [[ -z "${BASH_SOURCE[0]-}" || "${BASH_SOURCE[0]}" == "${0}" ]]; then

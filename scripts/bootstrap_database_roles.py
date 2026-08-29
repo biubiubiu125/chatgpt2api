@@ -53,15 +53,21 @@ def _targets() -> list[DatabaseTarget]:
     )
     if queue is not None:
         targets.append(queue)
-    storage_backend = str(os.getenv("STORAGE_BACKEND", "json") or "json").strip().lower()
+    storage_backend_env = str(os.getenv("STORAGE_BACKEND", "") or "").strip().lower()
+    database_url = str(os.getenv("DATABASE_URL", "") or "").strip()
     dedicated_app_url = str(os.getenv("APP_DATABASE_URL", "") or "").strip()
-    configured_app_url = (
-        dedicated_app_url
-        if dedicated_app_url
-        else str(os.getenv("DATABASE_URL", "") or "").strip()
-        if storage_backend == "postgres"
-        else ""
-    )
+    if storage_backend_env in {"json", "sqlite", "sqlite3", "git"}:
+        storage_backend = storage_backend_env
+    elif dedicated_app_url:
+        storage_backend = "postgres"
+    elif database_url.lower().startswith(("sqlite:", "sqlite3:")):
+        storage_backend = "sqlite"
+    else:
+        storage_backend = storage_backend_env or "postgres"
+
+    configured_app_url = dedicated_app_url if dedicated_app_url else database_url if storage_backend == "postgres" else ""
+    if storage_backend == "postgres" and not configured_app_url:
+        raise ValueError("APP_DATABASE_URL or DATABASE_URL is required when STORAGE_BACKEND=postgres")
     app = _target(configured_app_url, APP_DATABASE_NAME, "app")
     if app is not None:
         targets.append(app)
