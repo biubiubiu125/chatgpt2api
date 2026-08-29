@@ -7,6 +7,12 @@ HARNESS="$(mktemp)"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -f "${HARNESS}"; rm -rf "${TMP_DIR}"' EXIT
 
+UI_IN="${TMP_DIR}/ui-input"
+UI_OUT="${TMP_DIR}/ui-output"
+: >"${UI_IN}"
+: >"${UI_OUT}"
+export UI_IN UI_OUT
+
 awk '/^case "\$\{1:-\}"/ { exit } { print }' "${INSTALL_SCRIPT}" >"${HARNESS}"
 # shellcheck disable=SC1090
 source "${HARNESS}"
