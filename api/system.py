@@ -66,6 +66,7 @@ SETTINGS_UPDATE_KEYS = {
     "log_retention_days",
     "image_poll_timeout_secs",
     "image_stream_timeout_secs",
+    "text_stream_timeout_secs",
     "image_poll_interval_secs",
     "image_poll_initial_wait_secs",
     "image_account_concurrency",
@@ -190,6 +191,21 @@ class BackupDeleteRequest(BaseModel):
     key: str = ""
 
 
+class BackupDownloadRequest(BaseModel):
+    key: str = ""
+    passphrase: str = ""
+
+
+class BackupDetailRequest(BaseModel):
+    key: str = ""
+    passphrase: str = ""
+
+
+class BackupRestoreRequest(BaseModel):
+    key: str = ""
+    passphrase: str = ""
+
+
 class RetentionCleanupRequest(BaseModel):
     log_retention_days: int | None = None
     image_retention_days: int | None = None
@@ -202,6 +218,21 @@ class AccountCleanupRequest(BaseModel):
 
 def _clean_text(value: object) -> str:
     return str(value or "").strip()
+
+
+def _coerce_bool(value: object, default: bool = True) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    lowered = _clean_text(value).lower()
+    if lowered in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if lowered in {"0", "false", "no", "off", "disabled", "none", "null", ""}:
+        return False
+    return default
 
 
 @lru_cache(maxsize=2)
@@ -402,7 +433,7 @@ def _upsert_proxy_group(body: ProxyGroupRequest) -> dict[str, Any]:
                 "id": node_id,
                 "name": _clean_text(node.get("name")) or node_id,
                 "url": _clean_text(node.get("url")),
-                "enabled": bool(node.get("enabled", True)),
+                "enabled": _coerce_bool(node.get("enabled"), True),
                 "image_concurrency_limit": _coerce_proxy_node_image_concurrency_limit(
                     node.get("image_concurrency_limit")
                     if node.get("image_concurrency_limit") is not None
@@ -429,7 +460,7 @@ def _upsert_proxy_group(body: ProxyGroupRequest) -> dict[str, Any]:
 def _resolve_profile_proxy(profile_id: str) -> str:
     normalized = _proxy_profile_id(profile_id)
     for profile in _config_dict_list("proxy_profiles"):
-        if profile.get("id") == normalized and profile.get("enabled", True):
+        if profile.get("id") == normalized and _coerce_bool(profile.get("enabled"), True):
             return _clean_text(profile.get("proxy"))
     return ""
 
@@ -953,7 +984,7 @@ def create_router(app_version: str) -> APIRouter:
         nodes = [
             node for node in group.get("nodes", [])
             if isinstance(node, dict)
-            and node.get("enabled", True)
+            and _coerce_bool(node.get("enabled"), True)
             and _clean_text(node.get("url"))
             and (not node_id or node.get("id") == node_id)
         ]
@@ -1114,19 +1145,61 @@ def create_router(app_version: str) -> APIRouter:
         except BackupError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
-    @router.get("/api/backups/detail")
-    async def get_backup_detail(key: str = "", authorization: str | None = Header(default=None)):
+    @router.post("/api/backups/restore")
+    async def restore_backup_endpoint(body: BackupRestoreRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         try:
-            return {"item": await run_in_threadpool(backup_service.get_backup_detail, key)}
+            return {"result": await run_in_threadpool(backup_service.restore_backup, body.key, passphrase=body.passphrase)}
+        except BackupError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    @router.get("/api/backups/detail")
+    async def get_backup_detail(
+        key: str = "",
+        passphrase: str = "",
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        try:
+            return {
+                "item": await run_in_threadpool(
+                    backup_service.get_backup_detail,
+                    key,
+                    passphrase=passphrase,
+                )
+            }
+        except BackupError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    @router.post("/api/backups/detail")
+    async def get_backup_detail_post(
+        body: BackupDetailRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        try:
+            return {
+                "item": await run_in_threadpool(
+                    backup_service.get_backup_detail,
+                    body.key,
+                    passphrase=body.passphrase,
+                )
+            }
         except BackupError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
     @router.get("/api/backups/download")
-    async def download_backup_endpoint(key: str = "", authorization: str | None = Header(default=None)):
+    async def download_backup_endpoint(
+        key: str = "",
+        passphrase: str = "",
+        authorization: str | None = Header(default=None),
+    ):
         require_admin(authorization)
+        return await _download_backup_file(key, passphrase)
+
+    async def _download_backup_file(key: str, passphrase: str = ""):
         try:
-            item = await run_in_threadpool(backup_service.prepare_backup_download, key)
+            item = await run_in_threadpool(backup_service.prepare_backup_download, key, passphrase=passphrase)
         except BackupError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         filename = str(item.get("name") or "backup.bin")
@@ -1143,6 +1216,11 @@ def create_router(app_version: str) -> APIRouter:
             filename=filename,
             background=BackgroundTask(cleanup) if callable(cleanup) else None,
         )
+
+    @router.post("/api/backups/download")
+    async def download_backup_post_endpoint(body: BackupDownloadRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await _download_backup_file(body.key, body.passphrase)
 
 
     @router.get("/api/images/tags")

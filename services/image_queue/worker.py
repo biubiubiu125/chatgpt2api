@@ -12,7 +12,6 @@ from uuid import uuid4
 from services.cluster_settings import load_cluster_settings
 from services.image_failure import classify_image_exception
 from services.config import config
-from services.image_delivery import is_url_only_result
 from services.image_queue.repository import ImageQueueRepository
 from services.image_queue.resource_controller import ResourceController
 from services.image_queue.retry_policy import RetryPolicy
@@ -129,7 +128,7 @@ class ImageWorkerManager:
             min(float(settings.heartbeat_seconds), max(0.1, float(repository.lease_seconds) / 2.0)),
         )
         self._next_recovery_at = 0.0
-        self.cluster_settings = load_cluster_settings()
+        self.cluster_settings = load_cluster_settings(resolve_image_base_host=True)
         instance = str(getattr(settings, "instance_id", "") or os.getenv("IMAGE_QUEUE_INSTANCE_ID") or "").strip()
         suffix = uuid4()
         configured_worker_id = self.cluster_settings.worker_id
@@ -777,8 +776,6 @@ class ImageWorkerManager:
             getattr(job, "quota_consumed", False)
             and not getattr(job, "quota_accounted", False)
         )
-        if success and quota_consumed and is_url_only_result(getattr(job, "result_payload", {}) or {}):
-            return
         if claim.account_slot < 0 and not quota_consumed:
             return
         recorded = self._record_account_result(
@@ -794,8 +791,6 @@ class ImageWorkerManager:
     def _reconcile_unaccounted_quotas(self) -> None:
         for job in self.repository.list_unaccounted_terminal_quota_jobs():
             if job.account_id is None:
-                continue
-            if job.status.value == "success" and is_url_only_result(getattr(job, "result_payload", {}) or {}):
                 continue
             recorded = self._record_account_result(
                 job.account_id,

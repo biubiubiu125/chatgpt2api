@@ -137,6 +137,7 @@ const emit = defineEmits<{
   resend: [message: StudioMessage]
   'retry-assistant': [message: StudioMessage]
   'resume-image-task': [message: StudioMessage]
+  'cancel-image-task': [message: StudioMessage]
   'delete-message': [messageId: string]
   'copy-message': [content: string]
   preview: [src: string, name: string, localPath?: string]
@@ -679,6 +680,7 @@ function handleMessageAction(action: StudioMessageActionKey, message: StudioMess
   else if (action === 'fill') emit('retry', message)
   else if (action === 'retry') emit('retry-assistant', message)
   else if (action === 'resume-image') emit('resume-image-task', message)
+  else if (action === 'cancel-image') emit('cancel-image-task', message)
   else if (action === 'delete') emit('delete-message', message.id)
 }
 

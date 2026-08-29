@@ -44,9 +44,9 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     lowered = value.strip().lower()
-    if lowered in {"1", "true", "yes", "on"}:
+    if lowered in {"1", "true", "yes", "y", "on", "enabled"}:
         return True
-    if lowered in {"0", "false", "no", "off"}:
+    if lowered in {"0", "false", "no", "n", "off", "disabled", "none", "null", ""}:
         return False
     return default
 
@@ -54,12 +54,15 @@ def _env_bool(name: str, default: bool) -> bool:
 def _bool_value(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"1", "true", "yes", "on"}:
-            return True
-        if lowered in {"0", "false", "no", "off"}:
-            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if value is None:
+        return default
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on", "enabled"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off", "disabled", "none", "null", ""}:
+        return False
     return default
 
 
@@ -219,7 +222,7 @@ def main() -> int:
     clearance = runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {}
     print(
         "Proxy runtime summary: "
-        f"enabled={bool(runtime.get('enabled'))}, "
+        f"enabled={_bool_value(runtime.get('enabled'))}, "
         f"egress_mode={runtime.get('egress_mode')}, "
         f"proxy_url={_mask_url(str(runtime.get('proxy_url') or ''))}, "
         f"clearance_mode={clearance.get('mode')}, "

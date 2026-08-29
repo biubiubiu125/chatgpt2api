@@ -70,12 +70,13 @@ def urlopen(request: Request, timeout: float):  # noqa: ANN201
             payload = bytearray()
             too_large = False
 
-            def receive(chunk: bytes) -> None:
+            def receive(chunk: bytes) -> int:
                 nonlocal too_large
                 if max_bytes > 0 and len(payload) + len(chunk) > max_bytes:
                     too_large = True
                     raise _ReturnedUrlResponseTooLarge()
                 payload.extend(chunk)
+                return len(chunk)
 
             try:
                 session = curl_requests.Session(
@@ -185,6 +186,9 @@ def validate_public_image_base_url(value: object, *, resolve_host: bool = False)
             "worker image base URL must be an http or https URL without query or fragment"
         )
     _validate_public_host(parsed, resolve_dns=resolve_host)
+    path = parsed.path.rstrip("/")
+    if path not in {"", "/images"}:
+        raise ReturnedUrlVerificationError("worker image base URL path must be empty or /images")
     return text
 
 

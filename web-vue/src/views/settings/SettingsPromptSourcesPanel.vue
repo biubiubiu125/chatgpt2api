@@ -48,7 +48,7 @@
             <a
               :href="promptSourceHref(source) || undefined"
               :target="promptSourceHref(source) ? '_blank' : undefined"
-              rel="noreferrer"
+              rel="noopener noreferrer"
               class="settings-prompt-source-url"
               @click="!promptSourceHref(source) && $event.preventDefault()"
             >

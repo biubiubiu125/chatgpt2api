@@ -334,7 +334,9 @@ def _download_image_bytes_with_monitor(
     return downloaded_images
 
 
-def is_token_invalid_error(message: str) -> bool:
+def is_token_invalid_error(message: object) -> bool:
+    if isinstance(message, UpstreamHTTPError) and int(getattr(message, "status_code", 0) or 0) in {401, 403}:
+        return True
     text = str(message or "").lower()
     return (
         "token_invalidated" in text
@@ -379,6 +381,41 @@ def message_text(content: Any) -> str:
     return ""
 
 
+def _compact_json(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        return str(value or "")
+
+
+def _tool_calls_text(message: dict[str, Any]) -> str:
+    calls = message.get("tool_calls")
+    if not isinstance(calls, list) or not calls:
+        return ""
+    serialized: list[dict[str, Any]] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        serialized.append({
+            "id": str(call.get("id") or "").strip(),
+            "type": str(call.get("type") or "function").strip() or "function",
+            "name": str(function.get("name") or call.get("name") or "").strip(),
+            "arguments": function.get("arguments") if "arguments" in function else call.get("arguments"),
+        })
+    if not serialized:
+        return ""
+    return "Assistant tool calls:\n" + _compact_json(serialized)
+
+
+def _tool_result_text(message: dict[str, Any], text: str) -> str:
+    tool_call_id = str(message.get("tool_call_id") or message.get("id") or "").strip()
+    name = str(message.get("name") or "").strip()
+    label = tool_call_id or name
+    prefix = f"Tool result {label}:" if label else "Tool result:"
+    return f"{prefix} {text}".strip()
+
+
 def normalize_messages(messages: object, system: Any = None) -> list[dict[str, Any]]:
     normalized = []
     image_count = 0
@@ -392,9 +429,15 @@ def normalize_messages(messages: object, system: Any = None) -> list[dict[str, A
         for message in messages:
             if not isinstance(message, dict):
                 continue
-            role = message.get("role", "user")
+            role = str(message.get("role") or "user").strip().lower() or "user"
             content = message.get("content", "")
             text = message_text(content)
+            if role == "assistant":
+                tool_calls_text = _tool_calls_text(message)
+                if tool_calls_text:
+                    text = f"{text}\n\n{tool_calls_text}".strip()
+            elif role in {"tool", "function"}:
+                text = _tool_result_text(message, text)
             images: list[tuple[bytes, str]] = []
             if role == "user":
                 images.extend(extract_image_from_message_content(content))
@@ -1076,53 +1119,72 @@ def _remember_text_account(backend: OpenAIBackendAPI, access_token: str) -> str:
 
 def text_backend() -> OpenAIBackendAPI:
     access_token = account_service.get_text_access_token()
+    if not access_token:
+        raise RuntimeError("no available text account")
     backend = OpenAIBackendAPI(access_token=access_token)
     _remember_text_account(backend, access_token)
     return backend
 
 
+def _close_backend_safely(backend: OpenAIBackendAPI | None) -> None:
+    if backend is None:
+        return
+    close = getattr(backend, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception:
+        pass
+
+
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
     attempted_tokens: set[str] = set()
-    token = getattr(backend, "access_token", "")
+    token = str(getattr(backend, "access_token", "") or "").strip()
     emitted = False
-    while True:
-        if token and token in attempted_tokens:
-            raise RuntimeError("no available text account")
-        if token:
+    active_backend: OpenAIBackendAPI | None = backend
+    try:
+        while True:
+            if not token or token in attempted_tokens:
+                raise RuntimeError("no available text account")
             attempted_tokens.add(token)
-        active_backend: OpenAIBackendAPI | None = None
-        try:
             _remember_text_account(backend, token)
-            active_backend = OpenAIBackendAPI(access_token=token)
-            _remember_text_account(active_backend, token)
-            for event in conversation_events(
-                active_backend,
-                messages=request.messages,
-                model=request.model,
-                prompt=request.prompt,
-                thinking_effort=request.thinking_effort,
-            ):
-                if event.get("type") != "conversation.delta":
-                    continue
-                delta = str(event.get("delta") or "")
-                if delta:
-                    emitted = True
-                    yield delta
-            account_service.mark_text_used(token)
-            return
-        except Exception as exc:
-            error_message = str(exc)
-            if token and not emitted and is_token_invalid_error(error_message):
-                account_service.schedule_auth_verification(token, "text_stream")
-                token = account_service.get_text_access_token(attempted_tokens)
-                if token:
-                    continue
-            if token and not getattr(exc, "account_email", ""):
-                setattr(exc, "account_email", _text_account_email(token))
-            raise
-        finally:
-            if active_backend is not None:
-                active_backend.close()
+            if active_backend is not backend:
+                _remember_text_account(active_backend, token)
+            try:
+                for event in conversation_events(
+                    active_backend,
+                    messages=request.messages,
+                    model=request.model,
+                    prompt=request.prompt,
+                    thinking_effort=request.thinking_effort,
+                ):
+                    if event.get("type") != "conversation.delta":
+                        continue
+                    delta = str(event.get("delta") or "")
+                    if delta:
+                        emitted = True
+                        yield delta
+                account_service.mark_text_used(token)
+                return
+            except Exception as exc:
+                error_message = str(exc)
+                if not emitted and is_token_invalid_error(exc):
+                    account_service.schedule_auth_verification(token, "text_stream")
+                    next_token = str(account_service.get_text_access_token(attempted_tokens) or "").strip()
+                    if next_token:
+                        _close_backend_safely(active_backend)
+                        active_backend = OpenAIBackendAPI(access_token=next_token)
+                        _remember_text_account(backend, next_token)
+                        token = next_token
+                        emitted = False
+                        continue
+                    raise RuntimeError("no available text account") from exc
+                if not getattr(exc, "account_email", ""):
+                    setattr(exc, "account_email", _text_account_email(token))
+                raise
+    finally:
+        _close_backend_safely(active_backend)
 
 
 def collect_text(backend: OpenAIBackendAPI, request: ConversationRequest) -> str:

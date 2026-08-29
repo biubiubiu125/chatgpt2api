@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+from pathlib import PurePosixPath, PureWindowsPath
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -39,6 +40,8 @@ class GitStorageBackend(StorageBackend):
         self.branch = branch
         self.file_path = file_path
         self.auth_keys_file_path = auth_keys_file_path
+        self._validate_configured_file_path(self.file_path)
+        self._validate_configured_file_path(self.auth_keys_file_path)
         
         # 本地缓存目录
         if local_cache_dir is None:
@@ -49,6 +52,20 @@ class GitStorageBackend(StorageBackend):
         
         # 构建带认证的 Git URL
         self.auth_repo_url = self._build_auth_url(repo_url, token)
+
+    @staticmethod
+    def _validate_configured_file_path(file_path: str) -> tuple[str, ...]:
+        normalized = str(file_path or "").strip().replace("\\", "/")
+        path = PurePosixPath(normalized)
+        if (
+            not normalized
+            or path.is_absolute()
+            or PureWindowsPath(normalized).is_absolute()
+            or not path.parts
+            or any(part in {"", ".", ".."} for part in path.parts)
+        ):
+            raise ValueError("Git storage file paths must be relative and stay inside the repository")
+        return path.parts
 
     @staticmethod
     def _build_auth_url(repo_url: str, token: str) -> str:
@@ -187,10 +204,18 @@ class GitStorageBackend(StorageBackend):
 
     def _load_json_value(self, file_path: str) -> Any:
         repo = self._clone_or_pull()
-        file_full_path = Path(repo.working_dir) / file_path
+        file_full_path = self._repo_file_path(repo, file_path)
         if not file_full_path.exists():
             return None
         return read_json_file(file_full_path, name=file_path, default_factory=lambda: None)
+
+    def _repo_file_path(self, repo: Repo, file_path: str) -> Path:
+        parts = self._validate_configured_file_path(file_path)
+        root = Path(repo.working_dir).resolve()
+        target = root.joinpath(*parts).resolve(strict=False)
+        if not target.is_relative_to(root):
+            raise ValueError("Git storage file path escapes the repository")
+        return target
 
     def _save_merged_list(
         self,
@@ -227,7 +252,8 @@ class GitStorageBackend(StorageBackend):
 
     def _save_json_file(self, file_path: str, items: Any, message: str) -> None:
         repo = self._clone_or_pull()
-        file_full_path = Path(repo.working_dir) / file_path
+        self._validate_configured_file_path(file_path)
+        file_full_path = self._repo_file_path(repo, file_path)
         write_json_file(file_full_path, items, backup=False)
         repo.index.add([file_path])
         if repo.is_dirty():

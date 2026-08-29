@@ -1,10 +1,28 @@
 services:
+  data-permissions:
+    image: ${CHATGPT2API_IMAGE:-ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a}
+    container_name: ${CHATGPT2API_WORKER_ID:-chatgpt2api-worker}-data-permissions
+    user: "0:0"
+    volumes:
+      - ./data:/app/data
+    command:
+      - sh
+      - -ec
+      - |
+        mkdir -p /app/data/images
+        find /app/data -mindepth 1 -maxdepth 1 ! -name postgres -exec chown -R 10001:10001 {} +
+        chown 10001:10001 /app/data
+    restart: "no"
+
   app:
-    image: ${CHATGPT2API_IMAGE:-ghcr.io/biubiubiu125/chatgpt2api:latest}
+    image: ${CHATGPT2API_IMAGE:-ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a}
     container_name: ${CHATGPT2API_WORKER_ID:-chatgpt2api-worker}
     restart: unless-stopped
+    depends_on:
+      data-permissions:
+        condition: service_completed_successfully
     ports:
-      - "127.0.0.1:${CHATGPT2API_IMAGE_PORT:-3000}:80"
+      - "${CHATGPT2API_WORKER_BIND_HOST:-127.0.0.1}:${CHATGPT2API_IMAGE_PORT:-3000}:3000"
     volumes:
       - ./data:/app/data
     environment:
@@ -40,11 +58,44 @@ services:
       IMAGE_QUEUE_MAX_BACKLOG: ${IMAGE_QUEUE_MAX_BACKLOG:-50}
       IMAGE_QUEUE_PENDING_TTL_SECONDS: ${IMAGE_QUEUE_PENDING_TTL_SECONDS:-1800}
       IMAGE_QUEUE_CLAIM_MAX_RUNTIME_SECONDS: ${IMAGE_QUEUE_CLAIM_MAX_RUNTIME_SECONDS:-1800}
+      IMAGE_QUEUE_LEGACY_TASK_PATH: ${IMAGE_QUEUE_LEGACY_TASK_PATH:-}
+      IMAGE_QUEUE_LEASE_SECONDS: ${IMAGE_QUEUE_LEASE_SECONDS:-}
+      IMAGE_QUEUE_HEARTBEAT_SECONDS: ${IMAGE_QUEUE_HEARTBEAT_SECONDS:-}
+      IMAGE_QUEUE_POLL_INTERVAL_SECONDS: ${IMAGE_QUEUE_POLL_INTERVAL_SECONDS:-}
+      IMAGE_QUEUE_RESULT_WAIT_POLL_SECONDS: ${IMAGE_QUEUE_RESULT_WAIT_POLL_SECONDS:-}
+      IMAGE_QUEUE_GENERATION_ATTEMPTS: ${IMAGE_QUEUE_GENERATION_ATTEMPTS:-}
+      IMAGE_QUEUE_DOWNLOAD_ATTEMPTS: ${IMAGE_QUEUE_DOWNLOAD_ATTEMPTS:-}
+      IMAGE_QUEUE_SAVE_ATTEMPTS: ${IMAGE_QUEUE_SAVE_ATTEMPTS:-}
+      IMAGE_QUEUE_CPU_THROTTLE_PERCENT: ${IMAGE_QUEUE_CPU_THROTTLE_PERCENT:-}
+      IMAGE_QUEUE_CPU_PAUSE_PERCENT: ${IMAGE_QUEUE_CPU_PAUSE_PERCENT:-}
+      IMAGE_QUEUE_CPU_RESUME_PERCENT: ${IMAGE_QUEUE_CPU_RESUME_PERCENT:-}
+      IMAGE_QUEUE_MEMORY_THROTTLE_PERCENT: ${IMAGE_QUEUE_MEMORY_THROTTLE_PERCENT:-}
+      IMAGE_QUEUE_MEMORY_PAUSE_PERCENT: ${IMAGE_QUEUE_MEMORY_PAUSE_PERCENT:-}
+      IMAGE_QUEUE_MEMORY_REJECT_PERCENT: ${IMAGE_QUEUE_MEMORY_REJECT_PERCENT:-}
+      IMAGE_QUEUE_DB_POOL_SIZE: ${IMAGE_QUEUE_DB_POOL_SIZE:-}
+      IMAGE_QUEUE_DB_MAX_OVERFLOW: ${IMAGE_QUEUE_DB_MAX_OVERFLOW:-}
+      EDITABLE_FILE_WORKERS: ${EDITABLE_FILE_WORKERS:-}
+      EDITABLE_FILE_MAX_BACKLOG: ${EDITABLE_FILE_MAX_BACKLOG:-}
+      PROMPT_LIBRARY_DEFAULT_URL: ${PROMPT_LIBRARY_DEFAULT_URL:-}
+      PROMPT_LIBRARY_REMOTE_URL: ${PROMPT_LIBRARY_REMOTE_URL:-}
       CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
+      CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
+      CHATGPT2API_BACKUP_PASSPHRASE: ${CHATGPT2API_BACKUP_PASSPHRASE:-}
+      CHATGPT2API_MONITOR_COMPLETED_LIMIT: ${CHATGPT2API_MONITOR_COMPLETED_LIMIT:-}
+      CHATGPT2API_MONITOR_EVENT_LIMIT: ${CHATGPT2API_MONITOR_EVENT_LIMIT:-}
+      CHATGPT2API_QUOTA_RESERVATION_TTL_SECONDS: ${CHATGPT2API_QUOTA_RESERVATION_TTL_SECONDS:-}
+      CHATGPT2API_RUNTIME_LOG_FILE: ${CHATGPT2API_RUNTIME_LOG_FILE:-}
       CHATGPT2API_THREAD_TOKENS: ${CHATGPT2API_THREAD_TOKENS:-}
+      HOST: ${HOST:-0.0.0.0}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-}
       TZ: ${TZ:-Asia/Shanghai}
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1/health?format=json&scope=runtime', timeout=5).status == 200 else 1)\""]
+      # During first join activation the worker intentionally keeps the queue
+      # stopped until the app database token is finalized.  Healthcheck must
+      # therefore describe process liveness; runtime readiness is checked by
+      # the installer after activation.
+      test: ["CMD-SHELL", "python -c \"import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:3000/health/live?format=json', timeout=5).status == 200 else 1)\""]
       interval: 30s
       timeout: 6s
       retries: 5

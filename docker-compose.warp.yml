@@ -1,11 +1,46 @@
 services:
+  data-permissions:
+    image: ${CHATGPT2API_IMAGE:-ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a}
+    container_name: chatgpt2api-warp-data-permissions
+    user: "0:0"
+    volumes:
+      - ./data:/app/data
+    command:
+      - sh
+      - -ec
+      - |
+        mkdir -p /app/data/images
+        find /app/data -mindepth 1 -maxdepth 1 ! -name postgres -exec chown -R 10001:10001 {} +
+        chown 10001:10001 /app/data
+    restart: "no"
+
+  database-init:
+    image: ${CHATGPT2API_IMAGE:-ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a}
+    container_name: chatgpt2api-warp-database-init
+    working_dir: /app
+    volumes:
+      - ./scripts/bootstrap_database_roles.py:/app/scripts/bootstrap_database_roles.py:ro
+      - ./scripts/env_loader.py:/app/scripts/env_loader.py:ro
+    environment:
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-json}
+      APP_DATABASE_URL: ${APP_DATABASE_URL:-}
+      DATABASE_URL: ${DATABASE_URL:-}
+      IMAGE_QUEUE_DATABASE_URL: "${IMAGE_QUEUE_DATABASE_URL:?IMAGE_QUEUE_DATABASE_URL is required for durable image APIs}"
+      CHATGPT2API_DATABASE_BOOTSTRAP_ATTEMPTS: ${CHATGPT2API_DATABASE_BOOTSTRAP_ATTEMPTS:-30}
+      CHATGPT2API_DATABASE_BOOTSTRAP_DELAY_SECONDS: ${CHATGPT2API_DATABASE_BOOTSTRAP_DELAY_SECONDS:-2}
+    command: ["/app/.venv/bin/python", "-m", "scripts.bootstrap_database_roles"]
+    restart: "no"
+
   init-config:
-    image: python:3.13-alpine
+    image: ${CHATGPT2API_IMAGE:-ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a}
     container_name: chatgpt2api-warp-init
     working_dir: /app
     volumes:
       - ./data:/app/data
-      - ./scripts:/app/scripts:ro
+      - ./scripts/init_proxy_config.py:/app/scripts/init_proxy_config.py:ro
+    depends_on:
+      data-permissions:
+        condition: service_completed_successfully
     environment:
       CHATGPT2API_CONFIG_FILE: /app/data/config.json
       CHATGPT2API_PROXY_RUNTIME_ENABLED: ${CHATGPT2API_PROXY_RUNTIME_ENABLED:-true}
@@ -22,17 +57,16 @@ services:
       CHATGPT2API_PROXY_RUNTIME_BROWSER: ${CHATGPT2API_PROXY_RUNTIME_BROWSER:-chrome}
       CHATGPT2API_PROXY_RUNTIME_USER_AGENT: ${CHATGPT2API_PROXY_RUNTIME_USER_AGENT:-}
       CHATGPT2API_FLARESOLVERR_URL: ${CHATGPT2API_FLARESOLVERR_URL:-http://flaresolverr:8191}
-    command: ["python3", "/app/scripts/init_proxy_config.py"]
+    command: ["/app/.venv/bin/python", "/app/scripts/init_proxy_config.py"]
     restart: "no"
 
   warp-proxy:
-    image: caomingjun/warp:latest
+    image: ${CHATGPT2API_WARP_IMAGE:?CHATGPT2API_WARP_IMAGE must be set to an immutable image reference}
     container_name: chatgpt2api-warp-proxy
     restart: unless-stopped
     environment:
       WARP_SLEEP: "2"
-      # 可选：填写 Cloudflare WARP+ License Key
-      # WARP_LICENSE_KEY: ${WARP_LICENSE_KEY:-}
+      WARP_LICENSE_KEY: ${WARP_LICENSE_KEY:-}
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
@@ -42,32 +76,32 @@ services:
     ports:
       - "127.0.0.1:${WARP_SOCKS_PORT:-40000}:1080"
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.create_connection(('127.0.0.1', 1080), 5); s.close()\""]
+      test: ["CMD", "/healthcheck/index.sh"]
       interval: 30s
       timeout: 5s
       retries: 5
       start_period: 30s
 
   privoxy:
-    image: vimagick/privoxy:latest
+    image: ${CHATGPT2API_PRIVOXY_IMAGE:?CHATGPT2API_PRIVOXY_IMAGE must be set to an immutable image reference}
     container_name: chatgpt2api-privoxy
     restart: unless-stopped
     depends_on:
       warp-proxy:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ./scripts/privoxy-warp.conf:/etc/privoxy/config:ro
     ports:
       - "127.0.0.1:${PRIVOXY_PORT:-40080}:8118"
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 8118 || exit 1"]
+      test: ["CMD-SHELL", "wget -q --spider --timeout=5 http://127.0.0.1:8118/ || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 5
       start_period: 10s
 
   flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:latest
+    image: ${CHATGPT2API_FLARESOLVERR_IMAGE:-flaresolverr/flaresolverr@sha256:139dfee1c6f89249c8d665d1333a42e8ec74ec0a86bc6bb1c8461e10d3a66a47}
     container_name: chatgpt2api-flaresolverr
     restart: unless-stopped
     environment:
@@ -83,18 +117,22 @@ services:
       start_period: 30s
 
   app:
-    image: ${CHATGPT2API_IMAGE:-ghcr.io/biubiubiu125/chatgpt2api:latest}
+    image: ${CHATGPT2API_IMAGE:-ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a}
     container_name: chatgpt2api-warp
     restart: unless-stopped
     depends_on:
+      database-init:
+        condition: service_completed_successfully
       init-config:
         condition: service_completed_successfully
+      data-permissions:
+        condition: service_completed_successfully
       privoxy:
-        condition: service_started
+        condition: service_healthy
       flaresolverr:
-        condition: service_started
+        condition: service_healthy
     ports:
-      - "127.0.0.1:${CHATGPT2API_PORT:-3000}:80"
+      - "127.0.0.1:${CHATGPT2API_PORT:-3000}:3000"
     volumes:
       - ./data:/app/data
     environment:
@@ -110,6 +148,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:-}
       IMAGE_QUEUE_DATABASE_URL: "${IMAGE_QUEUE_DATABASE_URL:?IMAGE_QUEUE_DATABASE_URL is required for durable image APIs}"
       IMAGE_QUEUE_ARTIFACT_ROOT: /app/data/images
+      IMAGE_QUEUE_INSTANCE_ID: ${IMAGE_QUEUE_INSTANCE_ID:-}
       IMAGE_PROMPT_SUFFIX_ENABLED: ${IMAGE_PROMPT_SUFFIX_ENABLED:-true}
       IMAGE_PROMPT_SUFFIX: ${IMAGE_PROMPT_SUFFIX:-}
       IMAGE_QUEUE_RECOVERY_ACCOUNT_TIMEOUT_SECONDS: ${IMAGE_QUEUE_RECOVERY_ACCOUNT_TIMEOUT_SECONDS:-900}
@@ -127,17 +166,45 @@ services:
       IMAGE_QUEUE_MAX_BACKLOG: ${IMAGE_QUEUE_MAX_BACKLOG:-50}
       IMAGE_QUEUE_PENDING_TTL_SECONDS: ${IMAGE_QUEUE_PENDING_TTL_SECONDS:-1800}
       IMAGE_QUEUE_CLAIM_MAX_RUNTIME_SECONDS: ${IMAGE_QUEUE_CLAIM_MAX_RUNTIME_SECONDS:-1800}
+      IMAGE_QUEUE_LEGACY_TASK_PATH: ${IMAGE_QUEUE_LEGACY_TASK_PATH:-}
+      IMAGE_QUEUE_LEASE_SECONDS: ${IMAGE_QUEUE_LEASE_SECONDS:-}
+      IMAGE_QUEUE_HEARTBEAT_SECONDS: ${IMAGE_QUEUE_HEARTBEAT_SECONDS:-}
+      IMAGE_QUEUE_POLL_INTERVAL_SECONDS: ${IMAGE_QUEUE_POLL_INTERVAL_SECONDS:-}
+      IMAGE_QUEUE_RESULT_WAIT_POLL_SECONDS: ${IMAGE_QUEUE_RESULT_WAIT_POLL_SECONDS:-}
+      IMAGE_QUEUE_GENERATION_ATTEMPTS: ${IMAGE_QUEUE_GENERATION_ATTEMPTS:-}
+      IMAGE_QUEUE_DOWNLOAD_ATTEMPTS: ${IMAGE_QUEUE_DOWNLOAD_ATTEMPTS:-}
+      IMAGE_QUEUE_SAVE_ATTEMPTS: ${IMAGE_QUEUE_SAVE_ATTEMPTS:-}
+      IMAGE_QUEUE_CPU_THROTTLE_PERCENT: ${IMAGE_QUEUE_CPU_THROTTLE_PERCENT:-}
+      IMAGE_QUEUE_CPU_PAUSE_PERCENT: ${IMAGE_QUEUE_CPU_PAUSE_PERCENT:-}
+      IMAGE_QUEUE_CPU_RESUME_PERCENT: ${IMAGE_QUEUE_CPU_RESUME_PERCENT:-}
+      IMAGE_QUEUE_MEMORY_THROTTLE_PERCENT: ${IMAGE_QUEUE_MEMORY_THROTTLE_PERCENT:-}
+      IMAGE_QUEUE_MEMORY_PAUSE_PERCENT: ${IMAGE_QUEUE_MEMORY_PAUSE_PERCENT:-}
+      IMAGE_QUEUE_MEMORY_REJECT_PERCENT: ${IMAGE_QUEUE_MEMORY_REJECT_PERCENT:-}
+      IMAGE_QUEUE_DB_POOL_SIZE: ${IMAGE_QUEUE_DB_POOL_SIZE:-}
+      IMAGE_QUEUE_DB_MAX_OVERFLOW: ${IMAGE_QUEUE_DB_MAX_OVERFLOW:-}
+      EDITABLE_FILE_WORKERS: ${EDITABLE_FILE_WORKERS:-}
+      EDITABLE_FILE_MAX_BACKLOG: ${EDITABLE_FILE_MAX_BACKLOG:-}
+      PROMPT_LIBRARY_DEFAULT_URL: ${PROMPT_LIBRARY_DEFAULT_URL:-}
+      PROMPT_LIBRARY_REMOTE_URL: ${PROMPT_LIBRARY_REMOTE_URL:-}
       GIT_REPO_URL: ${GIT_REPO_URL:-}
       GIT_TOKEN: ${GIT_TOKEN:-}
       GIT_BRANCH: ${GIT_BRANCH:-main}
       GIT_FILE_PATH: ${GIT_FILE_PATH:-accounts.json}
       GIT_AUTH_KEYS_FILE_PATH: ${GIT_AUTH_KEYS_FILE_PATH:-auth_keys.json}
       CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
+      CHATGPT2API_BACKUP_PASSPHRASE: ${CHATGPT2API_BACKUP_PASSPHRASE:-}
+      CHATGPT2API_MONITOR_COMPLETED_LIMIT: ${CHATGPT2API_MONITOR_COMPLETED_LIMIT:-}
+      CHATGPT2API_MONITOR_EVENT_LIMIT: ${CHATGPT2API_MONITOR_EVENT_LIMIT:-}
+      CHATGPT2API_QUOTA_RESERVATION_TTL_SECONDS: ${CHATGPT2API_QUOTA_RESERVATION_TTL_SECONDS:-}
+      CHATGPT2API_RUNTIME_LOG_FILE: ${CHATGPT2API_RUNTIME_LOG_FILE:-}
       CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
       CHATGPT2API_THREAD_TOKENS: ${CHATGPT2API_THREAD_TOKENS:-}
+      HOST: ${HOST:-0.0.0.0}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-}
       TZ: ${TZ:-Asia/Shanghai}
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1/health?format=json&scope=runtime', timeout=5).status == 200 else 1)\""]
+      test: ["CMD-SHELL", "python -c \"import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:3000/health?format=json&scope=runtime', timeout=5).status == 200 else 1)\""]
       interval: 30s
       timeout: 6s
       retries: 5

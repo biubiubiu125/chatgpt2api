@@ -881,6 +881,7 @@ class ImageTaskService:
             remaining_paths = {
                 artifact.relative_path
                 for artifact in self._require_repository().list_artifacts(task_id)
+                if artifact.status != ArtifactStatus.INVALID
             }
         except Exception as exc:
             logger.warning({
@@ -911,6 +912,19 @@ class ImageTaskService:
                 "event": "image_requeued_artifact_cleanup_incomplete",
                 "task_id": str(task_id),
                 "artifact_count": len(discarded),
+            })
+            return
+        try:
+            self._require_repository().remove_invalid_artifacts(
+                task_id,
+                tuple(artifact.relative_path for artifact in discarded),
+            )
+        except Exception as exc:
+            logger.warning({
+                "event": "image_requeued_artifact_index_cleanup_failed",
+                "task_id": str(task_id),
+                "artifact_count": len(discarded),
+                "error": str(exc),
             })
 
     def _run_in_worker_pool(self, pool: str, operation):
@@ -950,7 +964,9 @@ class ImageTaskService:
             raise ImageQueueUnavailableError("image artifact service is not started")
         resolved_root = self.artifact_service.root.resolve()
         storage_service = getattr(self.artifact_service, "storage_service", None)
-        remote_reader = getattr(storage_service, "get_artifact_bytes", None) if storage_service is not None else None
+        remote_reader = getattr(storage_service, "get_remote_bytes", None) if storage_service is not None else None
+        if not callable(remote_reader) and storage_service is not None:
+            remote_reader = getattr(storage_service, "get_artifact_bytes", None)
         if not callable(remote_reader) and storage_service is not None:
             remote_reader = getattr(storage_service, "get_published_bytes", None)
         if not callable(remote_reader) and storage_service is not None:
@@ -1088,7 +1104,46 @@ class ImageTaskService:
         return accounted
 
     def _run_worker_maintenance(self) -> int:
-        return self.adopt_local_recovery_artifacts() + self.reconcile_unaccounted_delivery_results()
+        return (
+            self.adopt_local_recovery_artifacts()
+            + self.reconcile_unaccounted_delivery_results()
+            + self.cleanup_invalid_artifacts()
+        )
+
+    def cleanup_invalid_artifacts(self, limit: int = 100) -> int:
+        repository = self._require_repository()
+        if self.artifact_service is None:
+            return 0
+        cluster_settings = load_cluster_settings()
+        worker_id = (
+            cluster_settings.worker_id
+            if cluster_settings.is_worker
+            else _clean(getattr(self.worker, "worker_id", ""))
+        )
+        cleaned = 0
+        for artifact in repository.list_invalid_artifacts(
+            limit=limit,
+            worker_id=worker_id,
+            include_unowned=not bool(worker_id),
+        ):
+            try:
+                if not self.artifact_service.discard((artifact,)):
+                    logger.warning({
+                        "event": "image_invalid_artifact_cleanup_incomplete",
+                        "relative_path": artifact.relative_path,
+                    })
+                    continue
+                cleaned += repository.remove_invalid_artifacts(
+                    artifact.task_id,
+                    (artifact.relative_path,),
+                )
+            except Exception as exc:
+                logger.warning({
+                    "event": "image_invalid_artifact_cleanup_failed",
+                    "relative_path": artifact.relative_path,
+                    "error": str(exc),
+                })
+        return cleaned
 
     def _discard_artifacts_safely(
         self,
@@ -1841,7 +1896,10 @@ class ImageTaskService:
                 "load balancer without sticky sessions, use shared PostgreSQL and "
                 "node-owned image URL delivery, or enable request affinity"
             )
-        task = self._ensure_deliverable_task(owner, task, force_url_verification=True)
+        task = self._ensure_deliverable_task(
+            owner,
+            task,
+        )
         task = self._mark_response_attempted_for_deliverable_result(owner, task)
         return self._public_snapshot(task)
 
@@ -1857,7 +1915,10 @@ class ImageTaskService:
         requested = [item for item in (_clean(value) for value in task_ids) if item]
         snapshots = repository.list_tasks(owner, requested or None, limit=limit, offset=offset)
         snapshots = [
-            self._ensure_deliverable_task(owner, item, force_url_verification=True)
+            self._ensure_deliverable_task(
+                owner,
+                item,
+            )
             for item in snapshots
         ]
         snapshots = [
@@ -1886,6 +1947,27 @@ class ImageTaskService:
 
     def is_public_final_artifact(self, relative_path: object) -> bool:
         return self._require_repository().is_public_final_artifact(relative_path)
+
+    def delete_public_final_artifact(self, relative_path: object) -> bool:
+        rel = _clean(relative_path).replace("\\", "/").lstrip("/")
+        if not rel:
+            return False
+        repository = self._require_repository()
+        descriptor = repository.public_final_artifact_descriptor(rel)
+        if descriptor is None or self.artifact_service is None:
+            return False
+        cluster_settings = load_cluster_settings()
+        if cluster_settings.is_api_main:
+            return repository.invalidate_public_final_artifact(rel) is not None
+        invalidated = repository.invalidate_public_final_artifact(rel)
+        if invalidated is None:
+            return False
+        if not self.artifact_service.discard((descriptor,)):
+            return False
+        return bool(repository.remove_invalid_artifacts(
+            invalidated.task_id,
+            (invalidated.relative_path,),
+        ))
 
     @staticmethod
     def _is_waitable_terminal(task: TaskSnapshot) -> bool:
@@ -1987,7 +2069,10 @@ class ImageTaskService:
         current = repository.get_task(owner, task_id)
         if current is None:
             raise ValueError("image task not found")
-        current = self._ensure_deliverable_task(owner, current, force_url_verification=True)
+        current = self._ensure_deliverable_task(
+            owner,
+            current,
+        )
         task = repository.acknowledge(owner, task_id)
         if task is None:
             raise ValueError("image task not found")
@@ -2028,7 +2113,9 @@ class ImageTaskService:
         except ValueError as exc:
             raise InvalidImageArtifact("image result artifact path escapes storage root") from exc
         storage_service = getattr(self.artifact_service, "storage_service", None)
-        remote_reader = getattr(storage_service, "get_artifact_bytes", None) if storage_service is not None else None
+        remote_reader = getattr(storage_service, "get_remote_bytes", None) if storage_service is not None else None
+        if not callable(remote_reader) and storage_service is not None:
+            remote_reader = getattr(storage_service, "get_artifact_bytes", None)
         if not callable(remote_reader) and storage_service is not None:
             remote_reader = getattr(storage_service, "get_published_bytes", None)
         if not callable(remote_reader) and storage_service is not None:

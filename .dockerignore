@@ -1,6 +1,13 @@
 .git
 .gitignore
 config.json
+.env
+.env.*
+!.env.example
+data
+*.db
+*.sqlite
+*.sqlite3
 .idea
 .venv
 __pycache__
@@ -19,5 +26,12 @@ web
 web-vue/dist
 web-vue/node_modules
 web_dist
+.chatgpt2api-trash
 
 assets
+deploy/*.join
+deploy/workers.tsv
+deploy/join-signing.key
+deploy/join-signing.pub
+deploy/nginx-worker-images.conf
+run-python.sh

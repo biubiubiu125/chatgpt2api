@@ -294,6 +294,20 @@ export function useStudioImageTaskRuntime(input: StudioImageTaskRuntimeInput) {
     if (ackRetryTaskIds.size) scheduleAckRetry()
   }
 
+  async function cancelImageTask(taskId: string) {
+    const cleanTaskId = cleanStudioText(taskId)
+    if (!cleanTaskId) return
+    try {
+      const task = await imageTasksApi.cancel(cleanTaskId)
+      rememberTask(task.id || cleanTaskId)
+      merge([task])
+      syncMessageStatuses()
+      scheduleRefresh(0, true)
+    } catch (error) {
+      input.hooks.onRefreshError(input.hooks.formatError(error, '取消图片任务失败'))
+    }
+  }
+
   async function resumeImageTask(taskId: string) {
     const cleanTaskId = cleanStudioText(taskId)
     if (!cleanTaskId) return
@@ -415,6 +429,7 @@ export function useStudioImageTaskRuntime(input: StudioImageTaskRuntimeInput) {
     acknowledgeRenderedImageTask,
     scheduleAckRetry,
     resumeImageTask,
+    cancelImageTask,
     schedulePoll,
     scheduleRefresh,
     deactivate,

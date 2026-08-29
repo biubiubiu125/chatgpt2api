@@ -74,10 +74,26 @@ export interface BackupItem {
   encrypted?: boolean
 }
 
+export interface BackupDetail extends BackupItem {
+  manifest?: unknown
+  metadata?: Record<string, unknown>
+  files?: unknown[]
+  [key: string]: unknown
+}
+
 export interface BackupRunResult {
   key: string
   size: number
   encrypted: boolean
+}
+
+export interface BackupRestoreResult {
+  key: string
+  name?: string
+  encrypted?: boolean
+  restored_images?: number
+  image_queue?: Record<string, unknown>
+  [key: string]: unknown
 }
 
 export type ThirdPartyAppsSettings = Settings['third_party_apps']
@@ -94,11 +110,13 @@ const SETTINGS_SAVE_KEYS = [
   'fallback_proxy',
   'proxy_runtime',
   'base_url',
+  'image_base_url',
   'refresh_account_interval_minute',
   'image_retention_days',
   'log_retention_days',
   'image_poll_timeout_secs',
   'image_stream_timeout_secs',
+  'text_stream_timeout_secs',
   'image_poll_interval_secs',
   'image_poll_initial_wait_secs',
   'image_account_concurrency',
@@ -227,11 +245,13 @@ export function normalizeSettings(raw: RawSettings | null | undefined): Settings
     fallback_proxy: cleanString(source.fallback_proxy),
     proxy_runtime: proxyRuntime,
     base_url: cleanString(source.base_url ?? basic.base_url),
+    image_base_url: cleanString(source.image_base_url),
     refresh_account_interval_minute: numberValue(source.refresh_account_interval_minute, 5, 1),
     image_retention_days: numberValue(source.image_retention_days ?? basic.image_expire_hours, 15, 1),
     log_retention_days: numberValue(source.log_retention_days, 30, 1),
     image_poll_timeout_secs: numberValue(source.image_poll_timeout_secs, 60, 1),
     image_stream_timeout_secs: numberValue(source.image_stream_timeout_secs, 80, 1),
+    text_stream_timeout_secs: numberValue(source.text_stream_timeout_secs, 300, 1),
     image_poll_interval_secs: numberValue(source.image_poll_interval_secs, 10, 0.5),
     image_poll_initial_wait_secs: numberValue(source.image_poll_initial_wait_secs, 10, 0),
     image_account_concurrency: numberValue(source.image_account_concurrency, 1, 1, 3),
@@ -356,9 +376,11 @@ function toBackendSettings(settings: Settings): RawSettings {
     fallback_proxy: cleanString(normalized.fallback_proxy),
     proxy_runtime: normalizeProxyRuntime(normalized.proxy_runtime),
     base_url: cleanString(normalized.base_url),
+    image_base_url: cleanString(normalized.image_base_url),
     refresh_account_interval_minute: numberValue(normalized.refresh_account_interval_minute, 5, 1),
     image_poll_timeout_secs: numberValue(normalized.image_poll_timeout_secs, 60, 1),
     image_stream_timeout_secs: numberValue(normalized.image_stream_timeout_secs, 80, 1),
+    text_stream_timeout_secs: numberValue(normalized.text_stream_timeout_secs, 300, 1),
     image_poll_interval_secs: numberValue(normalized.image_poll_interval_secs, 10, 0.5),
     image_poll_initial_wait_secs: numberValue(normalized.image_poll_initial_wait_secs, 10, 0),
     image_account_concurrency: numberValue(normalized.image_account_concurrency, 1, 1, 3),
@@ -454,6 +476,30 @@ export const settingsApi = {
 
   deleteBackup: (key: string) =>
     apiClient.post<{ key: string }, { ok: boolean }>('/api/backups/delete', { key }),
+
+  restoreBackup: (key: string, passphrase = '') =>
+    apiClient.post<{ key: string; passphrase?: string }, { result: BackupRestoreResult }>(
+      '/api/backups/restore',
+      { key, passphrase },
+    ),
+
+  getBackupDetail: (key: string, passphrase = '') =>
+    apiClient.post<{ key: string; passphrase?: string }, { item: BackupDetail }>(
+      '/api/backups/detail',
+      { key, passphrase },
+    ),
+
+  backupDownloadUrl: (key: string) => {
+    const baseUrl = String(import.meta.env.VITE_API_URL || '').replace(/\/+$/, '')
+    const path = `/api/backups/download?key=${encodeURIComponent(key)}`
+    return baseUrl ? `${baseUrl}${path}` : path
+  },
+
+  backupDownloadPath: () => {
+    const baseUrl = String(import.meta.env.VITE_API_URL || '').replace(/\/+$/, '')
+    const path = '/api/backups/download'
+    return baseUrl ? `${baseUrl}${path}` : path
+  },
 
   testImageStorage: () =>
     apiClient.post<Record<string, never>, { result: ImageStorageTestResult }>('/api/image-storage/test', {}),

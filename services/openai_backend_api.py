@@ -1,4 +1,5 @@
 import base64
+import binascii
 import json
 import mimetypes
 import os
@@ -9,13 +10,14 @@ import time
 
 import urllib.error
 import urllib.request
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any, Dict, Iterator, Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse, urlsplit
 
 from curl_cffi import CurlInfo, CurlOpt, requests
 from PIL import Image
@@ -38,6 +40,7 @@ from services.image_failure import (
     terminal_assistant_text,
 )
 from services.protocol.reasoning import normalize_thinking_effort
+from services.returned_url_verifier import ReturnedUrlVerificationError, _curl_resolve_address, _validate_public_host
 from services.proxy_service import ProxyRuntimeProfile, proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.diagnostics import diagnostic_excerpt
@@ -66,6 +69,49 @@ SEARCH_TIMEOUT_SECS = 300.0
 SEARCH_POLL_INTERVAL_SECS = 3.0
 SEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion"}
 MAX_IMAGE_DOWNLOAD_BYTES = 50 * 1024 * 1024
+
+
+def _image_download_url_error(exc: ReturnedUrlVerificationError) -> ImageDownloadError:
+    message = str(exc).replace("returned image URL", "image download URL")
+    return ImageDownloadError(message or "image download URL is not publicly reachable")
+
+
+def _validated_image_download_url(url: object, base_url: str) -> tuple[str, object, tuple[object, ...]]:
+    raw_url = str(url or "").strip()
+    if not raw_url:
+        raise ImageDownloadError("image download URL is empty")
+    absolute_url = urljoin(f"{str(base_url or '').rstrip('/')}/", raw_url)
+    parsed = urlparse(absolute_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ImageDownloadError("image download URL must be an http or https URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ImageDownloadError("image download URL must not include credentials")
+    try:
+        addresses = tuple(_validate_public_host(urlsplit(absolute_url)))
+    except ReturnedUrlVerificationError as exc:
+        raise _image_download_url_error(exc) from exc
+    return absolute_url, parsed, addresses
+
+
+def _image_download_curl_options(parsed: object, addresses: tuple[object, ...]) -> dict[object, object]:
+    options: dict[object, object] = {CurlOpt.NOPROXY: "*"}
+    hostname = str(getattr(parsed, "hostname", "") or "")
+    if not hostname or not addresses:
+        return options
+    try:
+        resolve_host = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        resolve_host = hostname
+    try:
+        port = getattr(parsed, "port", None) or (443 if getattr(parsed, "scheme", "") == "https" else 80)
+    except ValueError as exc:
+        raise ImageDownloadError("image download URL has an invalid port") from exc
+    options[CurlOpt.RESOLVE] = [
+        f"{resolve_host}:{port}:{_curl_resolve_address(address)}"
+        for address in addresses
+    ]
+    return options
+
 SEARCH_CONVERSATION_ID_RE = re.compile(r'"conversation_id"\s*:\s*"([^"]+)"')
 SEARCH_URL_RE = re.compile(r"https?://[^\s\"'<>）)\]}]+")
 SEARCH_CITATION_RE = re.compile(r"\ue200cite\ue202([^\ue201]*)\ue201")
@@ -944,7 +990,7 @@ class OpenAIBackendAPI:
     @staticmethod
     def _iter_codex_response_events(raw: Any, max_duration_secs: float | None = None) -> Iterator[Dict[str, Any]]:
         content_type = str(raw.headers.get("content-type") or "").lower()
-        status_code = getattr(raw, "status", None)
+        status_code = getattr(raw, "status", None) or getattr(raw, "status_code", None)
         timeout_secs = float(max_duration_secs or 0)
         started_at = time.monotonic()
         timed_out = False
@@ -997,14 +1043,20 @@ class OpenAIBackendAPI:
                 }
             return False
 
-        if timeout_secs > 0:
+        def _read_body_text() -> str:
+            if hasattr(raw, "text"):
+                return str(getattr(raw, "text") or "")
+            data = raw.read()
+            return data.decode("utf-8", "replace") if isinstance(data, bytes) else str(data or "")
+
+        if timeout_secs > 0 and not hasattr(raw, "iter_content"):
             timer = threading.Timer(timeout_secs, _abort_stream)
             timer.daemon = True
             timer.start()
         try:
             if "application/json" in content_type:
                 _raise_if_timeout()
-                text = raw.read().decode("utf-8", "replace")
+                text = _read_body_text()
                 _raise_if_timeout()
                 _append_body(text)
                 try:
@@ -1013,6 +1065,24 @@ class OpenAIBackendAPI:
                         events.append(data)
                 except Exception as exc:
                     parse_errors.append(str(exc))
+            elif hasattr(raw, "iter_content"):
+                for payload_text in iter_sse_payloads(raw, max_duration_secs=timeout_secs):
+                    _append_body(f"data: {payload_text}\n\n")
+                    if payload_text == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(payload_text)
+                    except Exception as exc:
+                        parse_errors.append(str(exc))
+                        continue
+                    if isinstance(data, dict):
+                        events.append(data)
+                        if str(data.get("type") or "") in {
+                            "response.completed",
+                            "response.failed",
+                            "response.incomplete",
+                        }:
+                            break
             else:
                 lines: list[str] = []
                 while True:
@@ -1041,6 +1111,11 @@ class OpenAIBackendAPI:
         finally:
             if timer is not None:
                 timer.cancel()
+            if hasattr(raw, "close"):
+                try:
+                    raw.close()
+                except Exception:
+                    pass
 
         event_types: Dict[str, int] = {}
         image_result_lengths: list[int] = []
@@ -1095,12 +1170,7 @@ class OpenAIBackendAPI:
             "tool_choice": {"type": "image_generation"},
             "stream": True,
         }
-        request = urllib.request.Request(
-            self.base_url + path,
-            json.dumps(payload).encode(),
-            self._codex_responses_headers(),
-            method="POST",
-        )
+        request_headers = self._codex_responses_headers()
         account = account_service.get_account(self.access_token) or {}
         token_payload = account_service._decode_jwt_payload(self.access_token)
         auth_claim = token_payload.get("https://api.openai.com/auth")
@@ -1109,7 +1179,7 @@ class OpenAIBackendAPI:
         logger.info({
             "event": "codex_responses_request_debug",
             "url": self.base_url + path,
-            "transport": "urllib.request",
+            "transport": "curl_cffi.session",
             "timeout_secs": config.image_stream_timeout_secs,
             "account_email": str(account.get("email") or "").strip(),
             "source_type": str(account.get("source_type") or "").strip(),
@@ -1138,25 +1208,27 @@ class OpenAIBackendAPI:
                 ),
             },
             "headers": {
-                key: value for key, value in self._codex_responses_headers().items()
+                key: value for key, value in request_headers.items()
                 if key.lower() != "authorization"
             },
         })
         stream_timeout = config.image_stream_timeout_secs
-        try:
-            with urllib.request.urlopen(request, timeout=stream_timeout) as raw:
-                yield from self._iter_codex_response_events(raw, max_duration_secs=stream_timeout)
-        except urllib.error.HTTPError as error:
-            body_text = error.read().decode("utf-8", "replace")
-            body: Any = body_text
+        response = self.session.post(
+            self.base_url + path,
+            headers=request_headers,
+            json=payload,
+            timeout=stream_timeout,
+            stream=True,
+        )
+        if response.status_code != 200:
+            body: Any = getattr(response, "text", "")
             try:
-                body = json.loads(body_text)
+                body = response.json()
             except Exception:
                 pass
-            self._log_codex_response_failure(path, error.code, error.headers, payload, body)
-            retry_after_header = error.headers.get("Retry-After") if error.headers else None
-            retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
-            raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
+            self._log_codex_response_failure(path, response.status_code, response.headers, payload, body)
+            ensure_ok(response, path)
+        yield from self._iter_codex_response_events(response, max_duration_secs=stream_timeout)
 
     def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
         """为图片生成准备 conduit token。"""
@@ -1638,7 +1710,10 @@ class OpenAIBackendAPI:
         if match:
             mime_type = str(match.group(1) or "").strip().lower()
             payload = str(match.group(2) or "").strip()
-        data = base64.b64decode(payload)
+        try:
+            data = base64.b64decode(payload, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("invalid base64 image data") from exc
         image = Image.open(BytesIO(data))
         image.load()
         width, height = image.size
@@ -1905,6 +1980,14 @@ class OpenAIBackendAPI:
         ensure_ok(response, "artifact_download")
         content_type = self._clean_editable_mime_type(response.headers.get("Content-Type") or artifact.mime_type)
         file_name = self._resolve_editable_output_name(artifact, response.url, response.headers.get("Content-Disposition"), content_type, primary_mime_types, primary_mime_keywords, primary_default_extension)
+        self._validate_editable_download_payload(
+            response.content,
+            file_name,
+            content_type,
+            primary_mime_types,
+            primary_mime_keywords,
+            primary_default_extension,
+        )
         target_path = self._unique_editable_path(output_dir / file_name)
         target_path.write_bytes(response.content)
         return target_path
@@ -2060,6 +2143,38 @@ class OpenAIBackendAPI:
         if mime_type in EDITABLE_ZIP_MIME_TYPES or mime_type.endswith("/zip"):
             return ".zip"
         return mimetypes.guess_extension(mime_type) or ""
+
+    @staticmethod
+    def _validate_editable_download_payload(
+            payload: bytes,
+            file_name: str,
+            content_type: str,
+            primary_mime_types: set[str],
+            primary_mime_keywords: tuple[str, ...],
+            primary_default_extension: str,
+    ) -> None:
+        if not payload:
+            raise RuntimeError("editable artifact download is empty")
+        suffix = Path(file_name).suffix.lower()
+        mime = str(content_type or "").strip().lower()
+        if suffix == ".zip" or mime in EDITABLE_ZIP_MIME_TYPES or mime.endswith("/zip"):
+            if not zipfile.is_zipfile(BytesIO(payload)):
+                raise RuntimeError("editable zip artifact download is invalid")
+            return
+        if suffix == ".psd" or primary_default_extension == ".psd":
+            if not payload.startswith(b"8BPS"):
+                raise RuntimeError("editable psd artifact download is invalid")
+            return
+        if suffix == ".pptx" or (
+            primary_default_extension == ".pptx"
+            and (mime in primary_mime_types or any(keyword in mime for keyword in primary_mime_keywords))
+        ):
+            if not zipfile.is_zipfile(BytesIO(payload)):
+                raise RuntimeError("editable pptx artifact download is invalid")
+            return
+        if suffix == ".ppt":
+            if not payload.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+                raise RuntimeError("editable ppt artifact download is invalid")
 
     @staticmethod
     def _editable_filename_from_content_disposition(content_disposition: str) -> str:
@@ -3307,14 +3422,15 @@ class OpenAIBackendAPI:
 
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images: list[bytes] = []
+        base_netloc = urlparse(self.base_url).netloc.lower()
         for url in urls:
-            parsed_url = urlparse(url)
-            same_origin = (
-                not parsed_url.netloc
-                or parsed_url.netloc.lower() == urlparse(self.base_url).netloc.lower()
-            )
+            download_url, parsed_url, verified_addresses = _validated_image_download_url(url, self.base_url)
+            same_origin = parsed_url.netloc.lower() == base_netloc
+            request_path = parsed_url.path or "/"
+            if parsed_url.query:
+                request_path = f"{request_path}?{parsed_url.query}"
             download_headers = (
-                self._headers(parsed_url.path or "/")
+                self._headers(request_path)
                 if same_origin
                 else self._signed_asset_headers()
             )
@@ -3334,21 +3450,30 @@ class OpenAIBackendAPI:
 
                 try:
                     response = self.session.get(
-                        url,
+                        download_url,
                         headers=download_headers,
                         timeout=120,
+                        allow_redirects=False,
+                        curl_options=_image_download_curl_options(parsed_url, verified_addresses),
                         content_callback=receive_chunk,
                     )
+                    status_code = int(getattr(response, "status_code", 0) or 0)
+                    if 300 <= status_code < 400:
+                        raise ImageDownloadError("image download redirects are not allowed")
                     ensure_ok(
                         response,
                         "image_download",
                         credential_scope="account" if same_origin else "signed_asset",
                     )
-                    declared_size = str(getattr(response, "headers", {}).get("content-length") or "").strip()
+                    headers = getattr(response, "headers", {})
+                    declared_size = str(headers.get("content-length") or "").strip()
                     if declared_size.isdigit() and int(declared_size) > MAX_IMAGE_DOWNLOAD_BYTES:
                         raise ImageDownloadError(
                             f"image download exceeds {MAX_IMAGE_DOWNLOAD_BYTES} byte limit"
                         )
+                    content_type = str(headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+                    if content_type and not content_type.startswith("image/") and content_type != "application/octet-stream":
+                        raise ImageDownloadError(f"image download returned unsupported content type: {content_type}")
                     content = bytes(content_buffer or response.content or b"")
                     if len(content) > MAX_IMAGE_DOWNLOAD_BYTES:
                         raise ImageDownloadError(
@@ -3359,7 +3484,7 @@ class OpenAIBackendAPI:
                             logger.warning({
                                 "event": "image_download_retry",
                                 "reason": "empty_response",
-                                "url_host": urlparse(url).netloc,
+                                "url_host": parsed_url.netloc,
                             })
                             continue
                         raise ImageDownloadError("image download returned an empty response")
@@ -3378,7 +3503,7 @@ class OpenAIBackendAPI:
                         logger.warning({
                             "event": "image_download_retry",
                             "reason": failure.code,
-                            "url_host": urlparse(url).netloc,
+                            "url_host": parsed_url.netloc,
                             "error": diagnostic_excerpt(repr(exc), 300),
                         })
                         continue
@@ -3465,12 +3590,16 @@ class OpenAIBackendAPI:
         finally:
             response.close()
 
-    def _bootstrap(self) -> None:
+    def _bootstrap(self, timeout_secs: float = 30.0) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
+        try:
+            timeout = max(0.5, float(timeout_secs or 30.0))
+        except (TypeError, ValueError):
+            timeout = 30.0
         response = self.session.get(
             self.base_url + "/",
             headers=self._bootstrap_headers(),
-            timeout=30,
+            timeout=timeout,
         )
         ensure_ok(response, "bootstrap", credential_scope="public")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
@@ -3543,9 +3672,13 @@ class OpenAIBackendAPI:
             return "/backend-api/conversation", "Asia/Shanghai"
         return "/backend-anon/conversation", "America/Los_Angeles"
 
-    def list_models(self) -> Dict[str, Any]:
+    def list_models(self, *, timeout_secs: float = 30.0) -> Dict[str, Any]:
         """返回当前模式下可用模型，格式对齐 OpenAI `/v1/models`。"""
-        self._bootstrap()
+        try:
+            timeout = max(0.5, float(timeout_secs or 30.0))
+        except (TypeError, ValueError):
+            timeout = 30.0
+        self._bootstrap(timeout_secs=timeout)
         path = "/backend-api/models?history_and_training_disabled=false" if self.access_token else (
             "/backend-anon/models?iim=false&is_gizmo=false"
         )
@@ -3554,7 +3687,7 @@ class OpenAIBackendAPI:
         response = self.session.get(
             self.base_url + path,
             headers=self._headers(route),
-            timeout=30,
+            timeout=timeout,
         )
         ensure_ok(response, context)
         data = []

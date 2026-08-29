@@ -11,8 +11,10 @@ from uuid import UUID
 
 from PIL import Image, ImageOps
 
+from services.file_lock import file_lock
 from services.image_queue.types import ArtifactDescriptor, ArtifactStatus
 from services.image_url import build_public_image_url
+from services.image_storage_service import _webdav_client, content_type_for_path
 from utils.image_tokens import VerifiedImage, verify_image_bytes
 
 
@@ -154,15 +156,54 @@ def _discard_local_path(root: Path, relative_path: str) -> None:
         parent = parent.parent
 
 
+def _restore_remote_payload(relative_path: str, payload: bytes, settings: dict[str, object] | None) -> None:
+    if not settings:
+        return
+    try:
+        with _webdav_client(settings) as client:
+            client.put_atomic(relative_path, payload, content_type=content_type_for_path(relative_path))
+    except Exception:
+        pass
+
+
+def _restore_index_entry(storage_service: Any | None, relative_path: str, item: dict[str, Any] | None) -> None:
+    if storage_service is None or not isinstance(item, dict) or not item:
+        return
+    load_index = getattr(storage_service, "_load_clean_index", None)
+    save_index = getattr(storage_service, "_save_index", None)
+    index_lock = getattr(storage_service, "_index_lock", None)
+    lock_path_getter = getattr(storage_service, "_index_file_lock_path", None)
+    if not callable(load_index) or not callable(save_index):
+        return
+    try:
+        if hasattr(index_lock, "__enter__") and callable(lock_path_getter):
+            with index_lock, file_lock(lock_path_getter()):
+                items = load_index()
+                items[relative_path] = item
+                save_index(items)
+        else:
+            items = load_index()
+            items[relative_path] = item
+            save_index(items)
+    except Exception:
+        pass
+
+
 def _remote_reader(storage_service: Any | None) -> Any | None:
     if storage_service is None:
         return None
-    reader = getattr(storage_service, "get_artifact_bytes", None)
+    reader = getattr(storage_service, "get_remote_bytes", None)
+    if not callable(reader):
+        reader = getattr(storage_service, "get_artifact_bytes", None)
     if not callable(reader):
         reader = getattr(storage_service, "get_published_bytes", None)
     if not callable(reader):
         reader = getattr(storage_service, "get_bytes", None)
     return reader if callable(reader) else None
+
+
+def _uses_shared_remote_storage(storage_backend: object) -> bool:
+    return str(storage_backend or "").strip().lower() in {"webdav", "both"}
 
 
 def _verify_persisted_payload(
@@ -213,15 +254,51 @@ class ArtifactService:
             relative_path = f"{task_id}/{job_id}/{digest}.png"
         else:
             relative_path = f"{task_id}/{job_id}/{STAGE_DIRECTORIES.get(kind, kind)}/{digest}.png"
+        target_preexisted = _is_file(_safe_target(self.root, relative_path))
+        previous_local: bytes | None = _read_path_bytes(_safe_target(self.root, relative_path)) if target_preexisted else None
         target = _atomic_write(self.root, relative_path, png_bytes)
         publish_to_shared_storage = kind == "final"
-        if kind in {"input", "mask"} and self.storage_service is not None:
-            private_store = getattr(self.storage_service, "save_private_at_path", None)
-            if callable(private_store):
+        private_storage_attempted = False
+        private_storage_backend = ""
+        private_storage_settings: dict[str, object] | None = None
+        shared_storage_committed = False
+        shared_storage_settings: dict[str, object] | None = None
+        previous_item: dict[str, Any] = {}
+        previous_remote: bytes | None = None
+        if self.storage_service is not None:
+            settings_getter = getattr(self.storage_service, "settings", None)
+            if callable(settings_getter):
                 try:
+                    shared_storage_settings = settings_getter()
+                except Exception:
+                    shared_storage_settings = None
+            private_settings_getter = getattr(self.storage_service, "_private_webdav_settings", None)
+            if callable(private_settings_getter):
+                try:
+                    private_storage_settings = private_settings_getter()
+                except Exception:
+                    private_storage_settings = None
+            load_index = getattr(self.storage_service, "_load_clean_index", None)
+            if callable(load_index):
+                try:
+                    previous_item = dict(load_index().get(relative_path, {}))
+                except Exception:
+                    previous_item = {}
+            remote_reader = _remote_reader(self.storage_service)
+            if callable(remote_reader):
+                try:
+                    previous_remote = remote_reader(relative_path)
+                except Exception:
+                    previous_remote = None
+        try:
+            if kind in {"input", "mask"} and self.storage_service is not None:
+                private_store = getattr(self.storage_service, "save_private_at_path", None)
+                if callable(private_store):
+                    private_storage_attempted = True
                     stored = private_store(relative_path, png_bytes)
+                    private_storage_backend = getattr(stored, "storage", "")
                     remote_reader = _remote_reader(self.storage_service)
-                    if getattr(stored, "storage", "") == "private_webdav" and callable(remote_reader):
+                    if private_storage_backend == "private_webdav" and callable(remote_reader):
                         _verify_persisted_payload(
                             remote_reader(relative_path),
                             digest=digest,
@@ -246,17 +323,21 @@ class ArtifactService:
                         source_url=source_url,
                         ordinal=max(1, int(ordinal or 1)) if job_id is None else None,
                     )
-                except Exception:
-                    raise
-        if not publish_to_shared_storage:
-            public_url = ""
-            storage_backend = "private_local"
-        elif self.storage_service is None:
-            public_url = self._public_url(relative_path, base_url) if kind == "final" else ""
-            storage_backend = "local" if kind == "final" else "private_local"
-        else:
-            try:
+            if not publish_to_shared_storage:
+                public_url = ""
+                storage_backend = "private_local"
+            elif self.storage_service is None:
+                public_url = self._public_url(relative_path, base_url) if kind == "final" else ""
+                storage_backend = "local" if kind == "final" else "private_local"
+            else:
+                settings_getter = getattr(self.storage_service, "settings", None)
+                if callable(settings_getter):
+                    try:
+                        shared_storage_settings = settings_getter()
+                    except Exception:
+                        shared_storage_settings = None
                 stored = self.storage_service.save_at_path(relative_path, png_bytes, base_url)
+                shared_storage_committed = True
                 persisted = _read_path_bytes(target)
                 _verify_persisted_payload(
                     persisted,
@@ -266,7 +347,7 @@ class ArtifactService:
                     label="stored",
                 )
                 remote_reader = _remote_reader(self.storage_service)
-                if callable(remote_reader):
+                if _uses_shared_remote_storage(getattr(stored, "storage", "")) and callable(remote_reader):
                     try:
                         remote_payload = remote_reader(relative_path)
                     except Exception as exc:
@@ -278,10 +359,61 @@ class ArtifactService:
                         expected_height=verified.height,
                         label="remote",
                     )
-            except Exception:
-                raise
-            public_url = stored.url if kind == "final" else ""
-            storage_backend = stored.storage
+                public_url = stored.url if kind == "final" else ""
+                storage_backend = stored.storage
+        except Exception:
+            if kind in {"input", "mask"} and self.storage_service is not None and private_storage_attempted:
+                remote_delete = getattr(self.storage_service, "delete_artifact", None)
+                if callable(remote_delete):
+                    try:
+                        remote_delete(relative_path)
+                    except Exception:
+                        pass
+                if target_preexisted and previous_local is not None:
+                    try:
+                        _atomic_write(self.root, relative_path, previous_local)
+                    except Exception:
+                        pass
+                elif not target_preexisted:
+                    try:
+                        _discard_local_path(self.root, relative_path)
+                    except Exception:
+                        pass
+                if previous_remote is not None and private_storage_settings is not None:
+                    try:
+                        _restore_remote_payload(relative_path, previous_remote, private_storage_settings)
+                    except Exception:
+                        pass
+            elif publish_to_shared_storage and self.storage_service is not None and shared_storage_committed:
+                shared_delete = getattr(self.storage_service, "delete", None)
+                if callable(shared_delete):
+                    try:
+                        shared_delete(relative_path)
+                    except Exception:
+                        pass
+                if target_preexisted and previous_local is not None:
+                    try:
+                        _atomic_write(self.root, relative_path, previous_local)
+                    except Exception:
+                        pass
+                elif previous_item.get("webdav") and previous_remote is not None and shared_storage_settings is not None:
+                    try:
+                        _restore_remote_payload(relative_path, previous_remote, shared_storage_settings)
+                    except Exception:
+                        pass
+                elif not target_preexisted:
+                    try:
+                        _discard_local_path(self.root, relative_path)
+                    except Exception:
+                        pass
+                if previous_item:
+                    _restore_index_entry(self.storage_service, relative_path, previous_item)
+            elif not target_preexisted:
+                try:
+                    _discard_local_path(self.root, relative_path)
+                except Exception:
+                    pass
+            raise
         return ArtifactDescriptor(
             task_id=task_id,
             job_id=job_id,
@@ -311,7 +443,6 @@ class ArtifactService:
                         deleted = False
                 except Exception:
                     deleted = False
-                    continue
             try:
                 _discard_local_path(root, artifact.relative_path)
             except (OSError, ValueError):
@@ -518,26 +649,75 @@ class ArtifactService:
             return None
         path, payload, verified, digest = recovered
         relative_path = path.relative_to(self.root.resolve()).as_posix()
-        if self.storage_service is None:
-            public_url = self._public_url(relative_path, base_url)
-            storage_backend = "local"
-        else:
-            stored = self.storage_service.save_at_path(relative_path, payload, base_url)
-            remote_reader = getattr(self.storage_service, "get_published_bytes", None)
-            if not callable(remote_reader):
-                remote_reader = getattr(self.storage_service, "get_bytes", None)
+        target_preexisted = _is_file(path)
+        previous_local: bytes | None = _read_path_bytes(path) if target_preexisted else None
+        previous_item: dict[str, Any] = {}
+        previous_remote: bytes | None = None
+        shared_storage_settings: dict[str, object] | None = None
+        if self.storage_service is not None:
+            settings_getter = getattr(self.storage_service, "settings", None)
+            if callable(settings_getter):
+                try:
+                    shared_storage_settings = settings_getter()
+                except Exception:
+                    shared_storage_settings = None
+            load_index = getattr(self.storage_service, "_load_clean_index", None)
+            if callable(load_index):
+                try:
+                    previous_item = dict(load_index().get(relative_path, {}))
+                except Exception:
+                    previous_item = {}
+            remote_reader = _remote_reader(self.storage_service)
             if callable(remote_reader):
                 try:
-                    remote_payload = remote_reader(relative_path)
-                    remote_verified = verify_image_bytes(remote_payload)
-                except Exception as exc:
-                    raise InvalidImageArtifact("remote artifact is unreadable") from exc
-                if sha256(remote_payload).hexdigest() != digest:
-                    raise InvalidImageArtifact("remote artifact checksum mismatch")
-                if (remote_verified.width, remote_verified.height) != (verified.width, verified.height):
-                    raise InvalidImageArtifact("remote artifact dimensions changed")
-            public_url = stored.url
-            storage_backend = stored.storage
+                    previous_remote = remote_reader(relative_path)
+                except Exception:
+                    previous_remote = None
+        try:
+            if self.storage_service is None:
+                public_url = self._public_url(relative_path, base_url)
+                storage_backend = "local"
+            else:
+                stored = self.storage_service.save_at_path(relative_path, payload, base_url)
+                remote_reader = _remote_reader(self.storage_service)
+                if _uses_shared_remote_storage(getattr(stored, "storage", "")) and callable(remote_reader):
+                    try:
+                        remote_payload = remote_reader(relative_path)
+                        remote_verified = verify_image_bytes(remote_payload)
+                    except Exception as exc:
+                        raise InvalidImageArtifact("remote artifact is unreadable") from exc
+                    if sha256(remote_payload).hexdigest() != digest:
+                        raise InvalidImageArtifact("remote artifact checksum mismatch")
+                    if (remote_verified.width, remote_verified.height) != (verified.width, verified.height):
+                        raise InvalidImageArtifact("remote artifact dimensions changed")
+                public_url = stored.url
+                storage_backend = stored.storage
+        except Exception:
+            if self.storage_service is not None:
+                shared_delete = getattr(self.storage_service, "delete", None)
+                if callable(shared_delete):
+                    try:
+                        shared_delete(relative_path)
+                    except Exception:
+                        pass
+                if target_preexisted and previous_local is not None:
+                    try:
+                        _atomic_write(self.root, relative_path, previous_local)
+                    except Exception:
+                        pass
+                elif not target_preexisted:
+                    try:
+                        _discard_local_path(self.root, relative_path)
+                    except Exception:
+                        pass
+                if previous_remote is not None and shared_storage_settings is not None:
+                    try:
+                        _restore_remote_payload(relative_path, previous_remote, shared_storage_settings)
+                    except Exception:
+                        pass
+                if previous_item:
+                    _restore_index_entry(self.storage_service, relative_path, previous_item)
+            raise
         return ArtifactDescriptor(
             task_id=task_id,
             job_id=job_id,

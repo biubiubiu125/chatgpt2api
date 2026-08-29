@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -45,6 +45,8 @@ class QuotaReservation:
     identity_id: str = ""
     scope: str = ""
     dedupe_key: str = ""
+    dedupe_keys: tuple[str, ...] = ()
+    cancelable: bool = True
     committed: bool = False
     canceled: bool = False
 
@@ -57,11 +59,15 @@ class QuotaReservation:
             identity_id=self.identity_id,
             scope=self.scope,
             dedupe_key=self.dedupe_key,
+            dedupe_keys=self.dedupe_keys,
         )
         self.committed = True
 
     def cancel(self) -> None:
         if self.committed or self.canceled or not self.reservation_id:
+            return
+        if not self.cancelable:
+            self.canceled = True
             return
         self.service.cancel_reservation(self.today, self.reservation_id)
         self.canceled = True
@@ -173,6 +179,7 @@ class QuotaService:
         scope: str,
         *,
         idempotency_key: str = "",
+        idempotency_aliases: Iterable[object] | None = None,
     ) -> QuotaReservation:
         settings = self.settings_provider()
         if not settings.get("enabled", True):
@@ -183,25 +190,35 @@ class QuotaService:
             return QuotaReservation(self, "", "")
         identity_id = _identity_id(identity)
         today = str(self.today_provider()).strip()
-        dedupe_key = self._dedupe_key(identity_id, normalized_scope, idempotency_key)
+        dedupe_keys = self._dedupe_keys(
+            identity_id,
+            normalized_scope,
+            idempotency_key,
+            idempotency_aliases,
+        )
+        dedupe_key = dedupe_keys[0] if dedupe_keys else ""
         reservation_id = uuid4().hex
 
         with file_lock(self.path.with_suffix(self.path.suffix + ".lock")):
             state = self._load(today)
             idempotency = state.setdefault("idempotency", {})
-            if dedupe_key and idempotency.get(dedupe_key):
+            if dedupe_keys and any(idempotency.get(key) for key in dedupe_keys):
                 return QuotaReservation(self, today, "")
             reservations = self._active_reservations(state)
-            if dedupe_key:
+            if dedupe_keys:
+                requested_keys = set(dedupe_keys)
                 for active_reservation_id, item in reservations.items():
-                    if item.get("dedupe_key") == dedupe_key:
+                    active_keys = self._reservation_dedupe_keys(item)
+                    if requested_keys.intersection(active_keys):
                         return QuotaReservation(
                             self,
                             today,
                             active_reservation_id,
                             identity_id=identity_id,
                             scope=normalized_scope,
-                            dedupe_key=dedupe_key,
+                            dedupe_key=active_keys[0] if active_keys else dedupe_key,
+                            dedupe_keys=active_keys,
+                            cancelable=False,
                         )
             usage = state.setdefault("usage", {})
             user_usage = usage.setdefault(identity_id, {})
@@ -217,6 +234,7 @@ class QuotaService:
                 "identity_id": identity_id,
                 "scope": normalized_scope,
                 "dedupe_key": dedupe_key,
+                "dedupe_keys": list(dedupe_keys),
                 "created_at": time.time(),
             }
             state["reservations"] = reservations
@@ -228,6 +246,7 @@ class QuotaService:
             identity_id=identity_id,
             scope=normalized_scope,
             dedupe_key=dedupe_key,
+            dedupe_keys=dedupe_keys,
         )
 
     def commit_reservation(
@@ -238,38 +257,54 @@ class QuotaService:
         identity_id: str = "",
         scope: str = "",
         dedupe_key: str = "",
+        dedupe_keys: Iterable[object] | None = None,
     ) -> None:
         if not reservation_id:
             return
         with file_lock(self.path.with_suffix(self.path.suffix + ".lock")):
+            raw_state = read_json_object(self.path, name=self.path.name)
+            if raw_state.get("date") != today:
+                return
             state = self._load(today)
             reservations = self._active_reservations(state)
             reservation = reservations.pop(reservation_id, None)
             if not isinstance(reservation, dict):
                 if identity_id:
                     normalized_scope = _normalize_scope(scope)
+                    settings = self.settings_provider()
+                    limit = self._limit(settings, normalized_scope)
                     idempotency = state.setdefault("idempotency", {})
-                    if not (dedupe_key and idempotency.get(dedupe_key)):
+                    commit_keys = self._dedupe_keys_from_values(dedupe_key, dedupe_keys)
+                    if not (commit_keys and any(idempotency.get(key) for key in commit_keys)):
                         usage = state.setdefault("usage", {})
                         user_usage = usage.setdefault(identity_id, {})
                         current = max(0, int(user_usage.get(normalized_scope) or 0))
+                        pending = sum(
+                            1
+                            for item in reservations.values()
+                            if item.get("identity_id") == identity_id and item.get("scope") == normalized_scope
+                        )
+                        if limit >= 0 and current + pending >= limit:
+                            state["reservations"] = reservations
+                            write_json_file(self.path, state)
+                            raise QuotaExceededError(normalized_scope, limit)
                         user_usage[normalized_scope] = current + 1
-                        if dedupe_key:
-                            idempotency[dedupe_key] = True
+                        for key in commit_keys:
+                            idempotency[key] = True
                 state["reservations"] = reservations
                 write_json_file(self.path, state)
                 return
             identity_id = str(reservation.get("identity_id") or "")
             scope = _normalize_scope(str(reservation.get("scope") or ""))
-            dedupe_key = str(reservation.get("dedupe_key") or "")
+            dedupe_keys = self._reservation_dedupe_keys(reservation)
             idempotency = state.setdefault("idempotency", {})
-            if not (dedupe_key and idempotency.get(dedupe_key)):
+            if not (dedupe_keys and any(idempotency.get(key) for key in dedupe_keys)):
                 usage = state.setdefault("usage", {})
                 user_usage = usage.setdefault(identity_id, {})
                 current = max(0, int(user_usage.get(scope) or 0))
                 user_usage[scope] = current + 1
-                if dedupe_key:
-                    idempotency[dedupe_key] = True
+                for key in dedupe_keys:
+                    idempotency[key] = True
             state["reservations"] = reservations
             write_json_file(self.path, state)
 
@@ -297,6 +332,43 @@ class QuotaService:
         if not key:
             return ""
         return f"{identity_id}|{scope}|{key[:200]}"
+
+    @classmethod
+    def _dedupe_keys(
+        cls,
+        identity_id: str,
+        scope: str,
+        idempotency_key: object,
+        idempotency_aliases: Iterable[object] | None = None,
+    ) -> tuple[str, ...]:
+        return cls._dedupe_keys_from_values(
+            cls._dedupe_key(identity_id, scope, str(idempotency_key or "")),
+            (
+                cls._dedupe_key(identity_id, scope, str(alias or ""))
+                for alias in (idempotency_aliases or ())
+            ),
+        )
+
+    @staticmethod
+    def _dedupe_keys_from_values(
+        dedupe_key: object,
+        dedupe_keys: Iterable[object] | None = None,
+    ) -> tuple[str, ...]:
+        result: list[str] = []
+        for value in (dedupe_key, *(dedupe_keys or ())):
+            key = str(value or "").strip()
+            if key and key not in result:
+                result.append(key)
+        return tuple(result)
+
+    @classmethod
+    def _reservation_dedupe_keys(cls, reservation: dict[str, object]) -> tuple[str, ...]:
+        raw_keys = reservation.get("dedupe_keys")
+        if isinstance(raw_keys, list):
+            keys = cls._dedupe_keys_from_values("", raw_keys)
+            if keys:
+                return keys
+        return cls._dedupe_keys_from_values(reservation.get("dedupe_key"))
 
     @staticmethod
     def _active_reservations(state: dict[str, object]) -> dict[str, dict[str, object]]:
@@ -359,10 +431,16 @@ def reserve_quota(
     *,
     image_request: bool = False,
     idempotency_key: str = "",
+    idempotency_aliases: Iterable[object] | None = None,
 ) -> QuotaReservation:
     scope = quota_scope_for_request(endpoint, model, image_request=image_request)
     try:
-        return quota_service.reserve(identity, scope, idempotency_key=idempotency_key)
+        return quota_service.reserve(
+            identity,
+            scope,
+            idempotency_key=idempotency_key,
+            idempotency_aliases=idempotency_aliases,
+        )
     except QuotaExceededError as exc:
         raise HTTPException(
             status_code=429,

@@ -6,6 +6,7 @@ from hmac import compare_digest
 from typing import Any, Mapping
 
 from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, inspect, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from services.database_url import (
@@ -64,7 +65,7 @@ class ClusterJoinStore:
             ensure_database_role_marker(
                 connection,
                 APP_DATABASE_ROLE,
-                create_if_missing=not postgres,
+                create_if_missing=True,
             )
             Base.metadata.create_all(connection)
             self._ensure_schema_columns(connection)
@@ -74,13 +75,10 @@ class ClusterJoinStore:
     @staticmethod
     def _ensure_schema_columns(connection: Any) -> None:
         """Add current join-file identity columns for tables created by older builds."""
-        try:
-            existing = {
-                column["name"]
-                for column in inspect(connection).get_columns(WorkerJoinTokenModel.__tablename__)
-            }
-        except Exception:
-            return
+        existing = {
+            column["name"]
+            for column in inspect(connection).get_columns(WorkerJoinTokenModel.__tablename__)
+        }
         additions = {
             "cluster_id": "ALTER TABLE chatgpt2api_worker_join_token ADD COLUMN cluster_id VARCHAR(128) DEFAULT ''",
             "nonce": "ALTER TABLE chatgpt2api_worker_join_token ADD COLUMN nonce VARCHAR(128) DEFAULT ''",
@@ -200,6 +198,27 @@ class ClusterJoinStore:
             raise ValueError("worker_no must be positive")
         if not normalized["wireguard_ip"]:
             raise ValueError("wireguard_ip is required")
+        if not normalized["wireguard_server_ip"]:
+            raise ValueError("wireguard_server_ip is required")
+        if not normalized["wireguard_server_endpoint"]:
+            raise ValueError("wireguard_server_endpoint is required")
+        if not 1 <= normalized["wireguard_port"] <= 65535:
+            raise ValueError("wireguard_port is out of range")
+        for name in (
+            "token",
+            "cluster_id",
+            "nonce",
+            "worker_id",
+            "wireguard_ip",
+            "wireguard_server_ip",
+            "wireguard_server_endpoint",
+            "wireguard_server_public_key",
+            "wireguard_worker_private_key",
+            "wireguard_worker_public_key",
+            "signing_public_key_b64",
+        ):
+            if len(normalized[name]) > 2048:
+                raise ValueError(f"{name} is too long")
         normalized["app_database_url"] = validate_named_postgres_database(
             normalized["app_database_url"],
             APP_DATABASE_NAME,
@@ -267,7 +286,30 @@ class ClusterJoinStore:
                 updated_at=now,
             )
             session.add(row)
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError as exc:
+                session.rollback()
+                existing = session.execute(
+                    select(WorkerJoinTokenModel).where(
+                        (WorkerJoinTokenModel.token == normalized["token"])
+                        | (WorkerJoinTokenModel.nonce == normalized["nonce"])
+                        | (WorkerJoinTokenModel.worker_id == normalized["worker_id"])
+                        | (WorkerJoinTokenModel.worker_no == normalized["worker_no"])
+                        | (WorkerJoinTokenModel.wireguard_ip == normalized["wireguard_ip"])
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    if existing.worker_id == normalized["worker_id"]:
+                        raise ValueError(f"worker_id already exists: {normalized['worker_id']}") from exc
+                    if existing.nonce == normalized["nonce"]:
+                        raise ValueError("worker join nonce already exists") from exc
+                    if existing.worker_no == normalized["worker_no"]:
+                        raise ValueError(f"worker number already exists: {normalized['worker_no']}") from exc
+                    if existing.wireguard_ip == normalized["wireguard_ip"]:
+                        raise ValueError(f"wireguard IP already exists: {normalized['wireguard_ip']}") from exc
+                    raise ValueError(f"worker join token already exists: {normalized['token']}") from exc
+                raise
             return self.load_worker_join(normalized["token"]) or {}
 
     def load_worker_join(self, token: object) -> dict[str, Any] | None:
@@ -359,6 +401,44 @@ class ClusterJoinStore:
                 return self._row_to_dict(row)
         return None
 
+    def activate_worker_join_by_token_digest(
+        self,
+        *,
+        token_digest: object,
+        worker_id: object,
+        wireguard_ip: object,
+        cluster_id: object = "",
+    ) -> dict[str, Any] | None:
+        token_digest_text = str(token_digest or "").strip().lower()
+        worker_id_text = str(worker_id or "").strip()
+        wireguard_ip_text = str(wireguard_ip or "").strip()
+        cluster_id_text = str(cluster_id or "").strip()
+        if not self._is_sha256_hex(token_digest_text) or not worker_id_text or not wireguard_ip_text:
+            return None
+        now = self._now()
+        with self.Session() as session:
+            with session.begin():
+                query = select(WorkerJoinTokenModel).where(
+                    WorkerJoinTokenModel.worker_id == worker_id_text,
+                    WorkerJoinTokenModel.wireguard_ip == wireguard_ip_text,
+                    WorkerJoinTokenModel.status.in_(self.ACTIVATION_STATUSES),
+                )
+                if cluster_id_text:
+                    query = query.where(WorkerJoinTokenModel.cluster_id == cluster_id_text)
+                rows = session.execute(query.with_for_update()).scalars().all()
+                for row in rows:
+                    actual_digest = sha256(str(row.token or "").encode("utf-8")).hexdigest()
+                    if not compare_digest(actual_digest, token_digest_text):
+                        continue
+                    if row.status == "joined":
+                        return self._row_to_dict(row)
+                    if self._to_datetime(row.expires_at) <= now:
+                        return None
+                    row.status = "joined"
+                    row.updated_at = now
+                    return self._row_to_dict(row)
+        return None
+
     def reopen_worker_join(self, payload: Mapping[str, Any]) -> dict[str, Any] | None:
         normalized = self._normalize_payload(payload)
         now = self._now()
@@ -375,12 +455,18 @@ class ClusterJoinStore:
                 return self._row_to_dict(row)
 
     def mark_activation_failed(self, payload: Mapping[str, Any]) -> dict[str, Any] | None:
-        return self._transition_activation(
-            payload,
-            from_status="activating",
-            to_status="activation_failed",
-            require_unexpired=False,
-        )
+        normalized = self._normalize_payload(payload)
+        now = self._now()
+        with self.Session() as session:
+            with session.begin():
+                row = session.get(WorkerJoinTokenModel, normalized["token"], with_for_update=True)
+                if row is None or row.status not in {"activating", "joined"}:
+                    return None
+                if not self._matches(row, normalized):
+                    return None
+                row.status = "activation_failed"
+                row.updated_at = now
+                return self._row_to_dict(row)
 
     def _runtime_activation_is_valid(
         self,
@@ -485,9 +571,9 @@ class ClusterJoinStore:
                 ).scalar_one_or_none()
                 if row is None:
                     return None
-                if row.status != "pending":
+                if row.status not in {"pending", "activation_failed", "joined"}:
                     raise ValueError(
-                        f"worker {worker_id_text} is {row.status}; only pending joins can be rotated"
+                        f"worker {worker_id_text} is {row.status}; only pending, activation_failed, or joined joins can be rotated"
                     )
                 payload = self._row_to_dict(row)
                 session.delete(row)

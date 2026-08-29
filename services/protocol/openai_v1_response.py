@@ -503,24 +503,46 @@ def stream_web_search_response(body: dict[str, Any], messages: list[dict[str, An
     yield {"type": "response.web_search_call.in_progress", "output_index": 0, "item_id": search_id}
     yield {"type": "response.web_search_call.searching", "output_index": 0, "item_id": search_id}
     result = run_web_search(query)
+    account_email = str(result.get("_account_email") or "")
     search_item = web_search_call_item(query, search_id, "completed", normalized_sources(result))
-    yield {"type": "response.web_search_call.completed", "output_index": 0, "item_id": search_id}
-    yield {"type": "response.output_item.done", "output_index": 0, "item": search_item}
+    yield _with_log_metadata(
+        {"type": "response.web_search_call.completed", "output_index": 0, "item_id": search_id},
+        account_email,
+    )
+    yield _with_log_metadata(
+        {"type": "response.output_item.done", "output_index": 0, "item": search_item},
+        account_email,
+    )
 
     text, annotations = text_with_url_citations(result)
     message_item = text_output_item("", item_id, "in_progress", annotations)
-    yield {"type": "response.output_item.added", "output_index": 1, "item": message_item}
+    yield _with_log_metadata(
+        {"type": "response.output_item.added", "output_index": 1, "item": message_item},
+        account_email,
+    )
     if text:
-        yield {"type": "response.output_text.delta", "item_id": item_id, "output_index": 1, "content_index": 0, "delta": text}
-    yield {"type": "response.output_text.done", "item_id": item_id, "output_index": 1, "content_index": 0, "text": text}
+        yield _with_log_metadata(
+            {"type": "response.output_text.delta", "item_id": item_id, "output_index": 1, "content_index": 0, "delta": text},
+            account_email,
+        )
+    yield _with_log_metadata(
+        {"type": "response.output_text.done", "item_id": item_id, "output_index": 1, "content_index": 0, "text": text},
+        account_email,
+    )
     message_item = text_output_item(text, item_id, "completed", annotations)
-    yield {"type": "response.output_item.done", "output_index": 1, "item": message_item}
+    yield _with_log_metadata(
+        {"type": "response.output_item.done", "output_index": 1, "item": message_item},
+        account_email,
+    )
     usage = token_usage(
         input_text_tokens=count_message_text_tokens(messages, model),
         input_image_tokens=count_message_image_tokens(messages, model),
         output_text_tokens=count_text_tokens(text, model),
     )
-    yield response_completed(response_id, model, created, [search_item, message_item], usage)
+    completed = response_completed(response_id, model, created, [search_item, message_item], usage)
+    if account_email and isinstance(completed.get("response"), dict):
+        _with_log_metadata(completed["response"], account_email)
+    yield _with_log_metadata(completed, account_email)
 
 
 def stream_image_response(

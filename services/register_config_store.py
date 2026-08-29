@@ -105,14 +105,15 @@ class FileRegisterConfigStore:
         runtime = _normalize_runtime(data.get("runtime") if isinstance(data, dict) else {})
         if not runtime or str(runtime.get("owner_id") or "") != owner_id or str(runtime.get("run_id") or "") != run_id:
             return False
-        if not _lease_active(runtime, _now()):
+        now = _now()
+        if not _lease_active(runtime, now):
             return False
         data["runtime"] = _runtime_payload(
             owner_id,
             run_id,
             state=state or str(runtime.get("state") or "running"),
             lease_seconds=lease_seconds,
-            now=_now(),
+            now=now,
         )
         self.save(data)
         return True
@@ -150,7 +151,7 @@ class DatabaseRegisterConfigStore:
             ensure_database_role_marker(
                 connection,
                 APP_DATABASE_ROLE,
-                create_if_missing=not postgres,
+                create_if_missing=True,
             )
             Base.metadata.create_all(connection)
         self.Session = sessionmaker(bind=self.engine)
@@ -161,9 +162,9 @@ class DatabaseRegisterConfigStore:
         try:
             row = session.get(RegisterConfigModel, "default")
             data = _config_data_from_row(row)
-            runtime = self.load_runtime_lease()
-            if runtime:
-                data["runtime"] = runtime
+            runtime_row = session.get(RegisterRuntimeLeaseModel, "default")
+            if runtime_row is not None:
+                data["runtime"] = _row_to_runtime(runtime_row)
             return data
         finally:
             session.close()
@@ -304,9 +305,11 @@ def _config_data_from_row(row: RegisterConfigModel | None) -> dict[str, Any]:
         return {}
     try:
         data = json.loads(str(row.data or "{}"))
-    except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError as exc:
+        raise ValueError("register config database contains invalid JSON") from exc
+    if not isinstance(data, dict):
+        raise ValueError("register config database must contain a JSON object")
+    return data
 
 
 def _merge_config_preserving_newer_stats(

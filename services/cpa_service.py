@@ -14,6 +14,7 @@ from curl_cffi.requests import Session
 from services.account_service import account_service
 from services.account_import_errors import refresh_error_entries
 from services.config import DATA_DIR
+from services.file_lock import file_lock
 from services.json_file import read_json_file, write_json_file
 from services.proxy_service import proxy_settings
 
@@ -73,6 +74,9 @@ class CPAConfig:
         self._lock = Lock()
         self._pools: list[dict] = self._load()
 
+    def _lock_path(self) -> Path:
+        return self._store_file.with_name(f"{self._store_file.name}.lock")
+
     def _load(self) -> list[dict]:
         raw = read_json_file(
             self._store_file,
@@ -92,10 +96,12 @@ class CPAConfig:
 
     def list_pools(self) -> list[dict]:
         with self._lock:
+            self._pools = self._load()
             return [dict(pool) for pool in self._pools]
 
     def get_pool(self, pool_id: str) -> dict | None:
         with self._lock:
+            self._pools = self._load()
             for pool in self._pools:
                 if pool["id"] == pool_id:
                     return dict(pool)
@@ -103,13 +109,15 @@ class CPAConfig:
 
     def add_pool(self, name: str, base_url: str, secret_key: str) -> dict:
         pool = _normalize_pool({"id": _new_id(), "name": name, "base_url": base_url, "secret_key": secret_key})
-        with self._lock:
+        with self._lock, file_lock(self._lock_path()):
+            self._pools = self._load()
             self._pools.append(pool)
             self._save()
         return dict(pool)
 
     def update_pool(self, pool_id: str, updates: dict) -> dict | None:
-        with self._lock:
+        with self._lock, file_lock(self._lock_path()):
+            self._pools = self._load()
             for index, pool in enumerate(self._pools):
                 if pool["id"] != pool_id:
                     continue
@@ -120,7 +128,8 @@ class CPAConfig:
         return None
 
     def delete_pool(self, pool_id: str) -> bool:
-        with self._lock:
+        with self._lock, file_lock(self._lock_path()):
+            self._pools = self._load()
             before = len(self._pools)
             self._pools = [pool for pool in self._pools if pool["id"] != pool_id]
             if len(self._pools) < before:
@@ -129,7 +138,8 @@ class CPAConfig:
         return False
 
     def set_import_job(self, pool_id: str, import_job: dict | None) -> dict | None:
-        with self._lock:
+        with self._lock, file_lock(self._lock_path()):
+            self._pools = self._load()
             for index, pool in enumerate(self._pools):
                 if pool["id"] != pool_id:
                     continue
@@ -142,6 +152,7 @@ class CPAConfig:
 
     def get_import_job(self, pool_id: str) -> dict | None:
         with self._lock:
+            self._pools = self._load()
             for pool in self._pools:
                 if pool["id"] == pool_id:
                     job = pool.get("import_job")

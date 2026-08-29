@@ -8,7 +8,6 @@ from fastapi import HTTPException, Request
 
 from services.account_service import account_service
 from services.auth_service import auth_service
-from services.cluster_settings import load_cluster_settings
 from services.config import config
 from utils.log import logger
 
@@ -36,6 +35,21 @@ def allowlisted_trace_headers(headers: object) -> dict[str, str]:
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIST_DIR = BASE_DIR / "web_dist"
+WEB_APP_ROUTES = {
+    "",
+    "login",
+    "accounts",
+    "settings",
+    "proxy",
+    "register",
+    "logs",
+    "monitor",
+    "cluster",
+    "docs",
+    "gallery",
+    "debug",
+    "studio",
+}
 
 
 def extract_bearer_token(authorization: str | None) -> str:
@@ -99,23 +113,6 @@ def _is_local_request_host(hostname: str) -> bool:
         return False
 
 
-def _is_public_request_host(hostname: str) -> bool:
-    host = hostname.strip().strip("[]").lower().rstrip(".")
-    if not host:
-        return False
-    if _is_local_request_host(host):
-        return True
-    try:
-        return ip_address(host).is_global
-    except ValueError:
-        pass
-    if "." not in host:
-        return False
-    if host.endswith((".local", ".internal", ".lan", ".home", ".home.arpa", ".invalid")):
-        return False
-    return True
-
-
 def resolve_image_base_url(request: Request) -> str:
     image_base_url = getattr(config, "image_base_url", "")
     if image_base_url:
@@ -131,11 +128,15 @@ def resolve_image_base_url(request: Request) -> str:
     hostname = str(request.url.hostname or "").strip()
     if _is_local_request_host(hostname):
         return f"{request.url.scheme}://{request.url.netloc}"
-    if _is_public_request_host(hostname) and load_cluster_settings().is_standalone:
-        return f"{request.url.scheme}://{request.url.netloc}".rstrip("/")
     raise HTTPException(
         status_code=400,
-        detail={"error": "base_url_required", "message": "CHATGPT2API_BASE_URL is required"},
+        detail={
+            "error": "base_url_required",
+            "message": (
+                "CHATGPT2API_BASE_URL or CHATGPT2API_IMAGE_BASE_URL is required "
+                "for public image delivery"
+            ),
+        },
     )
 
 
@@ -144,7 +145,7 @@ def resolve_api_base_url(request: Request) -> str:
     if base_url:
         return base_url
     hostname = str(request.url.hostname or "").strip()
-    if _is_public_request_host(hostname):
+    if _is_local_request_host(hostname):
         return f"{request.url.scheme}://{request.url.netloc}".rstrip("/")
     raise HTTPException(
         status_code=400,
@@ -230,10 +231,21 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
 
 
 def resolve_web_asset(requested_path: str) -> Path | None:
-    if not WEB_DIST_DIR.exists():
+    base_dir = next(
+        (
+            candidate.resolve()
+            for candidate in (WEB_DIST_DIR, BASE_DIR / "web-vue" / "dist")
+            if (candidate / "index.html").is_file()
+        ),
+        None,
+    )
+    if base_dir is None:
         return None
-    clean_path = requested_path.strip("/")
-    base_dir = WEB_DIST_DIR.resolve()
+    clean_path = requested_path.strip().replace("\\", "/").strip("/")
+    if clean_path:
+        parts = Path(clean_path).parts
+        if any(part in {"", ".", ".."} for part in parts):
+            return None
     candidates = [base_dir / "index.html"] if not clean_path else [
         base_dir / Path(clean_path),
         base_dir / clean_path / "index.html",
@@ -246,4 +258,8 @@ def resolve_web_asset(requested_path: str) -> Path | None:
             continue
         if candidate.is_file():
             return candidate
+    if clean_path in WEB_APP_ROUTES:
+        index = base_dir / "index.html"
+        if index.is_file():
+            return index
     return None

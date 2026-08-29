@@ -11,6 +11,7 @@ IMAGE_QUEUE_DATABASE_NAME = "chatgpt2api_image_queue"
 APP_DATABASE_ROLE = "app"
 IMAGE_QUEUE_DATABASE_ROLE = "image_queue"
 DATABASE_ROLE_MARKER_TABLE = "chatgpt2api_database_role"
+SUPPORTED_POSTGRES_SCHEMES = frozenset({"postgresql", "postgresql+psycopg2"})
 
 
 def normalize_postgres_url(url: object) -> str:
@@ -41,7 +42,7 @@ def is_postgres_url(url: object) -> bool:
     if ":" not in value:
         return False
     scheme = value.split(":", 1)[0].lower()
-    return scheme.startswith("postgresql")
+    return scheme in SUPPORTED_POSTGRES_SCHEMES
 
 
 def postgres_database_name(url: object) -> str:
@@ -55,7 +56,10 @@ def validate_named_postgres_database(url: object, expected_name: str, *, role: s
     if not normalized:
         return ""
     if not is_postgres_url(normalized):
-        raise ValueError(f"{role} database requires a PostgreSQL URL")
+        raise ValueError(
+            f"{role} database requires a PostgreSQL URL using psycopg2 "
+            "(postgresql:// or postgresql+psycopg2://)"
+        )
     actual_name = postgres_database_name(normalized)
     if actual_name != expected_name:
         raise ValueError(f"{role} database must use {expected_name}")

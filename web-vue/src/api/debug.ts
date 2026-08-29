@@ -38,6 +38,8 @@ export type DebugChatCompletion = {
 
 export type DebugEditableKind = 'ppt' | 'psd'
 
+const DEBUG_LONG_REQUEST_TIMEOUT_MS = 330000
+
 export type DebugEditableFileTask = {
   id?: string
   taskId?: string
@@ -74,16 +76,21 @@ function endpointForEditableKind(kind: DebugEditableKind) {
 }
 
 export const debugApi = {
-  search: async (prompt: string) => apiClient.post<{ prompt: string }, DebugSearchResult>('/v1/search', { prompt }),
+  search: async (prompt: string) => apiClient.post<{ prompt: string }, DebugSearchResult>(
+    '/v1/search',
+    { prompt },
+    { timeout: DEBUG_LONG_REQUEST_TIMEOUT_MS },
+  ),
 
   chat: async (model: string, messages: DebugChatMessage[], reasoningEffort = '') => apiClient.post<Record<string, unknown>, DebugChatCompletion>(
-    '/v1/chat/completions',
-    {
-      model: model.trim() || 'auto',
-      messages,
-      ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
-    },
-  ),
+      '/v1/chat/completions',
+      {
+        model: model.trim() || 'auto',
+        messages,
+        ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+      },
+      { timeout: DEBUG_LONG_REQUEST_TIMEOUT_MS },
+    ),
 
   createEditableFileTask: async (kind: DebugEditableKind, input: { prompt: string; base64_images?: string[] }) => {
     const payload = {

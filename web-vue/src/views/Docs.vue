@@ -163,6 +163,7 @@ const chatCompletionExample = computed(() => `curl -X POST "http://localhost:786
 const imageGenerationExample = computed(() => `curl -X POST "http://localhost:7860/v1/images/generations" \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer YOUR_API_KEY" \\
+  -H "Idempotency-Key: image-generation-demo-1" \\
   -d '{
     "model": "${primaryImageModel.value}",
     "prompt": "draw a tiny cat icon, minimal flat vector",
@@ -173,6 +174,7 @@ const imageGenerationExample = computed(() => `curl -X POST "http://localhost:78
 
 const imageEditExample = computed(() => `curl -X POST "http://localhost:7860/v1/images/edits" \\
   -H "Authorization: Bearer YOUR_API_KEY" \\
+  -H "Idempotency-Key: image-edit-demo-1" \\
   -F "model=${primaryImageModel.value}" \\
   -F "prompt=把这张图改成赛博风格" \\
   -F "response_format=url" \\

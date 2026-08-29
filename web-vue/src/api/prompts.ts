@@ -1,5 +1,5 @@
 import axios, { type Method } from 'axios'
-import { getAuthToken } from './client'
+import { getAuthToken, notifyAuthFailure } from './client'
 
 export interface PromptLibraryItem {
   id: string
@@ -172,6 +172,7 @@ async function requestPromptApi<T extends object>(
         const reason = responseErrorMessage(text, `HTTP ${response.status}`)
         failures.push({ url, status: response.status, contentType, reason })
         if (response.status === 401 || response.status === 403) {
+          notifyAuthFailure(response.status)
           throw new Error(`${label} 请求失败：${reason}`)
         }
         continue

@@ -1066,17 +1066,24 @@ def _protocol_error_response(exc: Exception, status_code: int, sse: str) -> JSON
         status_code = max(400, min(599, int(exc.status_code or status_code)))
         if exc.retry_after is not None:
             headers = {"Retry-After": str(exc.retry_after)}
-        body = exc.body
-        if isinstance(body, dict):
-            error = body.get("error")
-            message = error if isinstance(error, dict) else body
-        else:
-            message = str(body or exc)
+        message = {
+            "error": {
+                "message": exc.public_message,
+                "type": "upstream_error",
+                "code": f"upstream_{exc.status_code}",
+            }
+        }
     else:
-        message = str(exc)
+        message = diagnostic_excerpt(str(exc), 1000)
     if sse == "anthropic":
         return anthropic_error_response(message, status_code, headers=headers)
     return openai_error_response(message, status_code, headers=headers)
+
+
+def _public_protocol_exception_message(exc: Exception) -> str:
+    if isinstance(exc, UpstreamHTTPError):
+        return exc.public_message
+    return diagnostic_excerpt(str(exc), 1000)
 
 
 def _next_item(items):
@@ -1096,6 +1103,24 @@ def _image_task_submission_metadata(body: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, dict) and str(value.get("task_id") or "").strip():
             return value
     return {}
+
+
+def _image_quota_idempotency(body: dict[str, Any]) -> tuple[str, tuple[str, ...]]:
+    image_context = body.get("_image_task_context") if isinstance(body.get("_image_task_context"), dict) else {}
+    primary = str(
+        image_context.get("quota_idempotency_key")
+        or image_context.get("idempotency_key")
+        or body.get("client_task_id")
+        or ""
+    ).strip()
+    raw_aliases = image_context.get("quota_idempotency_aliases")
+    aliases: list[str] = []
+    if isinstance(raw_aliases, (list, tuple, set)):
+        for item in raw_aliases:
+            value = str(item or "").strip()
+            if value and value != primary and value not in aliases:
+                aliases.append(value)
+    return primary, tuple(aliases)
 
 
 def _quota_commit_failure_error(
@@ -1138,6 +1163,8 @@ class LoggedCall:
     call_id: str = field(default_factory=lambda: uuid4().hex[:16])
     perf_timings: dict[str, int] = field(default_factory=dict)
     trace_metadata: dict[str, object] = field(default_factory=dict)
+    _stream_sender_failed: bool = field(default=False, init=False, repr=False)
+    _stream_failure_logged: bool = field(default=False, init=False, repr=False)
 
     async def run(self, handler, *args, sse: str = "openai", async_before=None):
         body = args[0] if args and isinstance(args[0], dict) else {}
@@ -1149,11 +1176,7 @@ class LoggedCall:
                 args[0]["_cache_identity"] = f"{identity_role}:{identity_id}"
             self.attach_trace_metadata(args[0])
         image_context = body.get("_image_task_context") if isinstance(body.get("_image_task_context"), dict) else {}
-        idempotency_key = str(
-            image_context.get("idempotency_key")
-            or body.get("client_task_id")
-            or ""
-        )
+        idempotency_key, idempotency_aliases = _image_quota_idempotency(body)
         quota_reservation = None
         try:
             if image_request:
@@ -1163,6 +1186,7 @@ class LoggedCall:
                     self.model,
                     image_request=True,
                     idempotency_key=idempotency_key,
+                    idempotency_aliases=idempotency_aliases,
                 )
             else:
                 enforce_quota(
@@ -1281,7 +1305,7 @@ class LoggedCall:
         except Exception as exc:
             _finalize_quota_on_failure()
             self.log("调用失败", status="failed", error=(
-                _public_image_exception_message(exc) if image_request else str(exc)
+                _public_image_exception_message(exc) if image_request else _public_protocol_exception_message(exc)
             ), account_email=getattr(exc, "account_email", ""),
                      extra=_exception_log_fields(exc, image=image_request))
             if image_request:
@@ -1292,15 +1316,31 @@ class LoggedCall:
             self.log("调用完成", result)
             return _strip_internal_response_fields(result)
 
+        self._stream_sender_failed = False
+        self._stream_failure_logged = False
         if self.endpoint.startswith("/v1/images"):
-            sender = lambda items: image_sse_stream(items, error_builder=_image_error_payload)
+            sender = lambda items: image_sse_stream(
+                items,
+                error_builder=_image_error_payload,
+                on_error=self._mark_stream_sender_failed,
+            )
         else:
             if sse == "anthropic":
-                sender = anthropic_sse_stream
+                sender = lambda items: anthropic_sse_stream(
+                    items,
+                    on_error=self._mark_stream_sender_failed,
+                )
             elif image_request:
-                sender = lambda items: sse_json_stream(items, error_builder=_image_error_payload)
+                sender = lambda items: sse_json_stream(
+                    items,
+                    error_builder=_image_error_payload,
+                    on_error=self._mark_stream_sender_failed,
+                )
             else:
-                sender = sse_json_stream
+                sender = lambda items: sse_json_stream(
+                    items,
+                    on_error=self._mark_stream_sender_failed,
+                )
         first_item_submitted = time.perf_counter()
 
         def _next_item_with_timing():
@@ -1351,7 +1391,7 @@ class LoggedCall:
             raise
         except Exception as exc:
             self.log("调用失败", status="failed", error=(
-                _public_image_exception_message(exc) if image_request else str(exc)
+                _public_image_exception_message(exc) if image_request else _public_protocol_exception_message(exc)
             ), account_email=getattr(exc, "account_email", ""),
                      extra=_exception_log_fields(exc, image=image_request))
             if image_request:
@@ -1377,6 +1417,24 @@ class LoggedCall:
         body["_trace_image_perf"] = True
         self.trace_metadata.update(_image_trace_metadata(body))
 
+    def _mark_stream_sender_failed(self, exc: Exception) -> None:
+        self._stream_sender_failed = True
+        if self._stream_failure_logged:
+            return
+        image_request = self._is_image_request()
+        self._stream_failure_logged = True
+        self.log(
+            "流式调用失败",
+            status="failed",
+            error=(
+                _public_image_exception_message(exc)
+                if image_request else _public_protocol_exception_message(exc)
+            ),
+            account_email=getattr(exc, "account_email", ""),
+            conversation_id=getattr(exc, "conversation_id", ""),
+            extra=_exception_log_fields(exc, image=image_request),
+        )
+
     def stream(self, items):
         urls: list[str] = []
         account_emails: list[str] = []
@@ -1393,6 +1451,7 @@ class LoggedCall:
                 yield _strip_internal_response_fields(item)
         except Exception as exc:
             failed = True
+            self._stream_failure_logged = True
             extra = _exception_log_fields(exc, image=image_request)
             combined_attempts = collect_image_attempts([image_attempts, exc])
             if combined_attempts:
@@ -1402,7 +1461,7 @@ class LoggedCall:
                 status="failed",
                 error=(
                     _public_image_exception_message(exc)
-                    if image_request else str(exc)
+                    if image_request else _public_protocol_exception_message(exc)
                 ),
                 urls=urls,
                 account_email=(account_emails[0] if account_emails else getattr(exc, "account_email", "")),
@@ -1420,7 +1479,7 @@ class LoggedCall:
                 ) from exc
             raise
         finally:
-            if not failed:
+            if not failed and not self._stream_sender_failed:
                 extra = {"image_attempts": image_attempts} if image_attempts else None
                 self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
                          conversation_id=conversation_ids[0] if conversation_ids else "", extra=extra)

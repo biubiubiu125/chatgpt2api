@@ -45,6 +45,11 @@ function gptMailResetDelays(status: GptMailStatus) {
   ]
 }
 
+function gptMailProviderSignature(provider: RegisterProvider | undefined) {
+  if (!provider || providerType(provider) !== 'gptmail') return ''
+  return JSON.stringify(sanitizedProviderPayload(provider))
+}
+
 export function useRegisterGptMailRuntime(input: RegisterGptMailRuntimeInput) {
   const statusStates = ref<Record<number, GptMailStatusState>>({})
   const clockNow = ref(Date.now())
@@ -153,15 +158,24 @@ export function useRegisterGptMailRuntime(input: RegisterGptMailRuntimeInput) {
     return buildGptMailStatusHint(state(index), provider, formatClock)
   }
 
+  function isCurrentGptMailProvider(index: number, signature: string) {
+    const provider = input.providers.value[index]
+    return Boolean(signature) && gptMailProviderSignature(provider) === signature
+  }
+
   async function checkStatus(index: number, provider: RegisterProvider, options: GptMailCheckOptions = {}) {
+    const signature = gptMailProviderSignature(provider)
+    if (!signature) return
     const previous = state(index).data
     setState(index, { ...state(index), loading: true, error: '' })
     try {
       const response = await registerApi.getGptMailStatus(sanitizedProviderPayload(provider), options.force ?? true)
+      if (!isCurrentGptMailProvider(index, signature)) return
       setState(index, { loading: false, error: '', data: response.status })
       if (options.reschedule !== false) scheduleRefresh(index, response.status)
       if (!options.silent) input.notifySuccess('GPTMail 状态已更新')
     } catch (error: any) {
+      if (!isCurrentGptMailProvider(index, signature)) return
       const message = error?.message || '获取 GPTMail 状态失败'
       setState(index, { loading: false, error: message, data: previous })
       if (!options.silent) input.notifyError(message)
@@ -169,12 +183,16 @@ export function useRegisterGptMailRuntime(input: RegisterGptMailRuntimeInput) {
   }
 
   async function refreshPublicKey(index: number, provider: RegisterProvider, options: GptMailCheckOptions = {}) {
+    const signature = gptMailProviderSignature(provider)
+    if (!signature) return
     const previous = state(index).data
     try {
       const response = await registerApi.refreshGptMailKey(sanitizedProviderPayload(provider), options.force ?? true)
+      if (!isCurrentGptMailProvider(index, signature)) return
       setState(index, { loading: false, error: '', data: response.status })
       if (options.reschedule !== false) scheduleRefresh(index, response.status)
     } catch (error: any) {
+      if (!isCurrentGptMailProvider(index, signature)) return
       const message = error?.message || '刷新 GPTMail 公共 Key 失败'
       setState(index, { loading: false, error: message, data: previous })
     }

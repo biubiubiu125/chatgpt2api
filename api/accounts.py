@@ -201,6 +201,21 @@ def _clean_text(value: object) -> str:
     return str(value or "").strip()
 
 
+def _coerce_bool(value: object, default: bool = True) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    raw = _clean_text(value).lower()
+    if raw in {"1", "true", "yes", "y", "on", "enabled"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off", "disabled", "none", "null", ""}:
+        return False
+    return default
+
+
 def _slug_id(value: object) -> str:
     raw = _clean_text(value).lower()
     chars: list[str] = []
@@ -259,7 +274,7 @@ def _account_group_payload(groups: list[dict[str, Any]] | None = None) -> dict[s
                 "name": _clean_text(group.get("name")) or group_id,
                 "proxy": proxy,
                 "proxy_group_id": _proxy_group_id_from_reference(proxy),
-                "enabled": bool(group.get("enabled", True)),
+                "enabled": _coerce_bool(group.get("enabled"), True),
                 "notes": _clean_text(group.get("notes")),
                 "account_count": counts.get(group_id, 0),
             }

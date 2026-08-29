@@ -49,7 +49,7 @@ class DatabaseStorageBackend(StorageBackend):
                 self.database_role = ensure_database_role_marker(
                     connection,
                     APP_DATABASE_ROLE,
-                    create_if_missing=False,
+                    create_if_missing=True,
                 )
         Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine)
@@ -57,19 +57,7 @@ class DatabaseStorageBackend(StorageBackend):
 
     def load_accounts(self) -> list[dict[str, Any]]:
         """从数据库加载账号数据"""
-        session = self.Session()
-        try:
-            accounts = []
-            for row in session.query(AccountModel).all():
-                try:
-                    account_data = json.loads(row.data)
-                    if isinstance(account_data, dict):
-                        accounts.append(account_data)
-                except json.JSONDecodeError:
-                    continue
-            return accounts
-        finally:
-            session.close()
+        return self._load_rows(AccountModel, identity_key="access_token", stored_key="access_token")
 
     def save_accounts(self, accounts: list[dict[str, Any]]) -> None:
         """保存账号数据到数据库"""
@@ -85,7 +73,7 @@ class DatabaseStorageBackend(StorageBackend):
 
     def load_auth_keys(self) -> list[dict[str, Any]]:
         """从数据库加载鉴权密钥数据"""
-        return self._load_rows(AuthKeyModel)
+        return self._load_rows(AuthKeyModel, identity_key="id", stored_key="key_id")
 
     def save_auth_keys(self, auth_keys: list[dict[str, Any]]) -> None:
         """保存鉴权密钥数据到数据库"""
@@ -99,20 +87,58 @@ class DatabaseStorageBackend(StorageBackend):
         """Merge auth-key list updates without resurrecting deleted keys."""
         return self._save_rows_merged(AuthKeyModel, auth_keys, previous_auth_keys, "id", "key_id")
 
-    def _load_rows(self, model: type[AccountModel] | type[AuthKeyModel]) -> list[dict[str, Any]]:
+    def _load_rows(
+        self,
+        model: type[AccountModel] | type[AuthKeyModel],
+        *,
+        identity_key: str,
+        stored_key: str,
+    ) -> list[dict[str, Any]]:
         session = self.Session()
         try:
             items = []
             for row in session.query(model).all():
-                try:
-                    item_data = json.loads(row.data)
-                    if isinstance(item_data, dict):
-                        items.append(item_data)
-                except json.JSONDecodeError:
-                    continue
+                items.append(self._decode_row_data(row, identity_key=identity_key, stored_key=stored_key))
             return items
         finally:
             session.close()
+
+    @staticmethod
+    def _decode_row_data(
+        row: AccountModel | AuthKeyModel,
+        *,
+        identity_key: str,
+        stored_key: str,
+    ) -> dict[str, Any]:
+        try:
+            item_data = json.loads(str(row.data or ""))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"database storage row {row.id} contains invalid JSON") from exc
+        if not isinstance(item_data, dict):
+            raise ValueError(f"database storage row {row.id} must contain a JSON object")
+        item_identity = str(item_data.get(identity_key) or "").strip()
+        stored_identity = str(getattr(row, stored_key) or "").strip()
+        if not item_identity or item_identity != stored_identity:
+            raise ValueError(f"database storage row {row.id} has inconsistent identity")
+        return item_data
+
+    @staticmethod
+    def _validate_items(items: list[dict[str, Any]], identity_key: str) -> list[dict[str, Any]]:
+        if not isinstance(items, list):
+            raise ValueError("database storage payload must be a list")
+        validated: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("database storage items must be JSON objects")
+            identity = str(item.get(identity_key) or "").strip()
+            if not identity:
+                raise ValueError(f"database storage item is missing {identity_key}")
+            if identity in seen:
+                raise ValueError(f"database storage contains duplicate {identity_key}")
+            seen.add(identity)
+            validated.append(item)
+        return validated
 
     def _save_rows(
         self,
@@ -121,19 +147,17 @@ class DatabaseStorageBackend(StorageBackend):
         source_key: str,
         target_key: str | None = None,
     ) -> None:
+        target_column = target_key or source_key
+        validated_items = self._validate_items(items, source_key)
         with self._write_lock:
             session = self.Session()
             try:
                 session.query(model).delete()
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
+                for item in validated_items:
                     key_value = str(item.get(source_key) or "").strip()
-                    if not key_value:
-                        continue
                     session.add(
                         model(
-                            **{target_key or source_key: key_value},
+                            **{target_column: key_value},
                             data=json.dumps(item, ensure_ascii=False),
                         )
                     )
@@ -150,14 +174,11 @@ class DatabaseStorageBackend(StorageBackend):
         model: type[AccountModel] | type[AuthKeyModel],
     ) -> list[dict[str, Any]]:
         rows = session.query(model).with_for_update().all()
+        identity_key = "access_token" if model is AccountModel else "id"
+        stored_key = "access_token" if model is AccountModel else "key_id"
         items = []
         for row in rows:
-            try:
-                item_data = json.loads(row.data)
-                if isinstance(item_data, dict):
-                    items.append(item_data)
-            except json.JSONDecodeError:
-                continue
+            items.append(self._decode_row_data(row, identity_key=identity_key, stored_key=stored_key))
         return items
 
     def _save_rows_merged(
@@ -169,6 +190,8 @@ class DatabaseStorageBackend(StorageBackend):
         target_key: str | None = None,
     ) -> list[dict[str, Any]]:
         target_column = target_key or source_key
+        self._validate_items(items, source_key)
+        self._validate_items(previous_items, source_key)
         with self._write_lock:
             for attempt in range(2):
                 session = self.Session()

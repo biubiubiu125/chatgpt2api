@@ -20,6 +20,7 @@ from urllib.parse import quote, urlencode
 from curl_cffi import Curl, CurlInfo, CurlOpt, requests
 
 from services.config import BASE_DIR, CONFIG_FILE, DATA_DIR, config, load_backup_state, save_backup_state
+from services.file_lock import file_lock, release_file_lock, try_acquire_file_lock
 from services.image_storage_service import IMAGE_INDEX_FILE
 from services.image_tags_service import TAGS_FILE
 
@@ -57,6 +58,10 @@ def _path_exists(path: Path) -> bool:
 
 def _path_is_file(path: Path) -> bool:
     return os.path.isfile(_native_filesystem_path(path))
+
+
+def _backup_state_lock_path() -> Path:
+    return DATA_DIR / "backup_state.lock"
 
 
 def _read_path_bytes(path: Path) -> bytes:
@@ -238,8 +243,50 @@ def _count_items(value: object) -> int:
     return 0
 
 
+def _decode_backup_metadata(payload: bytes) -> dict[str, object]:
+    try:
+        metadata = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BackupError("backup metadata is missing or invalid") from exc
+    if not isinstance(metadata, dict) or metadata.get("version") != 2:
+        raise BackupError("backup metadata is missing or invalid")
+    return metadata
+
+
 class BackupError(RuntimeError):
     pass
+
+
+BACKUP_MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
+BACKUP_MAX_ARCHIVE_MEMBERS = 10_000
+BACKUP_MAX_ARCHIVE_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
+SENSITIVE_BACKUP_INCLUDE_KEYS = frozenset({
+    "config",
+    "register",
+    "cpa",
+    "sub2api",
+    "logs",
+    "accounts_snapshot",
+    "auth_keys_snapshot",
+})
+
+
+def _validate_archive_members(members: list[tarfile.TarInfo]) -> list[tarfile.TarInfo]:
+    if len(members) > BACKUP_MAX_ARCHIVE_MEMBERS:
+        raise BackupError("backup archive contains too many members")
+    for member in members:
+        if int(member.size or 0) < 0:
+            raise BackupError("backup archive contains a member with an invalid size")
+        if not member.isfile() and not member.isdir():
+            raise BackupError("backup archive contains an unsupported member type")
+    total_size = sum(
+        int(member.size or 0)
+        for member in members
+        if member.isfile()
+    )
+    if total_size > BACKUP_MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+        raise BackupError("backup archive is too large after decompression")
+    return members
 
 
 class CloudflareR2Client:
@@ -425,13 +472,25 @@ class CloudflareR2Client:
         if response.status_code >= 400 and response.status_code != 404:
             raise BackupError(f"删除备份失败：HTTP {response.status_code}")
 
-    def download_bytes(self, key: str) -> bytes:
+    def download_bytes(self, key: str, *, max_bytes: int = BACKUP_MAX_DOWNLOAD_BYTES) -> bytes:
         response = self._request("GET", key, timeout=60.0)
         if response.status_code >= 400:
             raise BackupError(f"读取备份失败：HTTP {response.status_code}")
-        return bytes(response.content or b"")
+        content_length = _clean(response.headers.get("content-length"))
+        if content_length.isdigit() and int(content_length) > max_bytes:
+            raise BackupError("backup object exceeds the maximum download size")
+        payload = bytes(response.content or b"")
+        if len(payload) > max_bytes:
+            raise BackupError("backup object exceeds the maximum download size")
+        return payload
 
-    def download_file(self, key: str, destination: Path) -> dict[str, object]:
+    def download_file(
+        self,
+        key: str,
+        destination: Path,
+        *,
+        max_bytes: int = BACKUP_MAX_DOWNLOAD_BYTES,
+    ) -> dict[str, object]:
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
         object_path = f"/{self.bucket}/{quote(key.lstrip('/'), safe='/')}"
@@ -455,6 +514,15 @@ class CloudflareR2Client:
             raise BackupError(f"backup download failed: {exc}") from exc
         finally:
             curl.close()
+        for line in response_headers.getvalue().decode("iso-8859-1", errors="replace").splitlines():
+            if line.lower().startswith("content-length:"):
+                value = line.split(":", 1)[1].strip()
+                if value.isdigit() and int(value) > max_bytes:
+                    try:
+                        destination.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise BackupError("backup object exceeds the maximum download size")
         if status_code >= 400:
             detail = ""
             try:
@@ -462,7 +530,14 @@ class CloudflareR2Client:
             except Exception:
                 detail = ""
             raise BackupError(f"backup download failed: HTTP {status_code}{': ' + detail if detail else ''}")
-        return {"key": key, "size": destination.stat().st_size}
+        size = destination.stat().st_size
+        if size > max_bytes:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise BackupError("backup object exceeds the maximum download size")
+        return {"key": key, "size": size}
 
     def list_objects(self) -> list[dict[str, object]]:
         items: list[dict[str, object]] = []
@@ -510,6 +585,7 @@ class BackupService:
         self._image_queue_provider = None
         self._image_queue_restore_provider = None
         self._image_queue_artifact_root: Path | None = None
+        self._register_config_provider = None
 
     def set_image_queue_provider(self, provider) -> None:
         self._image_queue_provider = provider
@@ -520,6 +596,9 @@ class BackupService:
     def set_image_queue_artifact_root(self, root: Path | None) -> None:
         self._image_queue_artifact_root = Path(root).resolve() if root is not None else None
 
+    def set_register_config_provider(self, provider) -> None:
+        self._register_config_provider = provider if callable(provider) else None
+
     def _artifact_root(self) -> Path:
         return (self._image_queue_artifact_root or config.images_dir).resolve()
 
@@ -529,6 +608,8 @@ class BackupService:
         *,
         artifact_root: Path | None = None,
     ) -> dict[str, object]:
+        if len(payload) > BACKUP_MAX_DOWNLOAD_BYTES:
+            raise BackupError("backup payload exceeds the maximum download size")
         root = (artifact_root or self._artifact_root()).resolve()
         os.makedirs(_native_filesystem_path(root), exist_ok=True)
         staging_root = Path(tempfile.mkdtemp(
@@ -539,6 +620,7 @@ class BackupService:
         promoted_targets: list[Path] = []
         try:
             with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+                _validate_archive_members(archive.getmembers())
                 queue_member = archive.getmember("data/image-queue.json")
                 if not queue_member.isfile() or queue_member.size > 256 * 1024 * 1024:
                     raise BackupError("image queue backup payload is invalid")
@@ -664,7 +746,17 @@ class BackupService:
         source = path.resolve()
         if not source.is_file():
             raise BackupError(f"backup file does not exist: {source}")
+        try:
+            source_size = source.stat().st_size
+        except OSError as exc:
+            raise BackupError(f"cannot inspect backup file: {source}") from exc
+        if source_size > BACKUP_MAX_DOWNLOAD_BYTES:
+            raise BackupError("backup payload exceeds the maximum download size")
         payload = source.read_bytes()
+        # The file may be replaced or extended after stat(); enforce the limit
+        # again on the bytes actually handed to the archive parser.
+        if len(payload) > BACKUP_MAX_DOWNLOAD_BYTES:
+            raise BackupError("backup payload exceeds the maximum download size")
         if source.name.endswith(".enc"):
             secret = _clean(passphrase) or _clean(os.environ.get("CHATGPT2API_BACKUP_PASSPHRASE"))
             secret = secret or _clean(config.get_backup_settings().get("passphrase"))
@@ -672,6 +764,21 @@ class BackupService:
                 raise BackupError("encrypted backup requires a passphrase")
             payload = _openssl_decrypt(payload, secret)
         return self.restore_archive_payload(payload, artifact_root=artifact_root)
+
+    def restore_backup(self, key: str, *, passphrase: str = "") -> dict[str, object]:
+        item = self.prepare_backup_download(key, passphrase=passphrase)
+        try:
+            result = self.restore_archive_file(Path(item["path"]))
+            return {
+                "key": item["key"],
+                "name": item["name"],
+                "encrypted": bool(str(item["key"]).endswith(".enc")),
+                **result,
+            }
+        finally:
+            cleanup = item.get("cleanup")
+            if callable(cleanup):
+                cleanup()
 
     def start(self) -> None:
         with self._lock:
@@ -717,9 +824,15 @@ class BackupService:
         self.run_backup(trigger="schedule")
 
     def get_status(self) -> dict[str, object]:
+        running = self._running
+        lock_file = try_acquire_file_lock(_backup_state_lock_path())
+        if lock_file is None:
+            running = True
+        else:
+            release_file_lock(lock_file)
         return {
             **load_backup_state(),
-            "running": self._running,
+            "running": running,
         }
 
     def is_configured(self) -> bool:
@@ -782,6 +895,7 @@ class BackupService:
                 "name": name,
                 "size": int(item.get("size") or 0),
                 "updated_at": item.get("updated_at"),
+                "last_modified": item.get("last_modified") or item.get("updated_at"),
                 "encrypted": encrypted,
             })
         return parsed
@@ -855,7 +969,7 @@ class BackupService:
             "size": len(payload),
         }
 
-    def prepare_backup_download(self, key: str) -> dict[str, object]:
+    def prepare_backup_download(self, key: str, *, passphrase: str = "") -> dict[str, object]:
         settings = config.get_backup_settings()
         candidate = _validated_backup_object_key(settings, key)
         if not candidate:
@@ -864,7 +978,11 @@ class BackupService:
         downloaded_path = temp_dir / (candidate.rsplit("/", 1)[-1] or "backup.bin")
         client = CloudflareR2Client(settings)
         try:
-            client.download_file(candidate, downloaded_path)
+            client.download_file(
+                candidate,
+                downloaded_path,
+                max_bytes=BACKUP_MAX_DOWNLOAD_BYTES,
+            )
         except Exception:
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise
@@ -874,14 +992,15 @@ class BackupService:
         name = downloaded_path.name
         payload_path = downloaded_path
         if candidate.endswith(".enc"):
-            passphrase = _clean(config.get_backup_settings().get("passphrase"))
-            if not passphrase:
+            secret = _clean(passphrase) or _clean(os.environ.get("CHATGPT2API_BACKUP_PASSPHRASE"))
+            secret = secret or _clean(config.get_backup_settings().get("passphrase"))
+            if not secret:
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 raise BackupError("backup passphrase is required to decrypt this backup")
             name = name[:-4] or "backup.tar.gz"
             payload_path = temp_dir / name
             try:
-                _openssl_decrypt_file(downloaded_path, payload_path, passphrase)
+                _openssl_decrypt_file(downloaded_path, payload_path, secret)
             except Exception:
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 raise
@@ -894,7 +1013,7 @@ class BackupService:
             "cleanup": lambda: shutil.rmtree(temp_dir, ignore_errors=True),
         }
 
-    def get_backup_detail(self, key: str) -> dict[str, object]:
+    def get_backup_detail(self, key: str, *, passphrase: str = "") -> dict[str, object]:
         settings = config.get_backup_settings()
         candidate = _validated_backup_object_key(settings, key)
         if not candidate:
@@ -903,7 +1022,11 @@ class BackupService:
         payload_path = temp_dir / (candidate.rsplit("/", 1)[-1] or "backup.bin")
         client = CloudflareR2Client(settings)
         try:
-            client.download_file(candidate, payload_path)
+            client.download_file(
+                candidate,
+                payload_path,
+                max_bytes=BACKUP_MAX_DOWNLOAD_BYTES,
+            )
         except Exception:
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise
@@ -911,11 +1034,12 @@ class BackupService:
             client.close()
         try:
             if candidate.endswith(".enc"):
-                passphrase = _clean(config.get_backup_settings().get("passphrase"))
-                if not passphrase:
+                secret = _clean(passphrase) or _clean(os.environ.get("CHATGPT2API_BACKUP_PASSPHRASE"))
+                secret = secret or _clean(config.get_backup_settings().get("passphrase"))
+                if not secret:
                     raise BackupError("backup passphrase is required to inspect this encrypted backup")
                 decoded_path = temp_dir / payload_path.name.removesuffix(".enc")
-                _openssl_decrypt_file(payload_path, decoded_path, passphrase)
+                _openssl_decrypt_file(payload_path, decoded_path, secret)
                 payload_path = decoded_path
             detail = self._decode_archive_detail_file(payload_path)
             detail["key"] = candidate
@@ -926,46 +1050,50 @@ class BackupService:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def run_backup(self, *, trigger: str = "manual") -> dict[str, object]:
-        with self._lock:
-            current = self.get_status()
-            if self._running:
-                raise BackupError("当前已有备份任务正在执行")
-            started_at = _iso_now()
-            self._running = True
-            save_backup_state({
-                "last_started_at": started_at,
-                "last_finished_at": current.get("last_finished_at"),
-                "last_status": "idle",
-                "last_error": None,
-                "last_object_key": current.get("last_object_key"),
-            })
-        try:
-            result = self._run_backup_once(trigger=trigger)
-            save_backup_state({
-                "last_started_at": started_at,
-                "last_finished_at": _iso_now(),
-                "last_status": "success",
-                "last_error": None,
-                "last_object_key": result["key"],
-            })
-            return result
-        except Exception as exc:
-            save_backup_state({
-                "last_started_at": started_at,
-                "last_finished_at": _iso_now(),
-                "last_status": "error",
-                "last_error": str(exc) or exc.__class__.__name__,
-                "last_object_key": current.get("last_object_key"),
-            })
-            raise
-        finally:
-            self._running = False
+        with file_lock(_backup_state_lock_path()):
+            with self._lock:
+                current = self.get_status()
+                if self._running:
+                    raise BackupError("当前已有备份任务正在执行")
+                started_at = _iso_now()
+                self._running = True
+                save_backup_state({
+                    "last_started_at": started_at,
+                    "last_finished_at": current.get("last_finished_at"),
+                    "last_status": "idle",
+                    "last_error": None,
+                    "last_object_key": current.get("last_object_key"),
+                })
+            try:
+                result = self._run_backup_once(trigger=trigger)
+                save_backup_state({
+                    "last_started_at": started_at,
+                    "last_finished_at": _iso_now(),
+                    "last_status": "success",
+                    "last_error": result.get("warning"),
+                    "last_object_key": result["key"],
+                })
+                return result
+            except Exception as exc:
+                save_backup_state({
+                    "last_started_at": started_at,
+                    "last_finished_at": _iso_now(),
+                    "last_status": "error",
+                    "last_error": str(exc) or exc.__class__.__name__,
+                    "last_object_key": current.get("last_object_key"),
+                })
+                raise
+            finally:
+                self._running = False
 
     def _run_backup_once(self, *, trigger: str) -> dict[str, object]:
         settings = config.get_backup_settings()
         client = CloudflareR2Client(settings)
         client.validate()
         encrypted = bool(settings.get("encrypt"))
+        include = settings.get("include") if isinstance(settings.get("include"), dict) else {}
+        if not encrypted and any(bool(include.get(key)) for key in SENSITIVE_BACKUP_INCLUDE_KEYS):
+            raise BackupError("包含敏感数据的备份必须启用加密")
         suffix = ".tar.gz.enc" if encrypted else ".tar.gz"
         timestamp = _utc_now().strftime("%Y%m%dT%H%M%SZ")
         random_tag = f"{random.randint(0, 0xFFFF):04x}"
@@ -993,22 +1121,35 @@ class BackupService:
                     metadata=metadata,
                 )
                 payload_size = upload_path.stat().st_size
-                self._apply_rotation(client, int(settings.get("rotation_keep") or 0))
-                return {
+                result_payload = {
                     "key": result["key"],
                     "size": payload_size,
                     "encrypted": encrypted,
                 }
+                try:
+                    self._apply_rotation(client, int(settings.get("rotation_keep") or 0))
+                except Exception as exc:
+                    result_payload["warning"] = f"备份已上传，但旧备份轮换失败：{exc}"
+                return result_payload
         finally:
             client.close()
 
-    def _decode_backup_payload(self, key: str, payload: bytes) -> dict[str, object]:
+    def _decode_backup_payload(
+        self,
+        key: str,
+        payload: bytes,
+        *,
+        passphrase: str = "",
+    ) -> dict[str, object]:
+        if len(payload) > BACKUP_MAX_DOWNLOAD_BYTES:
+            raise BackupError("backup payload exceeds the maximum download size")
         decoded = payload
         if key.endswith(".enc"):
-            passphrase = _clean(config.get_backup_settings().get("passphrase"))
-            if not passphrase:
+            secret = _clean(passphrase) or _clean(os.environ.get("CHATGPT2API_BACKUP_PASSPHRASE"))
+            secret = secret or _clean(config.get_backup_settings().get("passphrase"))
+            if not secret:
                 raise BackupError("当前未配置加密口令，无法查看已加密备份")
-            decoded = _openssl_decrypt(decoded, passphrase)
+            decoded = _openssl_decrypt(decoded, secret)
         return self._decode_archive_detail(decoded)
 
     def _apply_rotation(self, client: CloudflareR2Client, keep: int) -> None:
@@ -1026,9 +1167,11 @@ class BackupService:
         files: list[dict[str, object]] = []
         snapshots: list[dict[str, object]] = []
         metadata: dict[str, object] = {}
+        metadata_found = False
         try:
             with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
-                members = [member for member in archive.getmembers() if member.isfile()]
+                members = _validate_archive_members(archive.getmembers())
+                members = [member for member in members if member.isfile()]
                 for member in members:
                     extracted = archive.extractfile(member)
                     if extracted is None:
@@ -1036,12 +1179,10 @@ class BackupService:
                     raw = extracted.read()
                     name = member.name
                     if name == "backup-metadata.json":
-                        try:
-                            parsed = json.loads(raw.decode("utf-8"))
-                            if isinstance(parsed, dict):
-                                metadata = parsed
-                        except Exception:
-                            metadata = {}
+                        if metadata_found:
+                            raise BackupError("backup metadata is duplicated")
+                        metadata = _decode_backup_metadata(raw)
+                        metadata_found = True
                         continue
                     if name.startswith("snapshots/") and name.endswith(".json"):
                         count = 0
@@ -1064,6 +1205,8 @@ class BackupService:
                     })
         except tarfile.TarError as exc:
             raise BackupError("解析备份压缩包失败，备份可能已损坏") from exc
+        if not metadata_found:
+            raise BackupError("backup metadata is missing or invalid")
         files.sort(key=lambda item: str(item.get("name") or ""))
         snapshots.sort(key=lambda item: str(item.get("name") or ""))
         return {
@@ -1079,21 +1222,21 @@ class BackupService:
         files: list[dict[str, object]] = []
         snapshots: list[dict[str, object]] = []
         metadata: dict[str, object] = {}
+        metadata_found = False
         try:
             with tarfile.open(source, mode="r:gz") as archive:
-                members = [member for member in archive.getmembers() if member.isfile()]
+                members = _validate_archive_members(archive.getmembers())
+                members = [member for member in members if member.isfile()]
                 for member in members:
                     extracted = archive.extractfile(member)
                     if extracted is None:
                         continue
                     name = member.name
                     if name == "backup-metadata.json":
-                        try:
-                            parsed = json.loads(extracted.read().decode("utf-8"))
-                            if isinstance(parsed, dict):
-                                metadata = parsed
-                        except Exception:
-                            metadata = {}
+                        if metadata_found:
+                            raise BackupError("backup metadata is duplicated")
+                        metadata = _decode_backup_metadata(extracted.read())
+                        metadata_found = True
                         continue
                     if name.startswith("snapshots/") and name.endswith(".json"):
                         count = 0
@@ -1121,6 +1264,8 @@ class BackupService:
                     })
         except tarfile.TarError as exc:
             raise BackupError("failed to parse backup archive; the backup may be damaged") from exc
+        if not metadata_found:
+            raise BackupError("backup metadata is missing or invalid")
         files.sort(key=lambda item: str(item.get("name") or ""))
         snapshots.sort(key=lambda item: str(item.get("name") or ""))
         return {
@@ -1173,7 +1318,18 @@ class BackupService:
             if include.get("config"):
                 self._add_file_to_archive(archive, CONFIG_FILE, "config.json")
             if include.get("register"):
-                self._add_file_to_archive(archive, DATA_DIR / "register.json", "data/register.json")
+                provider = self._register_config_provider
+                if callable(provider):
+                    register_payload = provider()
+                    if not isinstance(register_payload, dict):
+                        raise BackupError("register config backup provider returned invalid payload")
+                    self._add_bytes_to_archive(
+                        archive,
+                        "data/register.json",
+                        _json_bytes(register_payload),
+                    )
+                else:
+                    self._add_file_to_archive(archive, DATA_DIR / "register.json", "data/register.json")
             if include.get("cpa"):
                 self._add_file_to_archive(archive, DATA_DIR / "cpa_config.json", "data/cpa_config.json")
             if include.get("sub2api"):

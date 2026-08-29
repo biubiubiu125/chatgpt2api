@@ -1,4 +1,4 @@
-import { getAuthToken } from './client'
+import { getAuthToken, notifyAuthFailure } from './client'
 import type { DebugChatMessage } from './debug'
 
 export interface ChatStreamInput {
@@ -123,6 +123,7 @@ export async function streamChatCompletion(input: ChatStreamInput): Promise<Chat
   })
 
   if (!response.ok) {
+    notifyAuthFailure(response.status)
     throw new Error(await responseError(response))
   }
 

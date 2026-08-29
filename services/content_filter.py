@@ -142,8 +142,30 @@ def _resolve_fail_open(review: dict) -> bool:
         return True
     if isinstance(value, bool):
         return value
+    if isinstance(value, (int, float)):
+        return bool(value)
     if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "on", "enabled"}:
+            return True
+        if text in {"0", "false", "no", "n", "off", "disabled", "none", "null", ""}:
+            return False
+    return bool(value)
+
+
+def _resolve_enabled(review: dict) -> bool:
+    value = review.get("enabled")
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "disabled", "none", "null", ""}:
+        return False
     return bool(value)
 
 
@@ -156,7 +178,7 @@ def check_request(text: str) -> None:
         if word in text:
             raise HTTPException(status_code=400, detail={"error": "检测到敏感词，拒绝本次任务"})
     review = config.ai_review
-    if not review.get("enabled"):
+    if not _resolve_enabled(review):
         return
     base_url = str(review.get("base_url") or "").strip().rstrip("/")
     api_key = str(review.get("api_key") or "").strip()

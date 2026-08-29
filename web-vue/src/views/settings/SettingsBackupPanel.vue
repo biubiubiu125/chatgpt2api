@@ -110,6 +110,26 @@
         </div>
       </div>
 
+      <div v-if="backupDetail" class="backup-detail-card">
+        <div class="flex flex-wrap items-start justify-between gap-2">
+          <div class="min-w-0">
+            <p class="font-medium text-foreground">备份详情</p>
+            <p class="mt-1 break-all font-mono text-muted-foreground">{{ backupDetail.name || backupDetail.key }}</p>
+          </div>
+          <MetaChip v-if="backupDetail.encrypted" size="xs" tone="warning" variant="outline">已加密</MetaChip>
+        </div>
+        <div class="mt-3 grid grid-cols-2 gap-2 text-muted-foreground">
+          <span>大小</span>
+          <span class="text-right text-foreground">{{ formatBytes(Number(backupDetail.size_bytes ?? backupDetail.size ?? 0)) }}</span>
+          <span>对象 Key</span>
+          <span class="break-all text-right font-mono text-foreground">{{ backupDetail.key }}</span>
+          <span>最后修改</span>
+          <span class="text-right text-foreground">{{ backupDetail.last_modified || '-' }}</span>
+          <span>文件数</span>
+          <span class="text-right text-foreground">{{ Array.isArray(backupDetail.files) ? backupDetail.files.length : '-' }}</span>
+        </div>
+      </div>
+
       <div v-if="backupItems.length > 0" class="space-y-2">
         <div
           v-for="item in visibleBackupItems"
@@ -120,15 +140,42 @@
             <p class="truncate font-medium text-foreground">{{ item.name || item.key }}</p>
             <p class="mt-1 text-muted-foreground">{{ formatBytes(item.size_bytes ?? item.size ?? 0) }} · {{ item.last_modified || '-' }}</p>
           </div>
-          <Button
-            size="xs"
-            variant="outline"
-            root-class="text-rose-600"
-            :disabled="backupBusy === item.key"
-            @click="$emit('deleteItem', item)"
-          >
-            删除
-          </Button>
+          <div class="flex flex-wrap gap-1.5">
+            <Button
+              size="xs"
+              variant="outline"
+              :disabled="backupBusy === `detail:${item.key}`"
+              @click="$emit('showDetail', item)"
+            >
+              {{ backupBusy === `detail:${item.key}` ? '读取中...' : '详情' }}
+            </Button>
+            <Button
+              size="xs"
+              variant="outline"
+              :disabled="backupBusy === `download:${item.key}`"
+              @click="$emit('downloadItem', item)"
+            >
+              {{ backupBusy === `download:${item.key}` ? '下载中...' : '下载' }}
+            </Button>
+            <Button
+              size="xs"
+              variant="outline"
+              root-class="text-amber-600"
+              :disabled="Boolean(backupBusy) || backupState?.running"
+              @click="$emit('restoreItem', item)"
+            >
+              {{ backupBusy === `restore:${item.key}` ? '恢复中...' : '恢复' }}
+            </Button>
+            <Button
+              size="xs"
+              variant="outline"
+              root-class="text-rose-600"
+              :disabled="backupBusy === item.key"
+              @click="$emit('deleteItem', item)"
+            >
+              删除
+            </Button>
+          </div>
         </div>
       </div>
     </FormSection>
@@ -138,7 +185,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { Button, Checkbox, FormField, FormSection, Input } from 'nanocat-ui'
-import type { BackupItem, BackupState, BackupTestResult } from '@/api/settings'
+import type { BackupDetail, BackupItem, BackupState, BackupTestResult } from '@/api/settings'
 import type { Settings } from '@/types/api'
 import {
   backupIncludeOptions,
@@ -156,6 +203,7 @@ const props = defineProps<{
   backupState: BackupState | null
   backupItems: BackupItem[]
   backupTestResult: BackupTestResult | null
+  backupDetail: BackupDetail | null
   backupStatusText: string
 }>()
 
@@ -163,6 +211,9 @@ defineEmits<{
   testConnection: []
   runNow: []
   loadBackups: []
+  showDetail: [item: BackupItem]
+  downloadItem: [item: BackupItem]
+  restoreItem: [item: BackupItem]
   deleteItem: [item: BackupItem]
 }>()
 
@@ -175,6 +226,14 @@ const backup = computed(() => props.settings.backup as NonNullable<Settings['bac
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(13.5rem, 1fr));
   gap: 8px;
+}
+
+.backup-detail-card {
+  border: 1px solid hsl(var(--border));
+  border-radius: 14px;
+  background: hsl(var(--background) / 0.72);
+  padding: 12px;
+  font-size: 12px;
 }
 
 .backup-switch-grid {

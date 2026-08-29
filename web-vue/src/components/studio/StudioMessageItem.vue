@@ -268,7 +268,7 @@ import { hasStudioCodeContent } from '@/lib/studioMarkdownRenderer'
 import StudioMarkdownContent from './StudioMarkdownContent.vue'
 import type { StudioImageAssetView, StudioImageCompareSource, StudioMessage } from './types'
 
-export type StudioMessageActionKey = 'copy' | 'edit' | 'resend' | 'fill' | 'retry' | 'resume-image' | 'delete'
+export type StudioMessageActionKey = 'copy' | 'edit' | 'resend' | 'fill' | 'retry' | 'resume-image' | 'cancel-image' | 'delete'
 
 export interface StudioMessageAction {
   key: StudioMessageActionKey
@@ -319,6 +319,8 @@ function actionsForMessage(message: StudioMessageView): StudioMessageAction[] {
     if (message.content) actions.push({ key: 'edit', label: '编辑', icon: 'lucide:pencil' })
     actions.push({ key: 'resend', label: '重发', icon: 'lucide:refresh-cw' })
     if (message.content) actions.push({ key: 'fill', label: '填入', icon: 'lucide:clipboard-paste' })
+  } else if (message.mode === 'image' && message.task && ['queued', 'running', 'saving', 'retrying'].includes(message.task.status)) {
+    actions.push({ key: 'cancel-image', label: '取消任务', icon: 'lucide:x-circle', danger: true })
   } else if (message.mode !== 'image' || message.status === 'error') {
     if (message.mode === 'image' && message.status === 'error' && message.task?.can_resume_poll) {
       actions.push({ key: 'resume-image', label: '恢复轮询', icon: 'lucide:play' })

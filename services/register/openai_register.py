@@ -469,10 +469,14 @@ def _is_cloudflare_challenge(resp) -> bool:
 def _truthy(value: object, fallback: bool = False) -> bool:
     if isinstance(value, bool):
         return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if value is None:
+        return fallback
     text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "on"}:
+    if text in {"1", "true", "yes", "y", "on", "enabled"}:
         return True
-    if text in {"0", "false", "no", "off"}:
+    if text in {"0", "false", "no", "n", "off", "disabled", "none", "null", ""}:
         return False
     return fallback
 

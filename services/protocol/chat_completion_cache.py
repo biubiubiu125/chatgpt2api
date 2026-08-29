@@ -201,8 +201,8 @@ class ChatCompletionCache:
 
         expires_at = time.time() + int(settings.get("ttl_seconds") or 0)
         with self._lock:
-            cached_value = _strip_internal_response_fields(value)
-            self._entries[key] = CacheEntry(expires_at=expires_at, value=self._copy(cached_value))
+            cached_value = self._copy(value)
+            self._entries[key] = CacheEntry(expires_at=expires_at, value=cached_value)
             self._prune_locked(time.time(), max_entries)
             self._inflight.pop(key, None)
         with inflight.condition:
@@ -250,7 +250,7 @@ class ChatCompletionCache:
         chunks: list[dict[str, Any]] = []
         try:
             for chunk in compute():
-                chunks.append(_strip_internal_response_fields(chunk))
+                chunks.append(self._copy(chunk))
                 yield chunk
         except BaseException as exc:
             with self._lock:

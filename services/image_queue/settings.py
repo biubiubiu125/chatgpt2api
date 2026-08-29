@@ -20,30 +20,39 @@ class ImageQueueConfigurationError(RuntimeError):
     pass
 
 
-def _env_int(name: str, default: int, minimum: int = 1, maximum: int | None = None) -> int:
+def _first_env_value(name: str | tuple[str, ...], default: object) -> object:
+    names = (name,) if isinstance(name, str) else name
+    for candidate in names:
+        raw = os.getenv(candidate)
+        if raw is not None and str(raw).strip():
+            return raw
+    return default
+
+
+def _env_int(name: str | tuple[str, ...], default: int, minimum: int = 1, maximum: int | None = None) -> int:
     try:
-        value = int(str(os.getenv(name, "") or default).strip())
+        value = int(str(_first_env_value(name, default)).strip())
     except (TypeError, ValueError):
         value = default
     value = max(minimum, value)
     return min(value, maximum) if maximum is not None else value
 
 
-def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+def _env_float(name: str | tuple[str, ...], default: float, minimum: float = 0.0) -> float:
     try:
-        value = float(str(os.getenv(name, "") or default).strip())
+        value = float(str(_first_env_value(name, default)).strip())
     except (TypeError, ValueError):
         value = default
     return max(minimum, value)
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = str(os.getenv(name, "")).strip().lower()
+def _env_bool(name: str | tuple[str, ...], default: bool) -> bool:
+    raw = str(_first_env_value(name, "")).strip().lower()
     if not raw:
         return default
-    if raw in {"1", "true", "yes", "on"}:
+    if raw in {"1", "true", "yes", "y", "on", "enabled"}:
         return True
-    if raw in {"0", "false", "no", "off"}:
+    if raw in {"0", "false", "no", "n", "off", "disabled", "none", "null", ""}:
         return False
     return default
 
@@ -105,8 +114,8 @@ class ImageQueueSettings:
     def from_env(cls) -> "ImageQueueSettings":
         try:
             database_url = select_named_postgres_database(
-                dedicated_url=os.getenv("IMAGE_QUEUE_DATABASE_URL"),
-                fallback_url=os.getenv("DATABASE_URL"),
+                dedicated_url=os.getenv("IMAGE_QUEUE_DATABASE_URL") or os.getenv("CHATGPT2API_IMAGE_QUEUE_DATABASE_URL"),
+                fallback_url=os.getenv("DATABASE_URL") or os.getenv("CHATGPT2API_DATABASE_URL"),
                 expected_name=IMAGE_QUEUE_DATABASE_NAME,
                 role="image queue",
             )
@@ -116,6 +125,7 @@ class ImageQueueSettings:
         legacy_task_path = Path(str(os.getenv("IMAGE_QUEUE_LEGACY_TASK_PATH") or "data/image_tasks.json").strip())
         instance_id = str(
             os.getenv("IMAGE_QUEUE_INSTANCE_ID")
+            or os.getenv("CHATGPT2API_IMAGE_QUEUE_INSTANCE_ID")
             or os.getenv("HOSTNAME")
             or socket.gethostname()
             or "chatgpt2api"
@@ -181,20 +191,23 @@ class ImageQueueSettings:
             artifact_root=root,
             legacy_task_path=legacy_task_path,
             instance_id=instance_id,
-            verify_returned_url=_env_bool("IMAGE_QUEUE_VERIFY_RETURNED_URL", True),
+            verify_returned_url=_env_bool(
+                ("IMAGE_QUEUE_VERIFY_RETURNED_URL", "CHATGPT2API_IMAGE_QUEUE_VERIFY_RETURNED_URL"),
+                True,
+            ),
             returned_url_verify_timeout_seconds=_env_float(
-                "IMAGE_QUEUE_RETURNED_URL_VERIFY_TIMEOUT_SECONDS",
+                ("IMAGE_QUEUE_RETURNED_URL_VERIFY_TIMEOUT_SECONDS", "CHATGPT2API_IMAGE_QUEUE_RETURNED_URL_VERIFY_TIMEOUT_SECONDS"),
                 5.0,
                 0.5,
             ),
             returned_url_verify_attempts=_env_int(
-                "IMAGE_QUEUE_RETURNED_URL_VERIFY_ATTEMPTS",
+                ("IMAGE_QUEUE_RETURNED_URL_VERIFY_ATTEMPTS", "CHATGPT2API_IMAGE_QUEUE_RETURNED_URL_VERIFY_ATTEMPTS"),
                 3,
                 1,
                 10,
             ),
             returned_url_verify_max_bytes=_env_int(
-                "IMAGE_QUEUE_RETURNED_URL_VERIFY_MAX_BYTES",
+                ("IMAGE_QUEUE_RETURNED_URL_VERIFY_MAX_BYTES", "CHATGPT2API_IMAGE_QUEUE_RETURNED_URL_VERIFY_MAX_BYTES"),
                 65536,
                 512,
                 8 * 1024 * 1024,

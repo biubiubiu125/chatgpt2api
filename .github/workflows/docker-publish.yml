@@ -13,29 +13,140 @@ env:
 
 jobs:
   docker:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     concurrency:
       group: docker-${{ github.ref }}
       cancel-in-progress: true
     permissions:
-      contents: read
+      contents: write
       packages: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5
+        with:
+          python-version: "3.13"
+
+      - name: Validate shell and deployment manifests
+        run: |
+          bash -n deploy/install.sh
+          bash -n deploy/postgres-init/001-create-cluster-databases.sh
+          bash tests/scripts/test-install-script.sh
+          bash tests/scripts/test-deployment-manifest-files.sh
+          bash tests/scripts/test-frontend-script-manifest.sh
+          IMAGE_QUEUE_DATABASE_URL='postgresql://user:password@db:5432/chatgpt2api_image_queue' \
+            CHATGPT2API_WARP_IMAGE='caomingjun/warp@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+            CHATGPT2API_PRIVOXY_IMAGE='vimagick/privoxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+            docker compose -f docker-compose.yml config --quiet
+          IMAGE_QUEUE_DATABASE_URL='postgresql://user:password@db:5432/chatgpt2api_image_queue' \
+            CHATGPT2API_WARP_IMAGE='caomingjun/warp@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+            CHATGPT2API_PRIVOXY_IMAGE='vimagick/privoxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+            docker compose -f docker-compose.warp.yml config --quiet
+          POSTGRES_PASSWORD='runtime-password' \
+          POSTGRES_ADMIN_PASSWORD='admin-password' \
+          POSTGRES_PASSWORD_URLENCODED='runtime-password' \
+          POSTGRES_ADMIN_USER='chatgpt2api_admin' \
+          CHATGPT2API_CLUSTER_ID='cluster-ci' \
+          WIREGUARD_SERVER_IP='10.77.0.1' \
+            docker compose -f docker-compose.cluster-main.yml config --quiet
+          APP_DATABASE_URL='postgresql://runtime:password@10.77.0.1:5432/chatgpt2api_app' \
+          IMAGE_QUEUE_DATABASE_URL='postgresql://runtime:password@10.77.0.1:5432/chatgpt2api_image_queue' \
+          CHATGPT2API_WORKER_ID='worker-1' \
+          CHATGPT2API_WIREGUARD_IP='10.77.0.11' \
+          CHATGPT2API_IMAGE_BASE_URL='https://img.example.com/images' \
+          CHATGPT2API_CLUSTER_ID='cluster-ci' \
+            docker compose -f docker-compose.cluster-worker.yml config --quiet
+          docker compose -f docker-compose.local.yml config --quiet
+
+      - name: Read release build arguments
+        id: release
+        run: |
+          set -euo pipefail
+          manifest_value() {
+            local key="$1"
+            local manifest_ref=""
+            if [ -f deploy/release-manifest.env ]; then
+              manifest_ref="$(sed -n 's/^CHATGPT2API_RELEASE_REF=//p' deploy/release-manifest.env | head -n 1)"
+            fi
+            if [ "${manifest_ref}" = "${GITHUB_SHA}" ]; then
+              sed -n "s/^${key}=//p" deploy/release-manifest.env | head -n 1
+            fi
+          }
+          strip_optional_quotes() {
+            local value="$1"
+            value="${value#\"}"
+            value="${value%\"}"
+            printf '%s' "${value}"
+          }
+          UV_VERSION="$(manifest_value UV_VERSION)"
+          if [ -z "${UV_VERSION}" ]; then
+            UV_VERSION="$(sed -n 's/^ARG UV_VERSION=//p' Dockerfile | head -n 1)"
+          fi
+          test -n "${UV_VERSION}"
+          WARP_IMAGE="$(strip_optional_quotes "$(manifest_value CHATGPT2API_WARP_IMAGE)")"
+          PRIVOXY_IMAGE="$(strip_optional_quotes "$(manifest_value CHATGPT2API_PRIVOXY_IMAGE)")"
+          FLARESOLVERR_IMAGE="$(strip_optional_quotes "$(manifest_value CHATGPT2API_FLARESOLVERR_IMAGE)")"
+          if [ -z "${WARP_IMAGE}" ]; then
+            WARP_IMAGE="$(strip_optional_quotes "$(sed -n 's/^DEFAULT_CHATGPT2API_WARP_IMAGE=//p' deploy/install.sh | head -n 1)")"
+          fi
+          if [ -z "${PRIVOXY_IMAGE}" ]; then
+            PRIVOXY_IMAGE="$(strip_optional_quotes "$(sed -n 's/^DEFAULT_CHATGPT2API_PRIVOXY_IMAGE=//p' deploy/install.sh | head -n 1)")"
+          fi
+          if [ -z "${FLARESOLVERR_IMAGE}" ]; then
+            FLARESOLVERR_IMAGE="$(strip_optional_quotes "$(sed -n 's/^DEFAULT_CHATGPT2API_FLARESOLVERR_IMAGE=//p' deploy/install.sh | head -n 1)")"
+          fi
+          test -n "${WARP_IMAGE}"
+          test -n "${PRIVOXY_IMAGE}"
+          test -n "${FLARESOLVERR_IMAGE}"
+          printf 'uv_version=%s\n' "${UV_VERSION}" >> "${GITHUB_OUTPUT}"
+          printf 'warp_image=%s\n' "${WARP_IMAGE}" >> "${GITHUB_OUTPUT}"
+          printf 'privoxy_image=%s\n' "${PRIVOXY_IMAGE}" >> "${GITHUB_OUTPUT}"
+          printf 'flaresolverr_image=%s\n' "${FLARESOLVERR_IMAGE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate installer release pin
+        run: |
+          set -euo pipefail
+          strip_optional_quotes() {
+            local value="$1"
+            value="${value#\"}"
+            value="${value%\"}"
+            printf '%s' "${value}"
+          }
+          default_release_ref="$(strip_optional_quotes "$(sed -n 's/^DEFAULT_RELEASE_REF=//p' deploy/install.sh | head -n 1)")"
+          test "${default_release_ref}" = "${GITHUB_SHA}"
+
+      - name: Validate frontend regression scripts
+        working-directory: web-vue
+        run: |
+          npm ci --no-audit --no-fund
+          npm run test:debug-center-editable-tasks
+          npm run test:register-provider
+          npm run test:studio-image-tasks
+          npm run test:third-party-links
+          npm run build
+
+      - name: Validate backend regression tests
+        run: |
+          python -m pip install --disable-pip-version-check --no-input "uv==${{ steps.release.outputs.uv_version }}"
+          uv sync --frozen --dev
+          .venv/bin/python -m pytest -q
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         with:
           platforms: arm64
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -43,11 +154,10 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.IMAGE_REPOSITORY }}
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
             type=ref,event=branch
             type=ref,event=tag
             type=sha
@@ -55,7 +165,8 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Build and push image
-        uses: docker/build-push-action@v6
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: ./Dockerfile
@@ -64,5 +175,39 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            UV_VERSION=${{ steps.release.outputs.uv_version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Publish release manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          image_digest="${{ steps.build.outputs.digest }}"
+          [[ "${image_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          cat > deploy/release-manifest.env <<EOF
+          # Generated from the immutable source commit and published image digest.
+          CHATGPT2API_RELEASE_REF=${GITHUB_SHA}
+          CHATGPT2API_IMAGE=${IMAGE_REPOSITORY}@${image_digest}
+          CHATGPT2API_IMAGE_DIGEST=${image_digest}
+          UV_VERSION=${{ steps.release.outputs.uv_version }}
+          CHATGPT2API_WARP_IMAGE=${{ steps.release.outputs.warp_image }}
+          CHATGPT2API_PRIVOXY_IMAGE=${{ steps.release.outputs.privoxy_image }}
+          CHATGPT2API_FLARESOLVERR_IMAGE=${{ steps.release.outputs.flaresolverr_image }}
+          EOF
+          python scripts/validate_release_manifest.py \
+            --manifest deploy/release-manifest.env \
+            --image-repository "${IMAGE_REPOSITORY}" \
+            --release-ref "${GITHUB_SHA}"
+          release_tag="chatgpt2api-${GITHUB_SHA}"
+          if gh release view "${release_tag}" >/dev/null 2>&1; then
+            gh release upload "${release_tag}" deploy/release-manifest.env --clobber
+          else
+            gh release create "${release_tag}" \
+              --target "${GITHUB_SHA}" \
+              --title "chatgpt2api ${GITHUB_SHA}" \
+              --notes "Immutable deployment manifest for ${GITHUB_SHA}" \
+              deploy/release-manifest.env
+          fi

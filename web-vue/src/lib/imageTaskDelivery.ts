@@ -1,5 +1,7 @@
 export const IMAGE_LOAD_ERROR_PREFIX = '图片加载失败，请检查图片访问路径后重试。'
 
+const apiBaseUrl = String(import.meta.env.VITE_API_URL || '').replace(/\/+$/, '')
+
 type ImageTaskLikeMessage = {
   mode?: string
   status?: string
@@ -28,6 +30,10 @@ export function cleanImageTaskText(value: unknown) {
   return String(value ?? '').trim()
 }
 
+function publicImageTaskAssetUrl(path: string) {
+  return apiBaseUrl ? `${apiBaseUrl}${path}` : path
+}
+
 export function imageTaskMessageLookupId(message: ImageTaskLikeMessage | null | undefined) {
   if (!message) return ''
   return cleanImageTaskText(message.taskId) || cleanImageTaskText(message.clientTaskId)
@@ -50,9 +56,9 @@ function relativeImagePathUrl(value: unknown) {
   const rel = cleaned.replace(/^\/+/, '')
   if (!rel || rel.includes('..')) return ''
   if (rel.startsWith('images/') || rel.startsWith('image-thumbnails/')) {
-    return `/${rel}`
+    return publicImageTaskAssetUrl(`/${rel}`)
   }
-  return `/images/${rel}`
+  return publicImageTaskAssetUrl(`/images/${rel}`)
 }
 
 export function resolveImageTaskAssetUrl(asset: ImageTaskLikeAsset | null | undefined) {

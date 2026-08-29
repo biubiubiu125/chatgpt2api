@@ -6,6 +6,12 @@ from typing import Any
 
 
 _QUERY_SECRET_RE = re.compile(r"([?&]key=)([^&#\s'\"<>]+)", re.IGNORECASE)
+_BEARER_SECRET_RE = re.compile(r"(\bAuthorization\s*:\s*Bearer\s+)([^,\s;}\]]+)", re.IGNORECASE)
+_CREDENTIAL_FIELD_RE = re.compile(
+    r"(\b(?:password|access_token|refresh_token|id_token|api_key|claim_token)\b\s*\"?\s*[:=]\s*)"
+    r"(?:\"([^\"]*)\"|([^,\s;}\]]+))",
+    re.IGNORECASE,
+)
 
 
 def redact_register_log_text(text: object) -> str:
@@ -13,6 +19,11 @@ def redact_register_log_text(text: object) -> str:
     if not value:
         return ""
     value = _QUERY_SECRET_RE.sub(lambda match: f"{match.group(1)}***", value)
+    value = _BEARER_SECRET_RE.sub(lambda match: f"{match.group(1)}***", value)
+    value = _CREDENTIAL_FIELD_RE.sub(
+        lambda match: f'{match.group(1)}"{ "***" }"' if match.group(2) is not None else f"{match.group(1)}***",
+        value,
+    )
     return value
 
 

@@ -92,10 +92,12 @@ def _outlook_credential_changed(old: dict | None, new: dict) -> bool:
 def _safe_bool(value: object, fallback: bool = False) -> bool:
     if isinstance(value, bool):
         return value
+    if isinstance(value, (int, float)):
+        return bool(value)
     text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "on"}:
+    if text in {"1", "true", "yes", "y", "on", "enabled"}:
         return True
-    if text in {"0", "false", "no", "off"}:
+    if text in {"0", "false", "no", "n", "off", "disabled", "none", "null", ""}:
         return False
     return fallback
 
@@ -326,7 +328,7 @@ def _normalize(raw: dict) -> dict:
         wait_interval = 2
     cfg["mail"]["wait_interval"] = max(0.2, min(cfg["mail"]["wait_timeout"], wait_interval))
     cfg["mail"].pop("proxy", None)
-    cfg["enabled"] = bool(cfg.get("enabled"))
+    cfg["enabled"] = _safe_bool(cfg.get("enabled"), False)
     stats_raw = raw.get("stats") if isinstance(raw.get("stats"), dict) else {}
     stats = {**_default_config()["stats"], **stats_raw}
     if "threads" not in stats_raw:
@@ -872,25 +874,27 @@ class RegisterService:
 
     def update(self, updates: dict) -> dict:
         with self._lock:
-            self._reload_locked()
-            self._merge_provider_secrets(updates)
-            self._merge_outlook_pools(updates)
-            self._config = _normalize({**self._config, **updates})
-            self._drop_mail_proxy()
-            if not (self._runner and self._runner.is_alive()) and not self._runtime_lease_active_locked():
-                self._config["stats"]["threads"] = self._config["threads"]
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "proxy_required", "max_inflight_per_proxy", "total", "threads")})
-            self._save()
+            with file_lock(self._lock_path()):
+                self._config = self._load_unlocked()
+                self._merge_provider_secrets(updates)
+                self._merge_outlook_pools(updates)
+                self._config = _normalize({**self._config, **updates})
+                self._drop_mail_proxy()
+                if not (self._runner and self._runner.is_alive()) and not self._runtime_lease_active_locked():
+                    self._config["stats"]["threads"] = self._config["threads"]
+                openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "proxy_required", "max_inflight_per_proxy", "total", "threads")})
+                self._save_unlocked()
             return self.get()
 
     def start(self) -> dict:
         if not self._cluster_settings.run_worker:
             with self._lock:
-                self._reload_locked()
-                self._config["enabled"] = True
-                self._config["stats"]["pause_reason"] = "worker_role_required"
-                self._config["stats"]["updated_at"] = _now()
-                self._save()
+                with file_lock(self._lock_path()):
+                    self._config = self._load_unlocked()
+                    self._config["enabled"] = True
+                    self._config["stats"]["pause_reason"] = "worker_role_required"
+                    self._config["stats"]["updated_at"] = _now()
+                    self._save_unlocked()
             return self.get()
         start_runner = False
         start_log = ""
@@ -994,24 +998,29 @@ class RegisterService:
         return self.get()
 
     def reset(self) -> dict:
+        pool_metrics = self._pool_metrics()
         with self._lock:
-            self._reload_locked()
-            self._logs = []
-            self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), "updated_at": _now()}
-            with openai_register.stats_lock:
-                openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
-            self._save()
+            with file_lock(self._lock_path()):
+                self._config = self._load_unlocked()
+                if self._runner and self._runner.is_alive() or self._runtime_lease_active_locked():
+                    raise ValueError("registration runtime is still active; stop it before resetting")
+                self._logs = []
+                self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **pool_metrics, "updated_at": _now()}
+                with openai_register.stats_lock:
+                    openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
+                self._save_unlocked()
             return self.get()
 
     def reset_outlook_pool(self, scope: str = "all") -> dict:
         scope = str(scope or "all").strip().lower()
         if scope == "unused":
             with self._lock:
-                self._reload_locked()
-                removed = self._prune_unused_outlook_pools()
-                openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "proxy_required", "max_inflight_per_proxy", "total", "threads")})
-                self._save()
-                self._append_log(f"已清空 Outlook 邮箱池未使用邮箱，移除 {removed} 个", "yellow")
+                with file_lock(self._lock_path()):
+                    self._config = self._load_unlocked()
+                    removed = self._prune_unused_outlook_pools()
+                    openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "proxy_required", "max_inflight_per_proxy", "total", "threads")})
+                    self._save_unlocked()
+                    self._append_log(f"已清空 Outlook 邮箱池未使用邮箱，移除 {removed} 个", "yellow")
             return self.get()
         scope_aliases = {"failed": "retryable", "retryable": "retryable", "invalid": "invalid", "all": "all"}
         scope = scope_aliases.get(scope, "all")
@@ -1058,10 +1067,6 @@ class RegisterService:
             key: core_result.get(key)
             for key in (
                 "email",
-                "password",
-                "access_token",
-                "refresh_token",
-                "id_token",
                 "source_type",
                 "created_at",
             )
@@ -1127,8 +1132,7 @@ class RegisterService:
                     )
                     if not self._set_runtime_lease_locked(runtime_state):
                         self._shutdown_event.set()
-                        self._config["enabled"] = False
-                        stats["pause_reason"] = "runtime_lease_lost"
+                        return
                 self._save_stats_unlocked()
 
     @staticmethod
@@ -1175,6 +1179,12 @@ class RegisterService:
             with self._lock:
                 with file_lock(self._lock_path()):
                     self._config = self._load_unlocked()
+                    runtime = self._config.get("runtime") if isinstance(self._config.get("runtime"), dict) else {}
+                    if (
+                        str(runtime.get("owner_id") or "") != self._owner_id
+                        or str(runtime.get("run_id") or "") != self._run_id
+                    ):
+                        return
                     stats = self._config.setdefault("stats", {})
                     stats.update({
                         "running": 0,

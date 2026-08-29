@@ -14,6 +14,10 @@ from curl_cffi.requests.exceptions import RequestException
 from curl_cffi.requests.models import STREAM_END
 from fastapi import HTTPException
 from services.image_queue.idempotency import PUBLIC_IMAGE_MODELS
+from utils.diagnostics import (
+    diagnostic_excerpt,
+    sanitize_diagnostic_value,
+)
 from utils.log import logger
 
 BASE_IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
@@ -170,10 +174,7 @@ def is_codex_image_model(model: object) -> bool:
 
 def is_image_chat_request(body: dict[str, object]) -> bool:
     model = str(body.get("model") or "").strip()
-    modalities = body.get("modalities")
-    if is_supported_image_model(model):
-        return True
-    return isinstance(modalities, list) and "image" in {str(item or "").strip().lower() for item in modalities}
+    return is_supported_image_model(model)
 
 
 _UPSTREAM_BODY_LOG_LIMIT = 500
@@ -205,16 +206,21 @@ class UpstreamHTTPError(RuntimeError):
             if credential_scope in {"account", "signed_asset", "public"}
             else "account"
         )
-        if isinstance(body, (dict, list)):
+        safe_body = sanitize_diagnostic_value(body, string_limit=_UPSTREAM_BODY_LOG_LIMIT)
+        if isinstance(safe_body, (dict, list)):
             try:
-                body_str = json.dumps(body, ensure_ascii=False)
+                body_str = json.dumps(safe_body, ensure_ascii=False)
             except (TypeError, ValueError):
-                body_str = repr(body)
+                body_str = repr(safe_body)
         else:
-            body_str = str(body)
+            body_str = str(safe_body)
         if len(body_str) > _UPSTREAM_BODY_LOG_LIMIT:
             body_str = body_str[:_UPSTREAM_BODY_LOG_LIMIT] + "…[truncated]"
         super().__init__(f"{context} failed: status={status_code}, body={body_str}")
+
+    @property
+    def public_message(self) -> str:
+        return f"upstream request failed with status {int(self.status_code or 0)}"
 
 
 def ensure_ok(
@@ -252,16 +258,9 @@ def _stream_error_payload(
     if hasattr(exc, "to_openai_error"):
         return exc.to_openai_error()
     if isinstance(exc, UpstreamHTTPError):
-        message = str(exc)
-        if isinstance(exc.body, dict):
-            nested = exc.body.get("error")
-            if isinstance(nested, dict):
-                message = str(nested.get("message") or message)
-            else:
-                message = str(exc.body.get("message") or message)
         payload: dict[str, Any] = {
             "error": {
-                "message": message,
+                "message": exc.public_message,
                 "type": "upstream_error",
                 "code": f"upstream_{exc.status_code}",
             },
@@ -272,22 +271,25 @@ def _stream_error_payload(
         return payload
     if error_builder is not None:
         return error_builder(exc)
-    return {"error": {"message": str(exc), "type": exc.__class__.__name__}}
+    return {"error": {"message": diagnostic_excerpt(str(exc), 500), "type": exc.__class__.__name__}}
 
 
 def sse_json_stream(
     items,
     error_builder: Callable[[Exception], dict[str, Any]] | None = None,
+    on_error: Callable[[Exception], None] | None = None,
 ) -> Iterator[str]:
     yield ": stream-open\n\n"
     try:
         for item in items:
             yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
     except Exception as exc:
+        if on_error is not None:
+            on_error(exc)
         logger.warning({
             "event": "sse_stream_error",
             "error_type": exc.__class__.__name__,
-            "error": str(exc),
+            "error": diagnostic_excerpt(str(exc), 500),
         })
         error = _stream_error_payload(exc, error_builder)
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
@@ -298,6 +300,7 @@ def sse_json_stream(
 def image_sse_stream(
     items,
     error_builder: Callable[[Exception], dict[str, Any]] | None = None,
+    on_error: Callable[[Exception], None] | None = None,
 ) -> Iterator[str]:
     try:
         for item in items:
@@ -305,27 +308,34 @@ def image_sse_stream(
             yield f"event: {event}\n"
             yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
     except Exception as exc:
+        if on_error is not None:
+            on_error(exc)
         logger.warning({
             "event": "image_sse_stream_error",
             "error_type": exc.__class__.__name__,
-            "error": str(exc),
+            "error": diagnostic_excerpt(str(exc), 500),
         })
         error = _stream_error_payload(exc, error_builder)
         yield "event: error\n"
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 
 
-def anthropic_sse_stream(items) -> Iterator[str]:
+def anthropic_sse_stream(
+    items,
+    on_error: Callable[[Exception], None] | None = None,
+) -> Iterator[str]:
     try:
         for item in items:
             event = str(item.get("type") or "message_delta") if isinstance(item, dict) else "message_delta"
             yield f"event: {event}\n"
             yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
     except Exception as exc:
+        if on_error is not None:
+            on_error(exc)
         logger.warning({
             "event": "anthropic_sse_stream_error",
             "error_type": exc.__class__.__name__,
-            "error": str(exc),
+            "error": diagnostic_excerpt(str(exc), 500),
         })
         payload = _stream_error_payload(exc, None)
         source_error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
@@ -333,7 +343,7 @@ def anthropic_sse_stream(items) -> Iterator[str]:
             "type": "error",
             "error": {
                 "type": str(source_error.get("type") or "api_error"),
-                "message": str(source_error.get("message") or str(exc)),
+                "message": str(source_error.get("message") or diagnostic_excerpt(str(exc), 500)),
             },
         }
         for key in ("status_code", "retry_after"):
@@ -556,13 +566,17 @@ def has_response_image_generation_tool(body: dict[str, object]) -> bool:
     model = str(body.get("model") or "").strip().lower()
     if model in PUBLIC_IMAGE_MODELS:
         return True
+    tool_choice = body.get("tool_choice")
+    if str(tool_choice or "").strip().lower() == "none":
+        return False
+    if isinstance(tool_choice, dict):
+        return str(tool_choice.get("type") or "").strip() == "image_generation"
     tools = body.get("tools")
     if isinstance(tools, list):
         for tool in tools:
             if isinstance(tool, dict) and str(tool.get("type") or "").strip() == "image_generation":
                 return True
-    tool_choice = body.get("tool_choice")
-    return isinstance(tool_choice, dict) and str(tool_choice.get("type") or "").strip() == "image_generation"
+    return False
 
 
 def extract_prompt_from_message_content(content: object) -> str:

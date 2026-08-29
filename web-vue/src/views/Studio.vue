@@ -85,6 +85,7 @@
         @resend="resendMessage"
         @retry-assistant="retryAssistantMessage"
         @resume-image-task="resumeImageTask"
+        @cancel-image-task="cancelImageTask"
         @delete-message="deleteMessage"
         @copy-message="copyText"
         @preview="openPreview"
@@ -162,6 +163,7 @@ import { Icon } from '@iconify/vue'
 import { Button } from 'nanocat-ui'
 import { computed, defineAsyncComponent, onBeforeUnmount, ref } from 'vue'
 import { useSettingsStore } from '@/stores/settings'
+import { useAuthStore } from '@/stores/auth'
 import { useToast } from '@/composables/useToast'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { usePageRuntime } from '@/composables/usePageRuntime'
@@ -217,6 +219,7 @@ const StudioInpaintModal = defineAsyncComponent(() => import('@/components/studi
 const StudioImageCompareModal = defineAsyncComponent(() => import('@/components/studio/StudioImageCompareModal.vue'))
 
 const settingsStore = useSettingsStore()
+const authStore = useAuthStore()
 const toast = useToast()
 const confirmDialog = useConfirmDialog()
 const pageRuntime = usePageRuntime('studio')
@@ -312,6 +315,11 @@ function handleImageAssetError(message: StudioMessage, asset: StudioImageAssetVi
 function resumeImageTask(message: StudioMessage) {
   if (!message.taskId) return
   void imageTaskRuntime.resumeImageTask(message.taskId)
+}
+
+function cancelImageTask(message: StudioMessage) {
+  if (!message.taskId) return
+  void imageTaskRuntime.cancelImageTask(message.taskId)
 }
 
 const chatStreamRuntime = useStudioChatStreamRuntime({
@@ -678,8 +686,8 @@ function ensureActiveConversation() {
 
 function initializeStudio() {
   ensureActiveConversation()
-  if (!settingsStore.settings && !settingsStore.isLoading) {
-    void settingsStore.loadSettings()
+  if (authStore.isAdmin && !settingsStore.settings && !settingsStore.isLoading) {
+    void settingsStore.loadSettings().catch(() => {})
   }
   void modelFormRuntime.loadModelCatalog()
   void preloadPromptLibrary()

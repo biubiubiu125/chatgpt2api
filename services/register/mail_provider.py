@@ -2836,9 +2836,9 @@ def _normalize_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return value != 0
     text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "on", "y"}:
+    if text in {"1", "true", "yes", "on", "y", "enabled"}:
         return True
-    if text in {"0", "false", "no", "off", "n"}:
+    if text in {"0", "false", "no", "off", "n", "disabled", "none", "null", ""}:
         return False
     return default
 

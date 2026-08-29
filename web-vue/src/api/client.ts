@@ -20,7 +20,8 @@ export function clearAuthToken() {
   window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY)
 }
 
-type UnauthorizedHandler = () => void | Promise<void>
+export type AuthFailureReason = 'unauthorized' | 'forbidden'
+type UnauthorizedHandler = (reason: AuthFailureReason, error?: unknown) => void | Promise<void>
 
 let unauthorizedHandler: UnauthorizedHandler | null = null
 
@@ -28,12 +29,30 @@ export function setUnauthorizedHandler(handler: UnauthorizedHandler | null) {
   unauthorizedHandler = handler
 }
 
+let isRedirectingToLogin = false
+
+export function notifyAuthFailure(status: number | undefined, error?: unknown) {
+  const code = Number(status || 0)
+  if (code !== 401 && code !== 403) return false
+  const onLoginPage = window.location.hash.startsWith('#/login')
+  if (onLoginPage || isRedirectingToLogin) return true
+  isRedirectingToLogin = true
+  if (code === 401) clearAuthToken()
+  const reason: AuthFailureReason = code === 403 ? 'forbidden' : 'unauthorized'
+  Promise.resolve(unauthorizedHandler?.(reason, error))
+    .catch(() => {})
+    .finally(() => {
+      window.setTimeout(() => {
+        isRedirectingToLogin = false
+      }, 200)
+    })
+  return true
+}
+
 export const apiClient: AxiosInstance = axios.create({
   baseURL: import.meta.env.VITE_API_URL || '',
   timeout: 60000,
 })
-
-let isRedirectingToLogin = false
 
 apiClient.interceptors.request.use(
   (config) => {
@@ -54,19 +73,8 @@ apiClient.interceptors.response.use(
     const isAuthProbe = requestUrl.includes('/auth/status')
     const isLoginRequest = requestUrl.includes('/auth/login')
 
-    if (status === 401 && !isLoginRequest && !isAuthProbe) {
-      const onLoginPage = window.location.hash.startsWith('#/login')
-      if (!onLoginPage && !isRedirectingToLogin) {
-        isRedirectingToLogin = true
-        clearAuthToken()
-        Promise.resolve(unauthorizedHandler?.())
-          .catch(() => {})
-          .finally(() => {
-            window.setTimeout(() => {
-              isRedirectingToLogin = false
-            }, 200)
-          })
-      }
+    if ((status === 401 || status === 403) && !isLoginRequest && !isAuthProbe) {
+      notifyAuthFailure(status, error)
     }
 
     const errorMessage = formatErrorMessage(error.response?.data || error.message, { fallback: error.message, status })

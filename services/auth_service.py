@@ -23,6 +23,19 @@ def _hash_key(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _normalize_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    raw = str(value or "").strip().lower()
+    if raw in {"1", "true", "yes", "y", "on", "enabled"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off", "disabled", "none", "null", ""}:
+        return False
+    return default
+
+
 class LazyAuthService:
     def __init__(self, factory: Callable[[], "AuthService"]):
         self._factory = factory
@@ -90,7 +103,7 @@ class AuthService:
             "name": name,
             "role": role,
             "key_hash": key_hash,
-            "enabled": bool(raw.get("enabled", True)),
+            "enabled": _normalize_bool(raw.get("enabled", True), True),
             "created_at": created_at,
             "last_used_at": last_used_at,
         }
@@ -122,7 +135,7 @@ class AuthService:
             "id": item.get("id"),
             "name": item.get("name"),
             "role": item.get("role"),
-            "enabled": bool(item.get("enabled", True)),
+            "enabled": _normalize_bool(item.get("enabled", True), True),
             "created_at": item.get("created_at"),
             "last_used_at": item.get("last_used_at"),
         }
@@ -238,7 +251,7 @@ class AuthService:
                         exclude_id=normalized_id,
                     )
                 if "enabled" in updates and updates.get("enabled") is not None:
-                    next_item["enabled"] = bool(updates.get("enabled"))
+                    next_item["enabled"] = _normalize_bool(updates.get("enabled"), True)
                 if "key" in updates and updates.get("key") is not None:
                     next_item["key_hash"] = self._build_key_hash_locked(str(updates.get("key") or ""), exclude_id=normalized_id)
                 self._items[index] = next_item
@@ -271,7 +284,7 @@ class AuthService:
         with self._lock:
             self._reload_locked()
             for index, item in enumerate(self._items):
-                if not bool(item.get("enabled", True)):
+                if not _normalize_bool(item.get("enabled", True), True):
                     continue
                 stored_hash = self._clean(item.get("key_hash"))
                 if not stored_hash or not hmac.compare_digest(stored_hash, candidate_hash):

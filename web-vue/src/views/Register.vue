@@ -77,6 +77,7 @@
 
         <RegisterRuntimePanel
           :enabled="registerConfig.enabled"
+          :state="registerTaskState"
           :saving="legacySaving"
           :action-disabled="registerActionDisabled"
           :runtime-hint="registerRuntimeHint"

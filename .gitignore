@@ -13,10 +13,15 @@ data
 config.json
 config.local*.json
 edit
+deploy/worker-*.join
+deploy/workers.tsv
+deploy/nginx-worker-images.conf
+run-python.sh
 
 docker-compose-local.yml
 
 .claude/settings.local.json
+.chatgpt2api-trash/
 
 # Environment variables
 .env

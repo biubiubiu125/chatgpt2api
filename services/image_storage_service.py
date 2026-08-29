@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import mimetypes
 import os
 import tempfile
 import time
@@ -12,7 +13,7 @@ from threading import Lock
 from urllib.parse import quote, urlparse
 from uuid import UUID
 
-from curl_cffi import requests
+from curl_cffi import CurlOpt, requests
 from fastapi import HTTPException
 from PIL import Image
 
@@ -25,7 +26,15 @@ from utils.timezone import beijing_datetime_from_timestamp, beijing_now, beijing
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
 IMAGE_INDEX_LOCK = Lock()
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+IMAGE_CONTENT_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+}
 
 
 def _is_private_queue_artifact(rel: str) -> bool:
@@ -55,6 +64,28 @@ def _has_image_extension(path: str) -> bool:
     return Path(safe_rel).suffix.lower() in IMAGE_EXTENSIONS
 
 
+def content_type_for_path(path: str) -> str:
+    suffix = Path(str(path or "")).suffix.lower()
+    return IMAGE_CONTENT_TYPES.get(suffix) or mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+
+
+def _restore_remote_payload(rel: str, payload: bytes, settings: dict[str, object] | None) -> None:
+    if not settings:
+        return
+    try:
+        with _webdav_client(settings) as client:
+            client.put_atomic(rel, payload, content_type=content_type_for_path(rel))
+    except Exception:
+        pass
+
+
+MAX_WEBDAV_READ_BYTES = 50 * 1024 * 1024
+
+
+class _WebDAVResponseTooLarge(RuntimeError):
+    pass
+
+
 class ImageStorageError(RuntimeError):
     pass
 
@@ -69,6 +100,21 @@ class StoredImage:
 
 def _clean(value: object) -> str:
     return str(value or "").strip()
+
+
+def _coerce_bool(value: object, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    raw = _clean(value).lower()
+    if raw in {"1", "true", "yes", "y", "on", "enabled"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off", "disabled", "none", "null", ""}:
+        return False
+    return default
 
 
 def _now_iso() -> str:
@@ -159,7 +205,11 @@ class WebDAVClient:
         self.username = _clean(settings.get("webdav_username"))
         self.password = _clean(settings.get("webdav_password"))
         self.root_path = _clean(settings.get("webdav_root_path")).strip("/")
-        self.session = requests.Session()
+        self.session = requests.Session(
+            allow_redirects=False,
+            trust_env=False,
+            curl_options={CurlOpt.NOPROXY: "*"},
+        )
 
     def close(self) -> None:
         self.session.close()
@@ -173,10 +223,33 @@ class WebDAVClient:
     def _auth_kwargs(self) -> dict[str, object]:
         return {"auth": (self.username, self.password)} if self.username or self.password else {}
 
-    def _request(self, method: str, url: str, **kwargs):
-        response = self.session.request(method, url, timeout=30, **self._auth_kwargs(), **kwargs)
-        if response.status_code >= 400 and not (method == "MKCOL" and response.status_code in {405}):
-            raise ImageStorageError(f"WebDAV {method} failed: HTTP {response.status_code}")
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        allowed_statuses: set[int] | None = None,
+        **kwargs,
+    ):
+        request_kwargs = {
+            "timeout": 30,
+            "allow_redirects": False,
+            "curl_options": {CurlOpt.NOPROXY: "*"},
+            **self._auth_kwargs(),
+            **kwargs,
+        }
+        try:
+            response = self.session.request(method, url, **request_kwargs)
+        except _WebDAVResponseTooLarge as exc:
+            raise ImageStorageError(
+                f"WebDAV {method} failed: response exceeds {MAX_WEBDAV_READ_BYTES} bytes"
+            ) from exc
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        allowed = allowed_statuses or set()
+        if 300 <= status_code < 400:
+            raise ImageStorageError(f"WebDAV {method} failed: redirects are not allowed")
+        if status_code >= 400 and status_code not in allowed:
+            raise ImageStorageError(f"WebDAV {method} failed: HTTP {status_code}")
         return response
 
     def remote_url(self, rel: str = "") -> str:
@@ -191,19 +264,20 @@ class WebDAVClient:
             if not item:
                 continue
             current = f"{current}/{quote(item, safe='')}"
-            response = self.session.request("MKCOL", current, timeout=30, **self._auth_kwargs())
-            if response.status_code in {201, 405}:
-                continue
-            if response.status_code >= 400:
-                raise ImageStorageError(f"WebDAV MKCOL failed: HTTP {response.status_code}")
+            self._request("MKCOL", current, allowed_statuses={405})
 
-    def put(self, rel: str, payload: bytes, content_type: str = "image/png") -> str:
+    def put(self, rel: str, payload: bytes, content_type: str | None = None) -> str:
         self.ensure_dirs(rel)
         url = self.remote_url(rel)
-        self._request("PUT", url, data=payload, headers={"Content-Type": content_type})
+        self._request(
+            "PUT",
+            url,
+            data=payload,
+            headers={"Content-Type": content_type or content_type_for_path(rel)},
+        )
         return url
 
-    def put_atomic(self, rel: str, payload: bytes, content_type: str = "image/png") -> str:
+    def put_atomic(self, rel: str, payload: bytes, content_type: str | None = None) -> str:
         safe_rel = _safe_relative_path(rel)
         temporary_rel = f"{safe_rel}.{int(time.time() * 1000)}.tmp"
         self.put(temporary_rel, payload, content_type=content_type)
@@ -222,15 +296,40 @@ class WebDAVClient:
             raise
         return destination
 
+    def exists(self, rel: str) -> bool:
+        url = self.remote_url(rel)
+        for method in ("HEAD", "GET"):
+            response = self._request(method, url, allowed_statuses={404, 405, 501})
+            if 200 <= response.status_code < 300:
+                return True
+            if response.status_code == 404:
+                return False
+            if method == "HEAD" and response.status_code in {405, 501}:
+                continue
+            raise ImageStorageError(f"WebDAV {method} failed: HTTP {response.status_code}")
+        return False
+
     def get(self, rel: str) -> bytes:
-        response = self._request("GET", self.remote_url(rel))
-        return bytes(response.content)
+        payload = bytearray()
+
+        def receive_chunk(chunk: bytes) -> int:
+            if len(payload) + len(chunk) > MAX_WEBDAV_READ_BYTES:
+                raise _WebDAVResponseTooLarge()
+            payload.extend(chunk)
+            return len(chunk)
+
+        response = self._request("GET", self.remote_url(rel), content_callback=receive_chunk)
+        declared_size = str(getattr(response, "headers", {}).get("content-length") or "").strip()
+        if declared_size.isdigit() and int(declared_size) > MAX_WEBDAV_READ_BYTES:
+            raise ImageStorageError(f"WebDAV GET failed: response exceeds {MAX_WEBDAV_READ_BYTES} bytes")
+        data = bytes(payload or getattr(response, "content", b"") or b"")
+        if len(data) > MAX_WEBDAV_READ_BYTES:
+            raise ImageStorageError(f"WebDAV GET failed: response exceeds {MAX_WEBDAV_READ_BYTES} bytes")
+        return data
 
     def delete(self, rel: str) -> bool:
-        response = self.session.request("DELETE", self.remote_url(rel), timeout=30, **self._auth_kwargs())
-        if response.status_code in {200, 202, 204, 404}:
-            return response.status_code != 404
-        raise ImageStorageError(f"WebDAV DELETE failed: HTTP {response.status_code}")
+        response = self._request("DELETE", self.remote_url(rel), allowed_statuses={404})
+        return response.status_code != 404
 
     def test(self) -> dict[str, object]:
         if not self.url:
@@ -301,11 +400,30 @@ class ImageStorageService:
         items = raw.get("items")
         if not isinstance(items, dict):
             return {}
-        return {str(key): value for key, value in items.items() if isinstance(value, dict)}
+        normalized: dict[str, dict[str, object]] = {}
+        for key, value in items.items():
+            if not isinstance(value, dict):
+                continue
+            item = dict(value)
+            storage = str(item.get("storage") or "").strip().lower()
+            if "webdav" in item:
+                item["webdav"] = _coerce_bool(item.get("webdav"), False)
+            elif storage in {"webdav", "both"} or "webdav" in storage:
+                item["webdav"] = True
+            if "local" in item:
+                item["local"] = _coerce_bool(item.get("local"), False)
+            elif storage in {"local", "both"} or "local" in storage:
+                item["local"] = True
+            normalized[str(key)] = item
+        return normalized
 
     def _load_clean_index(self) -> dict[str, dict[str, object]]:
         items = self._load_index()
-        return {rel: item for rel, item in items.items() if _is_image_rel(rel)}
+        return {
+            rel: item
+            for rel, item in items.items()
+            if _is_image_rel(rel) and not _is_private_queue_artifact(rel)
+        }
 
     def _save_index(
         self,
@@ -369,7 +487,7 @@ class ImageStorageService:
         settings = self.settings()
         public_base_url = _clean(settings.get("public_base_url"))
         if public_base_url:
-            return f"{public_base_url.rstrip('/')}/{_safe_relative_path(rel)}"
+            return build_public_image_url(public_base_url, _safe_relative_path(rel))
         return build_public_image_url(base_url or config.base_url, _safe_relative_path(rel))
 
     def make_relative_path(self, image_data: bytes) -> str:
@@ -408,11 +526,31 @@ class ImageStorageService:
         if dimensions is None:
             raise ImageStorageError("invalid image payload")
         private_settings = self._private_webdav_settings()
+        previous_remote: bytes | None = None
+        previous_remote_readable = False
         if private_settings and self.mode() in {"webdav", "both"}:
-            with _webdav_client(private_settings) as client:
-                client.put_atomic(rel, image_data)
-            return StoredImage(rel=rel, url="", storage="private_webdav", size=len(image_data))
-        return StoredImage(rel=rel, url="", storage="private_local", size=len(image_data))
+            try:
+                with _webdav_client(private_settings) as client:
+                    previous_remote = client.get(rel)
+                previous_remote_readable = True
+            except Exception:
+                # A failed pre-read must not turn an upload failure into data
+                # loss by deleting an object whose previous state is unknown.
+                pass
+        try:
+            if private_settings and self.mode() in {"webdav", "both"}:
+                with _webdav_client(private_settings) as client:
+                    client.put_atomic(
+                        rel,
+                        image_data,
+                        content_type=content_type_for_path(rel),
+                    )
+                return StoredImage(rel=rel, url="", storage="private_webdav", size=len(image_data))
+            return StoredImage(rel=rel, url="", storage="private_local", size=len(image_data))
+        except Exception:
+            if previous_remote_readable and previous_remote is not None:
+                _restore_remote_payload(rel, previous_remote, private_settings)
+            raise
 
     def _save_public_at_path(
         self,
@@ -429,34 +567,88 @@ class ImageStorageService:
         stored_local = False
         stored_webdav = False
         remote_url = ""
+        path: Path | None = None
+        previous_local: bytes | None = None
+        previous_item = self._load_clean_index().get(rel, {})
+        previous_remote: bytes | None = None
+        remote_published = False
 
-        if mode in {"local", "both"}:
-            path = _local_image_path(rel)
-            _atomic_write_local(path, image_data)
-            stored_local = True
+        if previous_item.get("webdav") and mode in {"webdav", "both"}:
+            try:
+                with _webdav_client(self.settings()) as client:
+                    previous_remote = client.get(rel)
+            except Exception:
+                previous_remote = None
 
-        if mode in {"webdav", "both"}:
-            with _webdav_client(self.settings()) as client:
-                remote_url = client.put_atomic(rel, image_data)
-            stored_webdav = True
+        try:
+            if mode in {"local", "both"}:
+                path = _local_image_path(rel)
+                if path.is_file():
+                    previous_local = path.read_bytes()
+                _atomic_write_local(path, image_data)
+                stored_local = True
 
-        item = {
-            "rel": rel,
-            "path": rel,
-            "name": Path(rel).name,
-            "date": "-".join(rel.split("/")[:3]),
-            "size": len(image_data),
-            "created_at": _now_iso(),
-            "storage": "both" if stored_local and stored_webdav else ("webdav" if stored_webdav else "local"),
-            "local": stored_local,
-            "webdav": stored_webdav,
-            "remote_url": remote_url,
-        }
-        item["width"], item["height"] = dimensions
-        with self._index_lock, file_lock(self._index_file_lock_path()):
-            items = self._load_clean_index()
-            items[rel] = item
-            self._save_index(items)
+            if mode in {"webdav", "both"}:
+                with _webdav_client(self.settings()) as client:
+                    remote_url = client.put_atomic(
+                        rel,
+                        image_data,
+                        content_type=content_type_for_path(rel),
+                    )
+                stored_webdav = True
+                remote_published = True
+
+            item = {
+                "rel": rel,
+                "path": rel,
+                "name": Path(rel).name,
+                "date": "-".join(rel.split("/")[:3]),
+                "size": len(image_data),
+                "created_at": _now_iso(),
+                "storage": "both" if stored_local and stored_webdav else ("webdav" if stored_webdav else "local"),
+                "local": stored_local,
+                "webdav": stored_webdav,
+                "remote_url": remote_url,
+            }
+            item["width"], item["height"] = dimensions
+            with self._index_lock, file_lock(self._index_file_lock_path()):
+                items = self._load_clean_index()
+                items[rel] = item
+                self._save_index(items)
+        except Exception:
+            if remote_published and not bool(previous_item.get("webdav")):
+                try:
+                    with _webdav_client(self.settings()) as client:
+                        client.delete(rel)
+                except Exception:
+                    pass
+            elif remote_published and bool(previous_item.get("webdav")):
+                restore_payload = previous_remote if previous_remote is not None else previous_local
+                if restore_payload is not None:
+                    try:
+                        with _webdav_client(self.settings()) as client:
+                            client.put_atomic(
+                                rel,
+                                restore_payload,
+                                content_type=content_type_for_path(rel),
+                            )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        with _webdav_client(self.settings()) as client:
+                            client.delete(rel)
+                    except Exception:
+                        pass
+            if path is not None and stored_local:
+                try:
+                    if previous_local is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        _atomic_write_local(path, previous_local)
+                except OSError:
+                    pass
+            raise
         return StoredImage(
             rel=rel,
             url=self._public_url(rel, base_url),
@@ -472,7 +664,7 @@ class ImageStorageService:
         if path.is_file():
             return path.read_bytes()
         item = self._load_clean_index().get(safe_rel, {})
-        if item.get("webdav") or self.mode() in {"webdav", "both"}:
+        if item.get("webdav"):
             with _webdav_client(self.settings()) as client:
                 return client.get(safe_rel)
         raise HTTPException(status_code=404, detail="image not found")
@@ -485,10 +677,29 @@ class ImageStorageService:
         if path.is_file():
             return path.read_bytes()
         item = self._load_clean_index().get(safe_rel, {})
-        if item.get("webdav") or self.mode() in {"webdav", "both"}:
+        if item.get("webdav"):
             with _webdav_client(self.settings()) as client:
                 return client.get(safe_rel)
         raise HTTPException(status_code=404, detail="image not found")
+
+    def get_remote_bytes(self, rel: str) -> bytes:
+        """Read an artifact from WebDAV without falling back to the local copy."""
+        safe_rel = _safe_relative_path(rel)
+        if not _has_image_extension(safe_rel):
+            raise HTTPException(status_code=404, detail="image not found")
+        if _is_private_queue_artifact(safe_rel):
+            private_settings = self._private_webdav_settings()
+            if private_settings and self.mode() in {"webdav", "both"}:
+                with _webdav_client(private_settings) as client:
+                    return client.get(safe_rel)
+            raise HTTPException(status_code=404, detail="image not found")
+        if not _is_image_rel(safe_rel):
+            raise HTTPException(status_code=404, detail="image not found")
+        item = self._load_clean_index().get(safe_rel, {})
+        if not item.get("webdav"):
+            raise HTTPException(status_code=404, detail="image not found")
+        with _webdav_client(self.settings()) as client:
+            return client.get(safe_rel)
 
     def get_artifact_bytes(self, rel: str) -> bytes:
         safe_rel = _safe_relative_path(rel)
@@ -579,6 +790,17 @@ class ImageStorageService:
                         indexed.pop(rel, None)
                         changed = True
                         continue
+                    if not local and webdav:
+                        try:
+                            with _webdav_client(self.settings()) as client:
+                                if not client.exists(rel):
+                                    indexed.pop(rel, None)
+                                    changed = True
+                                    continue
+                        except Exception:
+                            # A transient WebDAV outage must not purge a valid
+                            # remote index entry; the next verification retries it.
+                            pass
                     storage = "both" if local and webdav else ("webdav" if webdav else "local")
                     if item.get("local") != local or item.get("storage") != storage:
                         item = {
@@ -610,22 +832,47 @@ class ImageStorageService:
             return False
         removed = False
         path = _local_image_path(safe_rel)
-        if path.is_file():
-            path.unlink()
-            removed = True
+        local_payload: bytes | None = None
+        remote_payload: bytes | None = None
+        webdav_settings: dict[str, object] | None = None
+        remote_deleted = False
         with self._index_lock, file_lock(self._index_file_lock_path()):
             items = self._load_clean_index()
             item = items.get(safe_rel, {})
             if item.get("webdav"):
+                webdav_settings = self.settings()
+                with _webdav_client(webdav_settings) as client:
+                    if not path.is_file():
+                        remote_payload = client.get(safe_rel)
+                    remote_deleted = bool(client.delete(safe_rel))
+                    removed = remote_deleted or removed
+            if path.is_file():
+                local_payload = path.read_bytes()
                 try:
-                    with _webdav_client(self.settings()) as client:
-                        removed = client.delete(safe_rel) or removed
-                except ImageStorageError:
-                    if not removed:
-                        raise
-            if safe_rel in items:
-                items.pop(safe_rel, None)
-                self._save_index(items)
+                    path.unlink()
+                except Exception:
+                    if remote_deleted:
+                        restore_payload = local_payload if local_payload is not None else remote_payload
+                        if restore_payload is not None:
+                            _restore_remote_payload(safe_rel, restore_payload, webdav_settings)
+                    raise
+                removed = True
+            try:
+                if safe_rel in items:
+                    items.pop(safe_rel, None)
+                    removed = True
+                    self._save_index(items)
+            except Exception:
+                if local_payload is not None and not path.is_file():
+                    try:
+                        _atomic_write_local(path, local_payload)
+                    except Exception:
+                        pass
+                if remote_deleted:
+                    restore_payload = local_payload if local_payload is not None else remote_payload
+                    if restore_payload is not None:
+                        _restore_remote_payload(safe_rel, restore_payload, webdav_settings)
+                raise
         return removed
 
     def delete_artifact(self, rel: str) -> bool:
@@ -634,22 +881,46 @@ class ImageStorageService:
             return self.delete(safe_rel)
         removed = False
         path = _local_image_path(safe_rel)
-        if path.is_file():
-            path.unlink()
-            removed = True
+        local_payload: bytes | None = None
+        remote_payload: bytes | None = None
+        private_settings: dict[str, object] | None = None
+        remote_deleted = False
         with self._index_lock, file_lock(self._index_file_lock_path()):
             items = self._load_index()
             private_settings = self._private_webdav_settings()
             if private_settings and self.mode() in {"webdav", "both"}:
+                with _webdav_client(private_settings) as client:
+                    if not path.is_file():
+                        remote_payload = client.get(safe_rel)
+                    remote_deleted = bool(client.delete(safe_rel))
+                    removed = remote_deleted or removed
+            if path.is_file():
+                local_payload = path.read_bytes()
                 try:
-                    with _webdav_client(private_settings) as client:
-                        removed = client.delete(safe_rel) or removed
-                except ImageStorageError:
-                    if not removed:
-                        raise
-            if safe_rel in items:
-                items.pop(safe_rel, None)
-                self._save_index(items, preserve_private=False)
+                    path.unlink()
+                except Exception:
+                    if remote_deleted:
+                        restore_payload = local_payload if local_payload is not None else remote_payload
+                        if restore_payload is not None:
+                            _restore_remote_payload(safe_rel, restore_payload, private_settings)
+                    raise
+                removed = True
+            try:
+                if safe_rel in items:
+                    items.pop(safe_rel, None)
+                    removed = True
+                    self._save_index(items, preserve_private=False)
+            except Exception:
+                if local_payload is not None and not path.is_file():
+                    try:
+                        _atomic_write_local(path, local_payload)
+                    except Exception:
+                        pass
+                if remote_deleted:
+                    restore_payload = local_payload if local_payload is not None else remote_payload
+                    if restore_payload is not None:
+                        _restore_remote_payload(safe_rel, restore_payload, private_settings)
+                raise
         return removed
 
     def sync_all(self) -> dict[str, int]:
@@ -685,7 +956,11 @@ class ImageStorageService:
                             continue
                     try:
                         payload = path.read_bytes()
-                        remote_url = client.put(rel, payload)
+                        remote_url = client.put(
+                            rel,
+                            payload,
+                            content_type=content_type_for_path(rel),
+                        )
                         dimensions = _image_dimensions(payload)
                         items[rel] = {
                             **item,

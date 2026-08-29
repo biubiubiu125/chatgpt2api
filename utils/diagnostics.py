@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -35,6 +36,77 @@ def diagnostic_excerpt(value: object, limit: int = 1000) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 15].rstrip() + "...[truncated]"
+
+
+REDACTED_DIAGNOSTIC_VALUE = "***redacted***"
+SENSITIVE_DIAGNOSTIC_KEY_PARTS = (
+    "authorization",
+    "cookie",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "api_key",
+    "apikey",
+    "access_key",
+    "refresh",
+    "credential",
+    "session",
+)
+INLINE_SECRET_PATTERNS = (
+    re.compile(r"(?i)\b(Bearer)\s+([A-Za-z0-9._~+/=-]{6,})"),
+    re.compile(
+        r"(?i)\b(authorization|cookie|access[_-]?token|refresh[_-]?token|api[_-]?key|password|secret|token)\s*[:=]\s*([^,;\s}\]]+)"
+    ),
+)
+
+
+def _is_sensitive_diagnostic_key(key: object) -> bool:
+    normalized = str(key or "").strip().lower().replace("-", "_")
+    return any(part in normalized for part in SENSITIVE_DIAGNOSTIC_KEY_PARTS)
+
+
+def redact_inline_secrets(text: object) -> str:
+    value = str(text or "")
+    for pattern in INLINE_SECRET_PATTERNS:
+        value = pattern.sub(lambda match: f"{match.group(1)} {REDACTED_DIAGNOSTIC_VALUE}", value)
+    return value
+
+
+def sanitize_diagnostic_value(
+    value: object,
+    *,
+    string_limit: int = 1000,
+    max_depth: int = 6,
+) -> Any:
+    if max_depth <= 0:
+        return diagnostic_excerpt(redact_inline_secrets(value), string_limit)
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            sanitized[key_text] = (
+                REDACTED_DIAGNOSTIC_VALUE
+                if _is_sensitive_diagnostic_key(key_text)
+                else sanitize_diagnostic_value(
+                    item,
+                    string_limit=string_limit,
+                    max_depth=max_depth - 1,
+                )
+            )
+        return sanitized
+    if isinstance(value, (list, tuple, set)):
+        return [
+            sanitize_diagnostic_value(
+                item,
+                string_limit=string_limit,
+                max_depth=max_depth - 1,
+            )
+            for item in value
+        ]
+    if isinstance(value, str):
+        return diagnostic_excerpt(redact_inline_secrets(value), string_limit)
+    return value
 
 
 def exception_diagnostic_fields(

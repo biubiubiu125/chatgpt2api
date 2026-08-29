@@ -16,6 +16,7 @@ from curl_cffi.requests import Session
 from services.account_service import account_service
 from services.account_import_errors import refresh_error_entries
 from services.config import DATA_DIR, config
+from services.file_lock import file_lock
 from services.json_file import read_json_file, write_json_file
 
 
@@ -159,6 +160,9 @@ class Sub2APIConfig:
         self._lock = Lock()
         self._servers: list[dict] = self._load()
 
+    def _lock_path(self) -> Path:
+        return self._store_file.with_name(f"{self._store_file.name}.lock")
+
     def _load(self) -> list[dict]:
         raw = read_json_file(
             self._store_file,
@@ -175,10 +179,12 @@ class Sub2APIConfig:
 
     def list_servers(self) -> list[dict]:
         with self._lock:
+            self._servers = self._load()
             return [dict(server) for server in self._servers]
 
     def get_server(self, server_id: str) -> dict | None:
         with self._lock:
+            self._servers = self._load()
             for server in self._servers:
                 if server["id"] == server_id:
                     return dict(server)
@@ -203,14 +209,16 @@ class Sub2APIConfig:
             "api_key": api_key,
             "group_id": group_id,
         })
-        with self._lock:
+        with self._lock, file_lock(self._lock_path()):
+            self._servers = self._load()
             self._servers.append(server)
             self._save()
         _token_cache.pop(server["id"], None)
         return dict(server)
 
     def update_server(self, server_id: str, updates: dict) -> dict | None:
-        with self._lock:
+        with self._lock, file_lock(self._lock_path()):
+            self._servers = self._load()
             for index, server in enumerate(self._servers):
                 if server["id"] != server_id:
                     continue
@@ -225,7 +233,8 @@ class Sub2APIConfig:
         return result
 
     def delete_server(self, server_id: str) -> bool:
-        with self._lock:
+        with self._lock, file_lock(self._lock_path()):
+            self._servers = self._load()
             before = len(self._servers)
             self._servers = [server for server in self._servers if server["id"] != server_id]
             removed = len(self._servers) < before
@@ -236,7 +245,8 @@ class Sub2APIConfig:
         return removed
 
     def set_import_job(self, server_id: str, import_job: dict | None) -> dict | None:
-        with self._lock:
+        with self._lock, file_lock(self._lock_path()):
+            self._servers = self._load()
             for index, server in enumerate(self._servers):
                 if server["id"] != server_id:
                     continue
@@ -249,6 +259,7 @@ class Sub2APIConfig:
 
     def get_import_job(self, server_id: str) -> dict | None:
         with self._lock:
+            self._servers = self._load()
             for server in self._servers:
                 if server["id"] == server_id:
                     job = server.get("import_job")

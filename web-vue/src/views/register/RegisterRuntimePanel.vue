@@ -59,6 +59,7 @@ import type { RegisterMetricItem, RegisterRuntimeLogLine } from '@/views/registe
 
 const props = defineProps<{
   enabled: boolean
+  state: string
   saving: boolean
   actionDisabled: boolean
   runtimeHint: string
@@ -71,7 +72,7 @@ const emit = defineEmits<{
   (e: 'reset-stats'): void
 }>()
 
-const resetDisabled = computed(() => props.saving || props.enabled)
+const resetDisabled = computed(() => props.saving || props.enabled || props.state !== 'idle')
 </script>
 
 <style scoped>

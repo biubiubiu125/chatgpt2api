@@ -1,4 +1,5 @@
 import { ref } from 'vue'
+import { notifyAuthFailure } from '@/api/client'
 import type { LegacyRegisterConfig } from '@/api/register'
 import type { PageRuntime } from '@/composables/usePageRuntime'
 
@@ -65,6 +66,7 @@ export function useRegisterLiveRuntime(input: RegisterLiveRuntimeInput) {
         signal: controller.signal,
       })
       if (!response.ok || !response.body) {
+        notifyAuthFailure(response.status)
         throw new Error(`register event stream failed: ${response.status}`)
       }
       stopPolling()

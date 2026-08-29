@@ -1,4 +1,4 @@
-import { getAuthToken } from '@/api/client'
+import { getAuthToken, notifyAuthFailure } from '@/api/client'
 import { isTrustedApiDownloadUrl, shouldAuthorizeDownloadUrl } from './downloadTargets'
 
 const apiBaseUrl = String(import.meta.env.VITE_API_URL || '').replace(/\/+$/, '')
@@ -88,7 +88,10 @@ async function fetchBlob(url: string, authorization = false) {
     headers,
     mode: 'cors',
   })
-  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  if (!response.ok) {
+    notifyAuthFailure(response.status)
+    throw new Error(`HTTP ${response.status}`)
+  }
 
   const blob = await response.blob()
   if (!blob.size) throw new Error('empty image payload')

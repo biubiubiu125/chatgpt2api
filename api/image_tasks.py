@@ -152,6 +152,26 @@ def _commit_quota_or_raise(quota, result: object, idempotency_key: str) -> None:
         ) from exc
 
 
+def _http_detail_error(exc: HTTPException) -> str:
+    detail = exc.detail
+    if isinstance(detail, dict):
+        return str(detail.get("error") or detail.get("message") or exc.status_code)
+    return str(detail or exc.status_code)
+
+
+def _log_task_failure(call: LoggedCall, exc: Exception, *, error: str = "") -> None:
+    if not error:
+        if isinstance(exc, HTTPException):
+            error = _http_detail_error(exc)
+        else:
+            error = str(getattr(exc, "code", "") or str(exc) or exc.__class__.__name__)
+    call.log("调用失败", status="failed", error=error)
+
+
+def _log_task_queued(call: LoggedCall, result: object) -> None:
+    call.log("已入队", result, status="queued")
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -204,6 +224,7 @@ def create_router() -> APIRouter:
                 body.model,
                 image_request=True,
                 idempotency_key=idempotency_key,
+                idempotency_aliases=[body.client_task_id],
             )
             try:
                 result = await run_in_threadpool(
@@ -223,14 +244,23 @@ def create_router() -> APIRouter:
                 quota.cancel()
                 raise
             _commit_quota_or_raise(quota, result, idempotency_key)
+            _log_task_queued(call, result)
             return result
+        except HTTPException as exc:
+            _log_task_failure(call, exc)
+            raise
         except IdempotencyConflict as exc:
+            _log_task_failure(call, exc, error=exc.code)
             raise HTTPException(
                 status_code=409,
                 detail={"error": exc.code, "message": str(exc)},
             ) from exc
         except ValueError as exc:
+            _log_task_failure(call, exc)
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        except Exception as exc:
+            _log_task_failure(call, exc)
+            raise
 
     @router.post("/api/image-tasks/edits", response_model=ImageTaskResponse)
     async def create_edit_task(
@@ -258,6 +288,7 @@ def create_router() -> APIRouter:
                 model,
                 image_request=True,
                 idempotency_key=idempotency_key,
+                idempotency_aliases=[client_task_id],
             )
             source_request_hash = image_edit_source_request_hash(payload, image_sources, mask_sources)
             existing = await run_in_threadpool(
@@ -270,20 +301,33 @@ def create_router() -> APIRouter:
         except IdempotencyConflict as exc:
             if quota is not None:
                 quota.cancel()
+            _log_task_failure(call, exc, error=exc.code)
             raise HTTPException(
                 status_code=409,
                 detail={"error": exc.code, "message": str(exc)},
             ) from exc
+        except HTTPException as exc:
+            if quota is not None:
+                quota.cancel()
+            _log_task_failure(call, exc)
+            raise
         except ValueError as exc:
             if quota is not None:
                 quota.cancel()
+            _log_task_failure(call, exc)
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-        except Exception:
+        except Exception as exc:
             if quota is not None:
                 quota.cancel()
+            _log_task_failure(call, exc)
             raise
         if existing is not None:
-            _commit_quota_or_raise(quota, existing, idempotency_key)
+            try:
+                _commit_quota_or_raise(quota, existing, idempotency_key)
+            except HTTPException as exc:
+                _log_task_failure(call, exc)
+                raise
+            _log_task_queued(call, existing)
             return existing
         try:
             images, resolved_masks = await read_image_source_groups(image_sources, mask_sources)
@@ -307,17 +351,29 @@ def create_router() -> APIRouter:
             )
         except IdempotencyConflict as exc:
             quota.cancel()
+            _log_task_failure(call, exc, error=exc.code)
             raise HTTPException(
                 status_code=409,
                 detail={"error": exc.code, "message": str(exc)},
             ) from exc
+        except HTTPException as exc:
+            quota.cancel()
+            _log_task_failure(call, exc)
+            raise
         except ValueError as exc:
             quota.cancel()
+            _log_task_failure(call, exc)
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-        except Exception:
+        except Exception as exc:
             quota.cancel()
+            _log_task_failure(call, exc)
             raise
-        _commit_quota_or_raise(quota, result, idempotency_key)
+        try:
+            _commit_quota_or_raise(quota, result, idempotency_key)
+        except HTTPException as exc:
+            _log_task_failure(call, exc)
+            raise
+        _log_task_queued(call, result)
         return result
 
     @router.post("/api/image-tasks/{task_id}/resume-poll", response_model=ImageTaskResponse)

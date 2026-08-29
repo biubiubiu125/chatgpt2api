@@ -171,6 +171,7 @@ def create_app() -> FastAPI:
         # Until PostgreSQL confirms exactly which artifacts are disposable, all
         # existing files are durable queue state and must be retained.
         config.set_image_retention_protection(config.all_image_paths)
+        backup_service.set_register_config_provider(register_service._runtime_config)
         worker_queue_ready = True
         if cluster_settings.is_worker and cluster_settings.run_worker:
             marker_status = worker_join_marker_status(cluster_settings)

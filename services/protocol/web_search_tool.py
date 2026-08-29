@@ -5,6 +5,7 @@ from typing import Any
 
 from services.account_service import account_service
 from services.openai_backend_api import OpenAIBackendAPI
+from utils.helper import UpstreamHTTPError
 
 WEB_SEARCH_TOOL_TYPES = {"web_search", "web_search_preview", "web_search_preview_2025_03_11"}
 SEARCH_CHAT_MODEL_PREFIXES = (
@@ -19,11 +20,15 @@ def _tool_type(tool: object) -> str:
 
 
 def has_web_search_tool(body: dict[str, Any]) -> bool:
+    tool_choice = body.get("tool_choice")
+    if str(tool_choice or "").strip().lower() == "none":
+        return False
+    if isinstance(tool_choice, dict):
+        return _tool_type(tool_choice) in WEB_SEARCH_TOOL_TYPES
     tools = body.get("tools")
     if isinstance(tools, list):
         return any(_tool_type(tool) in WEB_SEARCH_TOOL_TYPES for tool in tools)
-    tool_choice = body.get("tool_choice")
-    return _tool_type(tool_choice) in WEB_SEARCH_TOOL_TYPES
+    return False
 
 
 def is_web_search_chat_request(body: dict[str, Any]) -> bool:
@@ -153,9 +158,43 @@ def text_with_url_citations(result: dict[str, Any]) -> tuple[str, list[dict[str,
     return text.strip(), annotations
 
 
+def _is_token_invalid_error(exc: Exception) -> bool:
+    if isinstance(exc, UpstreamHTTPError) and int(getattr(exc, "status_code", 0) or 0) in {401, 403}:
+        return True
+    text = str(exc or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "token_invalidated",
+            "token_revoked",
+            "authentication token has been invalidated",
+            "invalidated oauth token",
+        )
+    )
+
+
 def run_web_search(query: str) -> dict[str, Any]:
-    token = account_service.get_text_access_token()
-    with OpenAIBackendAPI(token) as backend:
-        result = backend.search(query)
-    account_service.mark_text_used(token)
-    return result
+    attempted_tokens: set[str] = set()
+    token = str(account_service.get_text_access_token() or "").strip()
+    while token and token not in attempted_tokens:
+        attempted_tokens.add(token)
+        try:
+            with OpenAIBackendAPI(token) as backend:
+                result = backend.search(query)
+        except Exception as exc:
+            if _is_token_invalid_error(exc):
+                account_service.schedule_auth_verification(token, "text_search")
+                next_token = str(account_service.get_text_access_token(attempted_tokens) or "").strip()
+                if next_token and next_token not in attempted_tokens:
+                    token = next_token
+                    continue
+            if not getattr(exc, "account_email", ""):
+                account = account_service.get_account(token) or {}
+                setattr(exc, "account_email", str(account.get("email") or "").strip())
+            raise
+        account_service.mark_text_used(token)
+        account = account_service.get_account(token) or {}
+        output = dict(result) if isinstance(result, dict) else {"answer": str(result or "")}
+        output["_account_email"] = str(account.get("email") or "").strip()
+        return output
+    raise RuntimeError("no available text account")

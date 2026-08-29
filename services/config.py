@@ -6,9 +6,11 @@ import os
 import threading
 from pathlib import Path
 import time
+from urllib.parse import urlsplit
 
 from services.file_lock import file_lock
 from services.json_file import read_json_object, write_json_file
+from services.returned_url_verifier import ReturnedUrlVerificationError, validate_public_image_base_url
 from services.storage.base import StorageBackend
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -111,9 +113,9 @@ DEFAULT_THIRD_PARTY_APPS = {
 def _normalize_bool(value: object, default: bool = False) -> bool:
     if isinstance(value, str):
         lowered = value.strip().lower()
-        if lowered in {"1", "true", "yes", "on"}:
+        if lowered in {"1", "true", "yes", "y", "on", "enabled"}:
             return True
-        if lowered in {"0", "false", "no", "off"}:
+        if lowered in {"0", "false", "no", "n", "off", "disabled", "none", "null", ""}:
             return False
         return default
     if value is None:
@@ -243,7 +245,7 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
         "private_webdav_username": str(source.get("private_webdav_username") or "").strip(),
         "private_webdav_password": str(source.get("private_webdav_password") or "").strip(),
         "private_webdav_root_path": private_root_path or str(DEFAULT_IMAGE_STORAGE["private_webdav_root_path"]),
-        "public_base_url": str(source.get("public_base_url") or "").strip().rstrip("/"),
+        "public_base_url": _normalize_image_storage_public_base_url(source.get("public_base_url")),
     }
 
 
@@ -373,10 +375,54 @@ def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
     }
 
 
+def _normalize_base_url(value: object) -> str:
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return ""
+    parsed = urlsplit(text)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment:
+        raise ValueError("base_url must be an http or https URL without query or fragment")
+    return text
+
+
+def _normalize_image_base_url(value: object) -> str:
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return ""
+    try:
+        return validate_public_image_base_url(text, resolve_host=True)
+    except ReturnedUrlVerificationError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _normalize_image_storage_public_base_url(value: object) -> str:
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return ""
+    try:
+        return validate_public_image_base_url(text, resolve_host=True)
+    except ReturnedUrlVerificationError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _normalize_public_url_settings(data: dict[str, object]) -> dict[str, object]:
+    next_data = dict(data or {})
+    if "base_url" in next_data:
+        next_data["base_url"] = _normalize_base_url(next_data.get("base_url"))
+    if "image_base_url" in next_data:
+        next_data["image_base_url"] = _normalize_image_base_url(next_data.get("image_base_url"))
+    basic = next_data.get("basic")
+    if isinstance(basic, dict) and "base_url" in basic:
+        basic_next = dict(basic)
+        basic_next["base_url"] = _normalize_base_url(basic_next.get("base_url"))
+        next_data["basic"] = basic_next
+    return next_data
+
+
 def _legacy_basic_from_settings(value: object, settings: dict[str, object]) -> dict[str, object]:
     source = dict(value) if isinstance(value, dict) else {}
     source["proxy"] = str(settings.get("proxy") or "").strip()
-    source["base_url"] = str(settings.get("base_url") or "").strip().rstrip("/")
+    source["base_url"] = _normalize_base_url(settings.get("base_url"))
     try:
         source["image_expire_hours"] = max(
             1,
@@ -395,9 +441,62 @@ def _promote_legacy_basic_settings(data: dict[str, object]) -> dict[str, object]
     if "proxy" not in next_data and "proxy" in basic:
         next_data["proxy"] = str(basic.get("proxy") or "").strip()
     if "base_url" not in next_data and "base_url" in basic:
-        next_data["base_url"] = str(basic.get("base_url") or "").strip().rstrip("/")
+        next_data["base_url"] = _normalize_base_url(basic.get("base_url"))
     if "image_retention_days" not in next_data and "image_expire_hours" in basic:
         next_data["image_retention_days"] = basic.get("image_expire_hours")
+    return next_data
+
+
+def _normalize_config_collections(data: dict[str, object]) -> dict[str, object]:
+    """Normalize collection-shaped settings before their consumers interpret them.
+
+    These collections are persisted as legacy JSON and can therefore contain
+    boolean-looking strings.  Keeping the normalization at the config boundary
+    prevents different API/service consumers from applying different truthiness
+    rules to the same proxy or account group.
+    """
+    next_data = dict(data or {})
+
+    for key in ("proxy_profiles", "account_groups"):
+        raw_items = next_data.get(key)
+        if not isinstance(raw_items, list):
+            continue
+        normalized_items: list[object] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                normalized_items.append(item)
+                continue
+            normalized_item = dict(item)
+            normalized_item["enabled"] = _normalize_bool(normalized_item.get("enabled", True), True)
+            normalized_items.append(normalized_item)
+        next_data[key] = normalized_items
+
+    raw_groups = next_data.get("proxy_groups")
+    if isinstance(raw_groups, list):
+        normalized_groups: list[object] = []
+        for group in raw_groups:
+            if not isinstance(group, dict):
+                normalized_groups.append(group)
+                continue
+            normalized_group = dict(group)
+            normalized_group["enabled"] = _normalize_bool(normalized_group.get("enabled", True), True)
+            raw_nodes = normalized_group.get("nodes")
+            if isinstance(raw_nodes, list):
+                normalized_nodes: list[object] = []
+                for node in raw_nodes:
+                    if not isinstance(node, dict):
+                        normalized_nodes.append(node)
+                        continue
+                    normalized_node = dict(node)
+                    normalized_node["enabled"] = _normalize_bool(
+                        normalized_node.get("enabled", True),
+                        True,
+                    )
+                    normalized_nodes.append(normalized_node)
+                normalized_group["nodes"] = normalized_nodes
+            normalized_groups.append(normalized_group)
+        next_data["proxy_groups"] = normalized_groups
+
     return next_data
 
 
@@ -467,7 +566,9 @@ class ConfigStore:
         self.path = path
         self._lock = threading.RLock()
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        self.data = _promote_legacy_basic_settings(self._load())
+        self.data = _normalize_public_url_settings(
+            _normalize_config_collections(_promote_legacy_basic_settings(self._load()))
+        )
         self._loaded_mtime_ns = self._config_mtime_ns()
         self._storage_backend: StorageBackend | None = None
         self._image_retention_protection_provider = None
@@ -497,7 +598,9 @@ class ConfigStore:
         with self._lock:
             current_mtime_ns = self._config_mtime_ns()
             if current_mtime_ns and current_mtime_ns != self._loaded_mtime_ns:
-                self.data = _promote_legacy_basic_settings(self._load())
+                self.data = _normalize_public_url_settings(
+                    _normalize_config_collections(_promote_legacy_basic_settings(self._load()))
+                )
                 self._loaded_mtime_ns = current_mtime_ns
 
     def _save(self) -> None:
@@ -621,10 +724,7 @@ class ConfigStore:
 
     @property
     def image_parallel_generation(self) -> bool:
-        value = self.data.get("image_parallel_generation", True)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
+        return _normalize_bool(self.data.get("image_parallel_generation"), True)
 
     @property
     def image_remove_conversation_after_result(self) -> bool:
@@ -634,18 +734,12 @@ class ConfigStore:
     @property
     def image_settle_enabled(self) -> bool:
         """图片二次确认机制：找到 file_ids 后等待一段时间再次确认。"""
-        value = self.data.get("image_settle_enabled", True)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
+        return _normalize_bool(self.data.get("image_settle_enabled"), True)
 
     @property
     def image_check_before_hit_enabled(self) -> bool:
         """先check再hit：通过轮询确认 file_ids 存在后再返回，而非仅依赖 SSE 事件。"""
-        value = self.data.get("image_check_before_hit_enabled", True)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
+        return _normalize_bool(self.data.get("image_check_before_hit_enabled"), True)
 
     @property
     def image_settle_secs(self) -> float:
@@ -657,17 +751,11 @@ class ConfigStore:
 
     @property
     def auto_remove_invalid_accounts(self) -> bool:
-        value = self.data.get("auto_remove_invalid_accounts", True)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
+        return _normalize_bool(self.data.get("auto_remove_invalid_accounts"), True)
 
     @property
     def auto_remove_rate_limited_accounts(self) -> bool:
-        value = self.data.get("auto_remove_rate_limited_accounts", False)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
+        return _normalize_bool(self.data.get("auto_remove_rate_limited_accounts"), False)
 
     @property
     def log_levels(self) -> list[str]:
@@ -747,19 +835,21 @@ class ConfigStore:
 
     @property
     def base_url(self) -> str:
-        return str(
+        self.reload_if_changed()
+        return _normalize_base_url(
             os.getenv("CHATGPT2API_BASE_URL")
             or self.data.get("base_url")
             or ""
-        ).strip().rstrip("/")
+        )
 
     @property
     def image_base_url(self) -> str:
-        return str(
+        self.reload_if_changed()
+        return _normalize_image_base_url(
             os.getenv("CHATGPT2API_IMAGE_BASE_URL")
             or self.data.get("image_base_url")
             or ""
-        ).strip().rstrip("/")
+        )
 
     @property
     def app_version(self) -> str:
@@ -836,7 +926,7 @@ class ConfigStore:
     def update(self, data: dict[str, object]) -> dict[str, object]:
         with self._lock:
             with file_lock(self._lock_path()):
-                self.data = _promote_legacy_basic_settings(self._load())
+                self.data = _normalize_config_collections(_promote_legacy_basic_settings(self._load()))
                 self._loaded_mtime_ns = self._config_mtime_ns()
                 incoming = _promote_legacy_basic_settings(dict(data or {}))
                 if isinstance(incoming.get("backup"), dict):
@@ -913,6 +1003,8 @@ class ConfigStore:
                             incoming_runtime["_existing_cf_cookies"] = previous_clearance.get("cf_cookies")
                             incoming_runtime["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
                     next_data["proxy_runtime"] = _normalize_proxy_runtime_settings(incoming_runtime)
+                next_data = _normalize_config_collections(next_data)
+                next_data = _normalize_public_url_settings(next_data)
                 next_data["basic"] = _legacy_basic_from_settings(next_data.get("basic"), next_data)
                 next_data.pop("backup_state", None)
                 self.data = next_data
@@ -953,3 +1045,18 @@ def save_backup_state(state: dict[str, object]) -> dict[str, object]:
 
 
 config = ConfigStore(CONFIG_FILE)
+
+
+def _remote_aware_cleanup_old_images() -> int:
+    try:
+        from services.image_service import cleanup_image_retention
+    except Exception:
+        return ConfigStore.cleanup_old_images(config)
+    try:
+        result = cleanup_image_retention(config.image_retention_days)
+        return int(result.get("removed") or 0)
+    except Exception:
+        return ConfigStore.cleanup_old_images(config)
+
+
+config.cleanup_old_images = _remote_aware_cleanup_old_images

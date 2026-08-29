@@ -131,9 +131,37 @@ def attach_image_task_context(
     payload["_image_task_context"] = {
         "identity": dict(identity),
         "idempotency_key": idempotency_key,
+        "quota_idempotency_key": idempotency_key,
+        "quota_idempotency_aliases": [
+            client_task_id
+            for client_task_id in [str(payload.get("client_task_id") or "").strip()]
+            if client_task_id and client_task_id != idempotency_key
+        ],
         "trace_headers": allowlisted_trace_headers(request.headers),
         "base_url": resolve_image_base_url(request),
     }
+
+
+def require_editable_task_id(body: EditableFileTaskRequest, request: Request) -> str:
+    try:
+        client_task_id = select_idempotency_key(
+            request.headers,
+            str(body.client_task_id or ""),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+    if not client_task_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "idempotency_key_required",
+                "message": (
+                    "editable file tasks require Idempotency-Key, X-NewAPI-Request-Id, "
+                    "X-OneAPI-Request-Id, or client_task_id"
+                ),
+            },
+        )
+    return client_task_id
 
 
 def require_non_empty_text(value: object, field_name: str) -> str:
@@ -420,24 +448,23 @@ def create_router() -> APIRouter:
         kind = (body.kind or "ppt").strip().lower()
         if kind not in {"ppt", "psd"}:
             raise HTTPException(status_code=400, detail={"error": "kind must be ppt or psd"})
+        client_task_id = require_editable_task_id(body, request)
         endpoint = f"/v1/{kind}/generations"
-        await filter_or_log(
-            LoggedCall(identity, endpoint, "gpt-5-5-thinking", f"{kind.upper()} generation task", request_text=body.prompt),
-            body.prompt,
-        )
+        call = LoggedCall(identity, endpoint, "gpt-5-5-thinking", f"{kind.upper()} generation task", request_text=body.prompt)
+        await filter_or_log(call, body.prompt)
         quota = reserve_quota(
             identity,
             endpoint,
             "gpt-5-5-thinking",
             image_request=True,
-            idempotency_key=body.client_task_id or "",
+            idempotency_key=client_task_id,
         )
         submit = editable_file_task_service.submit_psd if kind == "psd" else editable_file_task_service.submit_ppt
         try:
             result = await run_in_threadpool(
                 submit,
                 identity,
-                client_task_id=body.client_task_id or "",
+                client_task_id=client_task_id,
                 prompt=body.prompt,
                 base64_images=body.base64_images,
                 base_url=resolve_api_base_url(request),
@@ -457,7 +484,8 @@ def create_router() -> APIRouter:
         except Exception:
             quota.cancel()
             raise
-        _commit_editable_quota_or_raise(quota, result, body.client_task_id or "")
+        _commit_editable_quota_or_raise(quota, result, client_task_id)
+        call.log("已入队", result, status="queued")
         return result
 
     @router.get("/files/{file_path:path}")
@@ -473,19 +501,21 @@ def create_router() -> APIRouter:
     @router.post("/v1/ppt/generations")
     async def create_ppt_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
-        await filter_or_log(LoggedCall(identity, "/v1/ppt/generations", "gpt-5-5-thinking", "PPT生成任务", request_text=body.prompt), body.prompt)
+        client_task_id = require_editable_task_id(body, request)
+        call = LoggedCall(identity, "/v1/ppt/generations", "gpt-5-5-thinking", "PPT生成任务", request_text=body.prompt)
+        await filter_or_log(call, body.prompt)
         quota = reserve_quota(
             identity,
             "/v1/ppt/generations",
             "gpt-5-5-thinking",
             image_request=True,
-            idempotency_key=body.client_task_id or "",
+            idempotency_key=client_task_id,
         )
         try:
             result = await run_in_threadpool(
                 editable_file_task_service.submit_ppt,
                 identity,
-                client_task_id=body.client_task_id or "",
+                client_task_id=client_task_id,
                 prompt=body.prompt,
                 base64_images=body.base64_images,
                 base_url=resolve_api_base_url(request),
@@ -505,25 +535,28 @@ def create_router() -> APIRouter:
         except Exception:
             quota.cancel()
             raise
-        _commit_editable_quota_or_raise(quota, result, body.client_task_id or "")
+        _commit_editable_quota_or_raise(quota, result, client_task_id)
+        call.log("已入队", result, status="queued")
         return result
 
     @router.post("/v1/psd/generations")
     async def create_psd_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
-        await filter_or_log(LoggedCall(identity, "/v1/psd/generations", "gpt-5-5-thinking", "PSD生成任务", request_text=body.prompt), body.prompt)
+        client_task_id = require_editable_task_id(body, request)
+        call = LoggedCall(identity, "/v1/psd/generations", "gpt-5-5-thinking", "PSD生成任务", request_text=body.prompt)
+        await filter_or_log(call, body.prompt)
         quota = reserve_quota(
             identity,
             "/v1/psd/generations",
             "gpt-5-5-thinking",
             image_request=True,
-            idempotency_key=body.client_task_id or "",
+            idempotency_key=client_task_id,
         )
         try:
             result = await run_in_threadpool(
                 editable_file_task_service.submit_psd,
                 identity,
-                client_task_id=body.client_task_id or "",
+                client_task_id=client_task_id,
                 prompt=body.prompt,
                 base64_images=body.base64_images,
                 base_url=resolve_api_base_url(request),
@@ -543,7 +576,8 @@ def create_router() -> APIRouter:
         except Exception:
             quota.cancel()
             raise
-        _commit_editable_quota_or_raise(quota, result, body.client_task_id or "")
+        _commit_editable_quota_or_raise(quota, result, client_task_id)
+        call.log("已入队", result, status="queued")
         return result
 
     return router

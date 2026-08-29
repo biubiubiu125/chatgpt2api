@@ -34,6 +34,7 @@
               :log-retention-days-field="logRetentionDaysField"
               :image-poll-timeout-field="imagePollTimeoutField"
               :image-stream-timeout-field="imageStreamTimeoutField"
+              :text-stream-timeout-field="textStreamTimeoutField"
               :image-account-concurrency-field="imageAccountConcurrencyField"
               :proxy-busy="proxyBusy"
               :proxy-test-result="proxyTestResult"
@@ -112,10 +113,14 @@
         :backup-state="backupState"
         :backup-items="backupItems"
         :backup-test-result="backupTestResult"
+        :backup-detail="backupDetail"
         :backup-status-text="backupStatusText"
         @test-connection="testBackupConnection"
         @run-now="runBackupNow"
         @load-backups="loadBackups"
+        @show-detail="showBackupDetail"
+        @download-item="downloadBackupItem"
+        @restore-item="openBackupRestore"
         @delete-item="deleteBackupItem"
       />
 
@@ -206,6 +211,15 @@
       @save-sub2api="saveSub2APIServer"
     />
 
+    <SettingsBackupRestoreModal
+      :open="Boolean(backupRestoreTarget)"
+      :item="backupRestoreTarget"
+      v-model:passphrase="backupRestorePassphrase"
+      :restoring="backupRestoring"
+      @close="closeBackupRestore"
+      @restore="restoreBackupItem"
+    />
+
     <ModalShell
       :open="Boolean(remoteImportModal)"
       max-width="58rem"
@@ -260,6 +274,7 @@ import {
 import SettingsBasicConfigPanel from '@/views/settings/SettingsBasicConfigPanel.vue'
 import SettingsBasicPolicyPanel from '@/views/settings/SettingsBasicPolicyPanel.vue'
 import SettingsBackupPanel from '@/views/settings/SettingsBackupPanel.vue'
+import SettingsBackupRestoreModal from '@/views/settings/SettingsBackupRestoreModal.vue'
 import SettingsExternalSourceModals from '@/views/settings/SettingsExternalSourceModals.vue'
 import SettingsExternalSourcesPanel from '@/views/settings/SettingsExternalSourcesPanel.vue'
 import SettingsIntegrationsPanel from '@/views/settings/SettingsIntegrationsPanel.vue'
@@ -309,6 +324,7 @@ const backupRuntime = useSettingsBackupRuntime({
   runtime: pageRuntime,
   requestKey: BACKUPS_REQUEST_KEY,
   requireSavedSettings,
+  afterRestore: reloadSettings,
 })
 const backupsLoaded = backupRuntime.backupsLoaded
 const backupBusy = backupRuntime.backupBusy
@@ -316,11 +332,20 @@ const backupLoading = backupRuntime.backupLoading
 const backupState = backupRuntime.backupState
 const backupItems = backupRuntime.backupItems
 const backupTestResult = backupRuntime.backupTestResult
+const backupDetail = backupRuntime.backupDetail
+const backupRestoreTarget = backupRuntime.backupRestoreTarget
+const backupRestorePassphrase = backupRuntime.backupRestorePassphrase
 const loadBackups = backupRuntime.loadBackups
 const testBackupConnection = backupRuntime.testBackupConnection
 const runBackupNow = backupRuntime.runBackupNow
+const showBackupDetail = backupRuntime.showBackupDetail
+const downloadBackupItem = backupRuntime.downloadBackupItem
 const deleteBackupItem = backupRuntime.deleteBackupItem
+const openBackupRestore = backupRuntime.openBackupRestore
+const closeBackupRestore = backupRuntime.closeBackupRestore
+const restoreBackupItem = backupRuntime.restoreBackupItem
 const backupStatusText = computed(() => buildBackupStatusText(backupState.value))
+const backupRestoring = computed(() => backupBusy.value.startsWith('restore:'))
 const externalSourcesRuntime = useSettingsExternalSourcesRuntime({
   runtime: pageRuntime,
   cpaRequestKey: CPA_POOLS_REQUEST_KEY,
@@ -457,6 +482,14 @@ const imageStreamTimeoutField = useNumberSettingField(
     localSettings.value.image_stream_timeout_secs = value
   },
   { integer: true, min: 1, fallback: 80 },
+)
+const textStreamTimeoutField = useNumberSettingField(
+  () => localSettings.value?.text_stream_timeout_secs ?? 300,
+  (value) => {
+    if (!localSettings.value) return
+    localSettings.value.text_stream_timeout_secs = value
+  },
+  { integer: true, min: 1, fallback: 300 },
 )
 const imageAccountConcurrencyField = useNumberSettingField(
   () => localSettings.value?.image_account_concurrency ?? 1,

@@ -349,7 +349,7 @@ class ImageQueueDatabase:
                     ensure_database_role_marker(
                         connection,
                         IMAGE_QUEUE_DATABASE_ROLE,
-                        create_if_missing=not postgres,
+                        create_if_missing=True,
                     )
                 except ValueError as exc:
                     raise ImageQueueConfigurationError(str(exc)) from exc

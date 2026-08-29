@@ -472,12 +472,13 @@ def _download_image_url(url: str, *, max_bytes: int | None = None) -> ImageInput
         received = bytearray()
         too_large = False
 
-        def receive(chunk: bytes) -> None:
+        def receive(chunk: bytes) -> int:
             nonlocal too_large
             if len(received) + len(chunk) > byte_limit:
                 too_large = True
                 raise _ImageInputTooLarge()
             received.extend(chunk)
+            return len(chunk)
 
         try:
             response = requests.get(

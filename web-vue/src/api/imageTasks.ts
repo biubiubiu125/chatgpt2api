@@ -407,6 +407,13 @@ export const imageTasksApi = {
     return normalizeTask(response)
   },
 
+  cancel: async (taskId: string) => {
+    const response = await apiClient.post<never, ImageTask>(
+      `/api/image-tasks/${encodeURIComponent(taskId)}/cancel`,
+    )
+    return normalizeTask(response)
+  },
+
   resumePoll: async (taskId: string, extraTimeoutSecs = 30) => {
     const response = await apiClient.post<{ extra_timeout_secs: number }, ImageTask>(
       `/api/image-tasks/${encodeURIComponent(taskId)}/resume-poll`,

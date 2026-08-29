@@ -1,6 +1,24 @@
 services:
+  data-permissions:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chatgpt2api:local
+    container_name: chatgpt2api-local-data-permissions
+    user: "0:0"
+    volumes:
+      - ./data:/app/data
+    command:
+      - sh
+      - -ec
+      - |
+        mkdir -p /app/data/images
+        find /app/data -mindepth 1 -maxdepth 1 ! -name postgres -exec chown -R 10001:10001 {} +
+        chown 10001:10001 /app/data
+    restart: "no"
+
   postgres:
-    image: postgres:17-alpine
+    image: postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
     container_name: chatgpt2api-postgres-local
     environment:
       POSTGRES_DB: chatgpt2api_image_queue
@@ -16,7 +34,7 @@ services:
       start_period: 10s
 
   postgres-init:
-    image: postgres:17-alpine
+    image: postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
     container_name: chatgpt2api-postgres-local-init
     depends_on:
       postgres:
@@ -71,12 +89,18 @@ services:
         condition: service_healthy
       postgres-init:
         condition: service_completed_successfully
+      data-permissions:
+        condition: service_completed_successfully
     ports:
-      - "127.0.0.1:8000:80"
+      - "127.0.0.1:8000:3000"
     volumes:
       - ./data:/app/data
     environment:
       CHATGPT2API_CONFIG_FILE: /app/data/config.json
+      CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
+      CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
+      CHATGPT2API_IMAGE_BASE_URL: ${CHATGPT2API_IMAGE_BASE_URL:-}
+      CHATGPT2API_THREAD_TOKENS: ${CHATGPT2API_THREAD_TOKENS:-}
       STORAGE_BACKEND: sqlite
       DATABASE_URL: sqlite:////app/data/accounts.db
       IMAGE_QUEUE_DATABASE_URL: postgresql+psycopg2://chatgpt2api:chatgpt2api@postgres:5432/chatgpt2api_image_queue
@@ -87,10 +111,38 @@ services:
       IMAGE_QUEUE_MAX_BACKLOG: ${IMAGE_QUEUE_MAX_BACKLOG:-50}
       IMAGE_QUEUE_PENDING_TTL_SECONDS: ${IMAGE_QUEUE_PENDING_TTL_SECONDS:-1800}
       IMAGE_QUEUE_CLAIM_MAX_RUNTIME_SECONDS: ${IMAGE_QUEUE_CLAIM_MAX_RUNTIME_SECONDS:-1800}
+      IMAGE_QUEUE_LEGACY_TASK_PATH: ${IMAGE_QUEUE_LEGACY_TASK_PATH:-}
+      IMAGE_QUEUE_LEASE_SECONDS: ${IMAGE_QUEUE_LEASE_SECONDS:-}
+      IMAGE_QUEUE_HEARTBEAT_SECONDS: ${IMAGE_QUEUE_HEARTBEAT_SECONDS:-}
+      IMAGE_QUEUE_POLL_INTERVAL_SECONDS: ${IMAGE_QUEUE_POLL_INTERVAL_SECONDS:-}
+      IMAGE_QUEUE_RESULT_WAIT_POLL_SECONDS: ${IMAGE_QUEUE_RESULT_WAIT_POLL_SECONDS:-}
+      IMAGE_QUEUE_GENERATION_ATTEMPTS: ${IMAGE_QUEUE_GENERATION_ATTEMPTS:-}
+      IMAGE_QUEUE_DOWNLOAD_ATTEMPTS: ${IMAGE_QUEUE_DOWNLOAD_ATTEMPTS:-}
+      IMAGE_QUEUE_SAVE_ATTEMPTS: ${IMAGE_QUEUE_SAVE_ATTEMPTS:-}
+      IMAGE_QUEUE_CPU_THROTTLE_PERCENT: ${IMAGE_QUEUE_CPU_THROTTLE_PERCENT:-}
+      IMAGE_QUEUE_CPU_PAUSE_PERCENT: ${IMAGE_QUEUE_CPU_PAUSE_PERCENT:-}
+      IMAGE_QUEUE_CPU_RESUME_PERCENT: ${IMAGE_QUEUE_CPU_RESUME_PERCENT:-}
+      IMAGE_QUEUE_MEMORY_THROTTLE_PERCENT: ${IMAGE_QUEUE_MEMORY_THROTTLE_PERCENT:-}
+      IMAGE_QUEUE_MEMORY_PAUSE_PERCENT: ${IMAGE_QUEUE_MEMORY_PAUSE_PERCENT:-}
+      IMAGE_QUEUE_MEMORY_REJECT_PERCENT: ${IMAGE_QUEUE_MEMORY_REJECT_PERCENT:-}
+      IMAGE_QUEUE_DB_POOL_SIZE: ${IMAGE_QUEUE_DB_POOL_SIZE:-}
+      IMAGE_QUEUE_DB_MAX_OVERFLOW: ${IMAGE_QUEUE_DB_MAX_OVERFLOW:-}
+      EDITABLE_FILE_WORKERS: ${EDITABLE_FILE_WORKERS:-}
+      EDITABLE_FILE_MAX_BACKLOG: ${EDITABLE_FILE_MAX_BACKLOG:-}
+      PROMPT_LIBRARY_DEFAULT_URL: ${PROMPT_LIBRARY_DEFAULT_URL:-}
+      PROMPT_LIBRARY_REMOTE_URL: ${PROMPT_LIBRARY_REMOTE_URL:-}
       IMAGE_PROMPT_SUFFIX_ENABLED: ${IMAGE_PROMPT_SUFFIX_ENABLED:-true}
       IMAGE_PROMPT_SUFFIX: ${IMAGE_PROMPT_SUFFIX:-}
+      CHATGPT2API_BACKUP_PASSPHRASE: ${CHATGPT2API_BACKUP_PASSPHRASE:-}
+      CHATGPT2API_MONITOR_COMPLETED_LIMIT: ${CHATGPT2API_MONITOR_COMPLETED_LIMIT:-}
+      CHATGPT2API_MONITOR_EVENT_LIMIT: ${CHATGPT2API_MONITOR_EVENT_LIMIT:-}
+      CHATGPT2API_QUOTA_RESERVATION_TTL_SECONDS: ${CHATGPT2API_QUOTA_RESERVATION_TTL_SECONDS:-}
+      CHATGPT2API_RUNTIME_LOG_FILE: ${CHATGPT2API_RUNTIME_LOG_FILE:-}
+      HOST: ${HOST:-0.0.0.0}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-}
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1/health?format=json&scope=runtime', timeout=5).status == 200 else 1)\""]
+      test: ["CMD-SHELL", "python -c \"import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:3000/health?format=json&scope=runtime', timeout=5).status == 200 else 1)\""]
       interval: 30s
       timeout: 6s
       retries: 5

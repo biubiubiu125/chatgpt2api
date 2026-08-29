@@ -11,15 +11,17 @@ from threading import RLock
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
-from curl_cffi import requests as curl_requests
+from curl_cffi import CurlOpt, requests as curl_requests
 
 from services.config import BASE_DIR, DATA_DIR
+from services.file_lock import file_lock
 from services.json_file import read_json_file, write_json_file
 from services.prompt_source_adapters import (
     adapter_label,
     normalize_adapter_name,
     parse_prompt_source_payload,
 )
+from services.returned_url_verifier import ReturnedUrlVerificationError, _curl_resolve_address, _validate_public_host
 
 
 PROMPT_SOURCE_PATH = DATA_DIR / "prompt_sources.json"
@@ -97,9 +99,9 @@ def _bool(value: object, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     raw = _clean(value).lower()
-    if raw in {"1", "true", "yes", "y", "on"}:
+    if raw in {"1", "true", "yes", "y", "on", "enabled"}:
         return True
-    if raw in {"0", "false", "no", "n", "off", "none", "null", ""}:
+    if raw in {"0", "false", "no", "n", "off", "disabled", "none", "null", ""}:
         return False
     return default
 
@@ -172,11 +174,105 @@ def _canonical_source_url(url: str) -> str:
 
 
 def _validate_source_url(url: str) -> str:
+    return _validated_source_target(url)[0]
+
+
+def _prompt_source_error(exc: ReturnedUrlVerificationError) -> ValueError:
+    return ValueError(str(exc).replace("returned image URL", "prompt source url"))
+
+
+def _validated_source_target(url: str) -> tuple[str, str, int, tuple[str, ...]]:
     normalized = _canonical_source_url(url)
     parsed = urlparse(normalized)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("invalid prompt source url")
-    return normalized
+    try:
+        addresses = _validate_public_host(parsed)
+    except ReturnedUrlVerificationError as exc:
+        raise _prompt_source_error(exc) from exc
+    hostname = str(parsed.hostname or "").encode("idna").decode("ascii")
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise ValueError("prompt source url port is invalid") from exc
+    return normalized, hostname, port, addresses
+
+
+class _PromptSourceTooLarge(RuntimeError):
+    pass
+
+
+def _prompt_source_curl_options(hostname: str, port: int, addresses: tuple[str, ...]) -> dict[object, object]:
+    options: dict[object, object] = {CurlOpt.NOPROXY: "*"}
+    if addresses:
+        options[CurlOpt.RESOLVE] = [
+            f"{hostname}:{port}:{_curl_resolve_address(address)}"
+            for address in addresses
+        ]
+    return options
+
+
+def _fetch_prompt_source_payload(fetch_url: str) -> tuple[str, str, bytes]:
+    current = fetch_url
+    for redirect_count in range(6):
+        current, hostname, port, addresses = _validated_source_target(current)
+        payload = bytearray()
+        too_large = False
+
+        def receive(chunk: bytes) -> int:
+            nonlocal too_large
+            if len(payload) + len(chunk) > PROMPT_SOURCE_MAX_BYTES:
+                too_large = True
+                raise _PromptSourceTooLarge()
+            payload.extend(chunk)
+            return len(chunk)
+
+        session = curl_requests.Session(
+            allow_redirects=False,
+            trust_env=False,
+            curl_options=_prompt_source_curl_options(hostname, port, addresses),
+        )
+        try:
+            response = session.request(
+                "GET",
+                current,
+                headers={
+                    "Accept": "application/json,text/markdown,text/html,text/plain,*/*",
+                    "User-Agent": "chatgpt2api-prompt-library/3.0",
+                },
+                timeout=PROMPT_SOURCE_TIMEOUT,
+                allow_redirects=False,
+                content_callback=receive,
+            )
+        except _PromptSourceTooLarge as exc:
+            raise ValueError("prompt source too large") from exc
+        except Exception as exc:
+            if too_large:
+                raise ValueError("prompt source too large") from exc
+            raise
+        finally:
+            session.close()
+
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        response_url = _clean(getattr(response, "url", ""))
+        if response_url and response_url != current:
+            _validated_source_target(response_url)
+        if status_code in {301, 302, 303, 307, 308}:
+            location = _clean(getattr(response, "headers", {}).get("location"))
+            if not location or redirect_count >= 5:
+                raise ValueError("prompt source has too many redirects")
+            current = urljoin(current, location)
+            continue
+        if not 200 <= status_code < 300:
+            raise ValueError(f"prompt source fetch failed: HTTP {status_code}")
+        content_length = _clean(getattr(response, "headers", {}).get("content-length"))
+        if content_length.isdigit() and int(content_length) > PROMPT_SOURCE_MAX_BYTES:
+            raise ValueError("prompt source too large")
+        body = bytes(payload or getattr(response, "content", b"") or b"")
+        if len(body) > PROMPT_SOURCE_MAX_BYTES:
+            raise ValueError("prompt source too large")
+        return current, str(getattr(response, "headers", {}).get("content-type", "")), body
+    raise ValueError("prompt source has too many redirects")
 
 
 def _validate_homepage(value: object) -> str:
@@ -229,7 +325,7 @@ def _sort_key(item: dict[str, Any]) -> tuple[int, int, str, str, str, str]:
     has_order = 0 if isinstance(order, int) else 1
     order_value = order if isinstance(order, int) else 9999
     return (
-        0 if bool(item.get("enabled", True)) else 1,
+        0 if _bool(item.get("enabled"), True) else 1,
         has_order,
         f"{order_value:08d}",
         _clean(item.get("source_name")).lower(),
@@ -391,12 +487,21 @@ def _merge_builtin_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]
         merged[match_index] = {
             **normalized_builtin,
             "name": _clean(existing.get("name")) or normalized_builtin["name"],
-            "enabled": bool(existing.get("enabled", True)),
+            "enabled": _bool(existing.get("enabled"), True),
             "sort_order": existing.get("sort_order") if existing.get("sort_order") is not None else normalized_builtin["sort_order"],
             "created_at": _clean(existing.get("created_at")) or normalized_builtin["created_at"],
             "updated_at": _clean(existing.get("updated_at")) or normalized_builtin["updated_at"],
         }
     return merged
+
+
+def _normalize_cached_prompt_item(raw: object) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    item = dict(raw)
+    if "enabled" in item:
+        item["enabled"] = _bool(item.get("enabled"), True)
+    return item
 
 
 def _normalize_prompt(raw: object, source: dict[str, Any]) -> dict[str, Any] | None:
@@ -460,11 +565,24 @@ class PromptLibraryService:
         self._cache_lock = RLock()
         self._source_cache: dict[str, dict[str, Any]] = {}
         self._cache_loaded = False
+        self._cache_mtime_ns = -1
+
+    def _sources_lock_path(self) -> Path:
+        return self.path.with_name(f"{self.path.name}.lock")
+
+    @staticmethod
+    def _cache_lock_path() -> Path:
+        return PROMPT_LIBRARY_CACHE_PATH.with_name(f"{PROMPT_LIBRARY_CACHE_PATH.name}.lock")
 
     def _ensure_cache_loaded_locked(self) -> None:
         with self._cache_lock:
-            if self._cache_loaded:
+            try:
+                cache_mtime_ns = PROMPT_LIBRARY_CACHE_PATH.stat().st_mtime_ns
+            except OSError:
+                cache_mtime_ns = 0
+            if self._cache_loaded and self._cache_mtime_ns == cache_mtime_ns:
                 return
+            next_cache: dict[str, dict[str, Any]] = {}
             data = read_json_file(
                 PROMPT_LIBRARY_CACHE_PATH,
                 name="prompt_library_cache.json",
@@ -476,26 +594,57 @@ class PromptLibraryService:
                 for source_id, cache in raw_sources.items():
                     if not isinstance(cache, dict):
                         continue
-                    items = cache.get("items")
-                    self._source_cache[_clean(source_id)] = {
-                        "items": items if isinstance(items, list) else [],
+                    items = [
+                        item
+                        for raw_item in (cache.get("items") if isinstance(cache.get("items"), list) else [])
+                        if (item := _normalize_cached_prompt_item(raw_item)) is not None
+                    ]
+                    normalized_source_id = _clean(source_id)
+                    if not normalized_source_id:
+                        continue
+                    next_cache[normalized_source_id] = {
+                        "items": items,
                         "adapter": _clean(cache.get("adapter")),
                         "fetched_at": _float_or_zero(cache.get("fetched_at")),
                         "last_sync_at": _clean(cache.get("last_sync_at")),
                         "last_error": _clean(cache.get("last_error")),
                         "last_fetch_ms": _int_or_none(cache.get("last_fetch_ms")),
                     }
+            self._source_cache = next_cache
             self._cache_loaded = True
+            self._cache_mtime_ns = cache_mtime_ns
 
-    def _save_cache_snapshot_locked(self) -> None:
-        with self._cache_lock:
+    def _save_cache_snapshot_locked(self, updates: dict[str, dict[str, Any]] | None = None) -> None:
+        with self._cache_lock, file_lock(self._cache_lock_path()):
+            current = read_json_file(
+                PROMPT_LIBRARY_CACHE_PATH,
+                name="prompt_library_cache.json",
+                default_factory=dict,
+                expected_types=(dict,),
+            )
+            raw_sources = current.get("sources", {}) if isinstance(current, dict) else {}
+            merged_sources = {
+                _clean(source_id): dict(cache)
+                for source_id, cache in raw_sources.items()
+                if _clean(source_id) and isinstance(cache, dict)
+            } if isinstance(raw_sources, dict) else {}
+            changed_sources = updates if updates is not None else self._source_cache
+            for source_id, cache in changed_sources.items():
+                normalized_id = _clean(source_id)
+                if normalized_id and isinstance(cache, dict):
+                    merged_sources[normalized_id] = dict(cache)
+            self._source_cache = merged_sources
             write_json_file(
                 PROMPT_LIBRARY_CACHE_PATH,
                 {
                     "updated_at": _now_iso(),
-                    "sources": self._source_cache,
+                    "sources": merged_sources,
                 },
             )
+            try:
+                self._cache_mtime_ns = PROMPT_LIBRARY_CACHE_PATH.stat().st_mtime_ns
+            except OSError:
+                self._cache_mtime_ns = 0
 
     def _load_sources_locked(self) -> list[dict[str, Any]]:
         data = read_json_file(
@@ -542,7 +691,7 @@ class PromptLibraryService:
                     "last_error": f"default snapshot failed: {exc}"[:500],
                     "last_fetch_ms": 0,
                 }
-            self._save_cache_snapshot_locked()
+            self._save_cache_snapshot_locked({DEFAULT_PROMPT_SOURCE_ID: self._source_cache[DEFAULT_PROMPT_SOURCE_ID]})
             return
         with self._cache_lock:
             current = dict(self._source_cache.get(DEFAULT_PROMPT_SOURCE_ID) or {})
@@ -556,7 +705,7 @@ class PromptLibraryService:
                 "last_error": "",
                 "last_fetch_ms": 0,
             }
-        self._save_cache_snapshot_locked()
+        self._save_cache_snapshot_locked({DEFAULT_PROMPT_SOURCE_ID: self._source_cache[DEFAULT_PROMPT_SOURCE_ID]})
 
     def _source_status_locked(self, source: dict[str, Any]) -> dict[str, Any]:
         self._ensure_cache_loaded_locked()
@@ -589,20 +738,8 @@ class PromptLibraryService:
             for fetch_url in _source_fetch_urls(source):
                 for _attempt in range(PROMPT_SOURCE_FETCH_ATTEMPTS):
                     try:
-                        response = curl_requests.get(
-                            fetch_url,
-                            headers={
-                                "Accept": "application/json,text/markdown,text/html,text/plain,*/*",
-                                "User-Agent": "chatgpt2api-prompt-library/3.0",
-                            },
-                            timeout=PROMPT_SOURCE_TIMEOUT,
-                        )
-                        response.raise_for_status()
-                        content_type = response.headers.get("content-type", "")
-                        payload = response.content[: PROMPT_SOURCE_MAX_BYTES + 1]
-                        if len(payload) > PROMPT_SOURCE_MAX_BYTES:
-                            raise ValueError("prompt source too large")
-                        source_for_items = {**source, "url": fetch_url}
+                        final_url, content_type, payload = _fetch_prompt_source_payload(fetch_url)
+                        source_for_items = {**source, "url": final_url}
                         adapter_name, raw_items = parse_prompt_source_payload(payload, source_for_items, content_type=content_type)
                         items = sorted(
                             [item for raw in raw_items if (item := _normalize_prompt(raw, source_for_items)) is not None],
@@ -626,7 +763,7 @@ class PromptLibraryService:
                     "last_error": "",
                     "last_fetch_ms": int((time.monotonic() - started) * 1000),
                 }
-            self._save_cache_snapshot_locked()
+            self._save_cache_snapshot_locked({source_id: self._source_cache[source_id]})
             return list(items)
         except Exception as exc:
             fallback_items = list((cache or {}).get("items") or [])
@@ -639,13 +776,13 @@ class PromptLibraryService:
                     "last_error": str(exc)[:500],
                     "last_fetch_ms": int((time.monotonic() - started) * 1000),
                 }
-            self._save_cache_snapshot_locked()
+            self._save_cache_snapshot_locked({source_id: self._source_cache[source_id]})
             return fallback_items
 
     def _list_cached_items_locked(self, *, include_disabled_items: bool = False) -> dict[str, Any]:
         sources = self._load_sources_locked()
         self._seed_default_cache_locked(sources)
-        enabled_sources = [source for source in sources if include_disabled_items or bool(source.get("enabled", True))]
+        enabled_sources = [source for source in sources if include_disabled_items or _bool(source.get("enabled"), True)]
         with self._cache_lock:
             source_cache = {
                 source_id: dict(cache)
@@ -662,7 +799,7 @@ class PromptLibraryService:
                 cached_source_count += 1
             source_items = list(cache.get("items") or [])
             if not include_disabled_items:
-                source_items = [item for item in source_items if bool(item.get("enabled", True))]
+                source_items = [item for item in source_items if _bool(item.get("enabled"), True)]
             for item in source_items:
                 if not isinstance(item, dict):
                     continue
@@ -678,7 +815,7 @@ class PromptLibraryService:
             "items": sorted(items, key=_sort_key),
             "synced": cached_source_count > 0,
             "cached_source_count": cached_source_count,
-            "enabled_source_count": len([source for source in sources if bool(source.get("enabled", True))]),
+            "enabled_source_count": len([source for source in sources if _bool(source.get("enabled"), True)]),
         }
 
     def _list_items_locked(self, *, include_disabled_items: bool = False, force: bool = False, source_id: str = "") -> list[dict[str, Any]]:
@@ -686,7 +823,7 @@ class PromptLibraryService:
         if source_id:
             sources = [source for source in sources if source.get("id") == source_id]
         else:
-            sources = [source for source in sources if bool(source.get("enabled", True))]
+            sources = [source for source in sources if _bool(source.get("enabled"), True)]
         if not sources:
             return []
 
@@ -711,7 +848,7 @@ class PromptLibraryService:
         seen: set[str] = set()
         for source, source_items in sorted(fetched, key=lambda pair: _source_sort_key(pair[0])):
             if not include_disabled_items:
-                source_items = [item for item in source_items if bool(item.get("enabled", True))]
+                source_items = [item for item in source_items if _bool(item.get("enabled"), True)]
             for item in source_items:
                 fingerprint = _prompt_fingerprint(item)
                 if fingerprint in seen:
@@ -734,7 +871,7 @@ class PromptLibraryService:
         normalized_id = _clean(source_id)
         if not normalized_id:
             return None
-        with self._lock:
+        with self._lock, file_lock(self._sources_lock_path()):
             sources = self._load_sources_locked()
             for index, current in enumerate(sources):
                 if current.get("id") != normalized_id:
@@ -772,7 +909,7 @@ class PromptLibraryService:
                     "error": _clean(source.get("last_error")),
                 }
                 for source in sources
-                if bool(source.get("enabled", True)) and _clean(source.get("last_error"))
+                if _bool(source.get("enabled"), True) and _clean(source.get("last_error"))
             ]
             if not source_id:
                 items = self._list_cached_items_locked(include_disabled_items=True)["items"]

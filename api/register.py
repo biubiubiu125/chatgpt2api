@@ -71,7 +71,10 @@ def create_router() -> APIRouter:
     @router.post("/api/register/reset")
     async def reset_register(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"register": await run_in_threadpool(register_service.reset)}
+        try:
+            return {"register": await run_in_threadpool(register_service.reset)}
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post("/api/register/outlook-pool/reset")
     async def reset_outlook_pool(body: OutlookPoolResetRequest, authorization: str | None = Header(default=None)):

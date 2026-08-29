@@ -9,7 +9,7 @@ import json
 from typing import Any, Callable, Iterable, Sequence, TextIO
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, delete, func, or_, select, text, update
+from sqlalchemy import and_, delete, exists, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -148,6 +148,59 @@ def _backup_datetime(value: object, default: datetime | None = None) -> datetime
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
+def _backup_bool(
+    record: dict[str, Any],
+    key: str,
+    *,
+    default: bool = False,
+) -> bool:
+    if key not in record or record[key] is None:
+        return default
+    value = record[key]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise ValueError(f"image queue backup field {key} must be boolean")
+
+
+def _backup_mapping(
+    record: dict[str, Any],
+    key: str,
+) -> dict[str, Any]:
+    if key not in record or record[key] is None:
+        return {}
+    value = record[key]
+    if not isinstance(value, dict):
+        raise ValueError(f"image queue backup field {key} must be an object")
+    return dict(value)
+
+
+def _backup_string_list(
+    record: dict[str, Any],
+    key: str,
+) -> list[str]:
+    if key not in record or record[key] is None:
+        return []
+    value = record[key]
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"image queue backup field {key} must be an array of strings")
+    return list(value)
+
+
+def _backup_relative_path(value: object) -> str:
+    text = str(value or "").strip()
+    normalized = text.replace("\\", "/")
+    if (
+        not normalized
+        or normalized.startswith("/")
+        or (len(normalized) >= 2 and normalized[1] == ":")
+        or any(part in {"", ".", ".."} for part in normalized.split("/"))
+    ):
+        raise ValueError("image queue backup contains an unsafe artifact path")
+    return normalized
+
+
 def claimable_job_statement(
     now: datetime | None = None,
     excluded_job_ids: Sequence[UUID] = (),
@@ -274,7 +327,7 @@ class ImageQueueRepository:
             if lock:
                 statement = statement.with_for_update()
             add_match(session.execute(statement).scalar_one_or_none())
-        if task_id is not None and len(matches) > 1:
+        if len(matches) > 1:
             raise IdempotencyConflict("image task identifier matches multiple tasks")
         return matches[0] if matches else None
 
@@ -572,9 +625,13 @@ class ImageQueueRepository:
         except IntegrityError as exc:
             with self.database.session() as session:
                 existing = self._matching_existing_task(session, request)
-                if existing is not None and existing.request_hash == request.request_hash:
-                    return EnqueueResult(task=self._task_snapshot(session, existing), created=False)
-            raise IdempotencyConflict("idempotency key was already used with a different request") from exc
+                if existing is not None:
+                    if existing.request_hash == request.request_hash:
+                        return EnqueueResult(task=self._task_snapshot(session, existing), created=False)
+                    raise IdempotencyConflict(
+                        "idempotency key was already used with a different request"
+                    ) from exc
+            raise
 
     def expire_pending_tasks(
         self,
@@ -727,7 +784,7 @@ class ImageQueueRepository:
                         if task is not None
                     ]
                     unique_candidates = {task.id: task for task in candidates}
-                    if _uuid(identifier) is not None and len(unique_candidates) > 1:
+                    if len(unique_candidates) > 1:
                         raise IdempotencyConflict("image task identifier matches multiple tasks")
                     task = next(iter(unique_candidates.values()), None)
                     if task is not None and task.id not in seen:
@@ -2060,10 +2117,26 @@ class ImageQueueRepository:
             else:
                 return None
             previous_status = job.status
-            session.execute(delete(ImageTaskArtifact).where(
-                ImageTaskArtifact.job_id == job.id,
-                ImageTaskArtifact.kind.in_(discard_kinds),
-            ))
+            invalidated = session.execute(
+                select(ImageTaskArtifact)
+                .where(
+                    ImageTaskArtifact.job_id == job.id,
+                    ImageTaskArtifact.kind.in_(discard_kinds),
+                )
+                .with_for_update()
+            ).scalars().all()
+            for artifact in invalidated:
+                artifact.status = ArtifactStatus.INVALID.value
+                artifact.ready_at = None
+            if invalidated:
+                self._event(
+                    session,
+                    task_id=task.id,
+                    job_id=job.id,
+                    event_type="result_artifacts_marked_for_cleanup",
+                    attempt=job.generate_attempts + job.download_attempts + job.save_attempts,
+                    data={"paths": [item.relative_path for item in invalidated]},
+                )
             job.status = JobStatus.QUEUED.value
             job.stage = recovery_stage.value
             job.result_payload = {}
@@ -2094,6 +2167,28 @@ class ImageQueueRepository:
             )
             self._aggregate_task(session, task)
             return self._task_snapshot(session, task)
+
+    def remove_invalid_artifacts(
+        self,
+        task_id: UUID,
+        relative_paths: Sequence[str],
+    ) -> int:
+        paths = tuple(
+            str(path or "").strip()
+            for path in relative_paths
+            if str(path or "").strip()
+        )
+        if not paths:
+            return 0
+        with self.database.session() as session:
+            result = session.execute(
+                delete(ImageTaskArtifact).where(
+                    ImageTaskArtifact.task_id == task_id,
+                    ImageTaskArtifact.relative_path.in_(paths),
+                    ImageTaskArtifact.status == ArtifactStatus.INVALID.value,
+                )
+            )
+            return int(result.rowcount or 0)
 
     def fail_undeliverable_result(
         self,
@@ -2137,6 +2232,18 @@ class ImageQueueRepository:
             job.lease_token = None
             job.lease_expires_at = None
             job.heartbeat_at = None
+            invalidated = session.execute(
+                select(ImageTaskArtifact)
+                .where(
+                    ImageTaskArtifact.job_id == job.id,
+                    ImageTaskArtifact.kind == "final",
+                    ImageTaskArtifact.status == ArtifactStatus.READY.value,
+                )
+                .with_for_update()
+            ).scalars().all()
+            for artifact in invalidated:
+                artifact.status = ArtifactStatus.INVALID.value
+                artifact.ready_at = None
             self._event(
                 session,
                 task_id=job.task_id,
@@ -2148,10 +2255,83 @@ class ImageQueueRepository:
                 data={
                     "error_code": error_code,
                     "error_message": error_message[:1000],
+                    "artifact_paths": [item.relative_path for item in invalidated],
                 },
             )
             self._aggregate_task(session, task)
             return self._task_snapshot(session, task)
+
+    def list_invalid_artifacts(
+        self,
+        limit: int = 100,
+        *,
+        worker_id: str = "",
+        include_unowned: bool = True,
+    ) -> list[ArtifactDescriptor]:
+        with self.database.session() as session:
+            statement = (
+                select(ImageTaskArtifact)
+                .where(ImageTaskArtifact.status == ArtifactStatus.INVALID.value)
+                .order_by(ImageTaskArtifact.created_at, ImageTaskArtifact.relative_path)
+                .limit(max(1, min(1000, int(limit))))
+            )
+            normalized_worker_id = str(worker_id or "").strip()
+            if normalized_worker_id:
+                owner_filters = [ImageTaskArtifact.worker_id == normalized_worker_id]
+                if include_unowned:
+                    owner_filters.extend((
+                        ImageTaskArtifact.worker_id.is_(None),
+                        ImageTaskArtifact.worker_id == "",
+                    ))
+                statement = statement.where(or_(*owner_filters))
+            rows = session.execute(statement).scalars().all()
+            return [self._artifact_descriptor(item) for item in rows]
+
+    def invalidate_public_final_artifact(
+        self,
+        relative_path: object,
+    ) -> ArtifactDescriptor | None:
+        rel = str(relative_path or "").strip().replace("\\", "/").lstrip("/")
+        if not rel:
+            return None
+        with self.database.session() as session:
+            artifact = session.execute(
+                select(ImageTaskArtifact)
+                .join(ImageJob, ImageJob.id == ImageTaskArtifact.job_id)
+                .join(ImageTask, ImageTask.id == ImageTaskArtifact.task_id)
+                .where(
+                    ImageTaskArtifact.relative_path == rel,
+                    ImageTaskArtifact.kind == "final",
+                    ImageTaskArtifact.status == ArtifactStatus.READY.value,
+                    ImageJob.status == JobStatus.SUCCESS.value,
+                    ImageTask.status.in_([status.value for status in TERMINAL_TASK_STATUSES]),
+                )
+                .limit(1)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if artifact is None:
+                return None
+            job = session.get(ImageJob, artifact.job_id) if artifact.job_id is not None else None
+            if job is not None:
+                job.result_payload = {}
+                job.updated_at = utc_now()
+            artifact.status = ArtifactStatus.INVALID.value
+            artifact.ready_at = None
+            self._event(
+                session,
+                task_id=artifact.task_id,
+                job_id=artifact.job_id,
+                event_type="public_final_artifact_invalidated",
+                data={
+                    "relative_path": rel,
+                    "kind": "final",
+                    "worker_id": str(artifact.worker_id or ""),
+                },
+            )
+            task = session.get(ImageTask, artifact.task_id)
+            if task is not None:
+                self._aggregate_task(session, task)
+            return self._artifact_descriptor(artifact)
 
     @staticmethod
     def _increment_attempt(job: ImageJob) -> None:
@@ -2574,6 +2754,22 @@ class ImageQueueRepository:
                 raise TaskStateConflict("only successful or partial completed image results can be acknowledged")
             if task.delivery_status == DeliveryStatus.ACKNOWLEDGED.value:
                 return self._task_snapshot(session, task)
+            result_payloads = session.execute(
+                select(ImageJob.result_payload).where(
+                    ImageJob.task_id == task.id,
+                    ImageJob.status == JobStatus.SUCCESS.value,
+                )
+            ).scalars()
+            available_results = sum(
+                1
+                for payload in result_payloads
+                if isinstance(payload, dict) and bool(payload)
+            )
+            if (
+                (task.status == TaskStatus.SUCCESS.value and int(available_results or 0) < max(1, int(task.required_jobs or 0)))
+                or (terminal_with_results and int(available_results or 0) <= 0)
+            ):
+                raise TaskStateConflict("deliverable image result is no longer available")
             task.delivery_status = DeliveryStatus.ACKNOWLEDGED.value
             task.delivery_acked_at = utc_now()
             self._event(session, task_id=task.id, event_type="delivery_acknowledged")
@@ -2623,6 +2819,67 @@ class ImageQueueRepository:
                     "height": int(artifact.height or 0),
                 })
             return items
+
+    def public_final_artifact_descriptor(self, relative_path: object) -> ArtifactDescriptor | None:
+        rel = str(relative_path or "").strip().replace("\\", "/").lstrip("/")
+        if not rel:
+            return None
+        with self.database.session() as session:
+            artifact = session.execute(
+                select(ImageTaskArtifact)
+                .join(ImageJob, ImageJob.id == ImageTaskArtifact.job_id)
+                .join(ImageTask, ImageTask.id == ImageTaskArtifact.task_id)
+                .where(
+                    ImageTaskArtifact.relative_path == rel,
+                    ImageTaskArtifact.kind == "final",
+                    ImageTaskArtifact.status == ArtifactStatus.READY.value,
+                    ImageJob.status == JobStatus.SUCCESS.value,
+                    ImageTask.status.in_([status.value for status in TERMINAL_TASK_STATUSES]),
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            return self._artifact_descriptor(artifact) if artifact is not None else None
+
+    def delete_public_final_artifact(self, relative_path: object) -> bool:
+        rel = str(relative_path or "").strip().replace("\\", "/").lstrip("/")
+        if not rel:
+            return False
+        with self.database.session() as session:
+            artifact = session.execute(
+                select(ImageTaskArtifact)
+                .join(ImageJob, ImageJob.id == ImageTaskArtifact.job_id)
+                .join(ImageTask, ImageTask.id == ImageTaskArtifact.task_id)
+                .where(
+                    ImageTaskArtifact.relative_path == rel,
+                    ImageTaskArtifact.kind == "final",
+                    ImageTaskArtifact.status == ArtifactStatus.READY.value,
+                    ImageJob.status == JobStatus.SUCCESS.value,
+                    ImageTask.status.in_([status.value for status in TERMINAL_TASK_STATUSES]),
+                )
+                .limit(1)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if artifact is None:
+                return False
+            task_id = artifact.task_id
+            job_id = artifact.job_id
+            if job_id is not None:
+                job = session.get(ImageJob, job_id)
+                if job is not None:
+                    job.result_payload = {}
+                    job.updated_at = utc_now()
+            session.delete(artifact)
+            self._event(
+                session,
+                task_id=task_id,
+                job_id=job_id,
+                event_type="public_final_artifact_deleted",
+                data={"relative_path": rel, "kind": "final"},
+            )
+            task = session.get(ImageTask, task_id)
+            if task is not None:
+                self._aggregate_task(session, task)
+            return True
 
     def is_public_final_artifact(self, relative_path: object) -> bool:
         rel = str(relative_path or "").strip().replace("\\", "/").lstrip("/")
@@ -2851,6 +3108,13 @@ class ImageQueueRepository:
                 select(ImageTask.id).where(
                     ImageTask.completed_at.is_not(None),
                     ImageTask.completed_at <= retention_cutoff,
+                    ~exists(
+                        select(ImageJob.id).where(
+                            ImageJob.task_id == ImageTask.id,
+                            ImageJob.quota_consumed.is_(True),
+                            ImageJob.quota_accounted.is_(False),
+                        ).correlate(ImageTask)
+                    ),
                     or_(
                         and_(
                             ImageTask.status == TaskStatus.SUCCESS.value,
@@ -2873,21 +3137,42 @@ class ImageQueueRepository:
                 return PurgedTerminalTasks(removed=0)
             cleanup_worker_id = str(worker_id or "").strip()
             artifact_statement = select(ImageTaskArtifact).where(ImageTaskArtifact.task_id.in_(task_ids))
+            artifact_rows = list(session.execute(artifact_statement).scalars().all())
             if cleanup_worker_id:
-                worker_filters = [ImageTaskArtifact.worker_id == cleanup_worker_id]
-                if include_unowned:
-                    worker_filters.extend((
-                        ImageTaskArtifact.worker_id.is_(None),
-                        ImageTaskArtifact.worker_id == "",
-                    ))
-                artifact_statement = artifact_statement.where(
-                    or_(*worker_filters)
+                fresh_cutoff = current_time - timedelta(
+                    seconds=max(60.0, float(self.lease_seconds) * 2.0)
                 )
-            artifacts = tuple(
-                self._artifact_descriptor(item)
-                for item in session.execute(artifact_statement).scalars().all()
-            )
+                fresh_worker_ids = {
+                    str(owner or "").strip()
+                    for owner, heartbeat_at in session.execute(
+                        select(ImageWorkerState.worker_id, ImageWorkerState.heartbeat_at)
+                        .where(ImageWorkerState.heartbeat_at > fresh_cutoff)
+                    ).all()
+                    if str(owner or "").strip()
+                }
+                selected_rows = []
+                for item in artifact_rows:
+                    owner = str(item.worker_id or "").strip()
+                    if owner == cleanup_worker_id:
+                        selected_rows.append(item)
+                    elif not owner:
+                        if include_unowned:
+                            selected_rows.append(item)
+                    elif owner not in fresh_worker_ids:
+                        selected_rows.append(item)
+                artifact_rows = selected_rows
+            artifacts = tuple(self._artifact_descriptor(item) for item in artifact_rows)
             if not cleanup_worker_id:
+                # A caller without a worker identity still has to remove physical
+                # artifacts before deleting their database rows.  Otherwise a
+                # transient filesystem/WebDAV failure would make the task
+                # unreachable while leaving the artifact behind.
+                if artifact_rows:
+                    return PurgedTerminalTasks(
+                        removed=0,
+                        artifacts=artifacts,
+                        task_ids=task_ids,
+                    )
                 result = session.execute(delete(ImageTask).where(ImageTask.id.in_(task_ids)))
                 return PurgedTerminalTasks(
                     removed=int(result.rowcount or 0),
@@ -2914,18 +3199,38 @@ class ImageQueueRepository:
             return 0
         cleanup_worker_id = str(worker_id or "").strip()
         with self.database.session() as session:
-            artifact_statement = delete(ImageTaskArtifact).where(ImageTaskArtifact.task_id.in_(normalized_task_ids))
+            artifact_rows = list(session.execute(
+                select(ImageTaskArtifact)
+                .where(ImageTaskArtifact.task_id.in_(normalized_task_ids))
+                .with_for_update()
+            ).scalars().all())
             if cleanup_worker_id:
-                worker_filters = [ImageTaskArtifact.worker_id == cleanup_worker_id]
-                if include_unowned:
-                    worker_filters.extend((
-                        ImageTaskArtifact.worker_id.is_(None),
-                        ImageTaskArtifact.worker_id == "",
-                    ))
-                artifact_statement = artifact_statement.where(
-                    or_(*worker_filters)
+                fresh_cutoff = utc_now() - timedelta(
+                    seconds=max(60.0, float(self.lease_seconds) * 2.0)
                 )
-            session.execute(artifact_statement)
+                fresh_worker_ids = {
+                    str(owner or "").strip()
+                    for owner in session.execute(
+                        select(ImageWorkerState.worker_id)
+                        .where(ImageWorkerState.heartbeat_at > fresh_cutoff)
+                    ).scalars().all()
+                    if str(owner or "").strip()
+                }
+                artifact_rows = [
+                    item for item in artifact_rows
+                    if (
+                        str(item.worker_id or "").strip() == cleanup_worker_id
+                        or (
+                            include_unowned and not str(item.worker_id or "").strip()
+                        )
+                        or (
+                            str(item.worker_id or "").strip()
+                            and str(item.worker_id or "").strip() not in fresh_worker_ids
+                        )
+                    )
+                ]
+            for artifact in artifact_rows:
+                session.delete(artifact)
             remaining_task_ids = {
                 item
                 for item in session.execute(
@@ -3045,6 +3350,13 @@ class ImageQueueRepository:
                 .join(ImageTask, ImageTask.id == ImageTaskArtifact.task_id)
                 .outerjoin(ImageJob, ImageJob.id == ImageTaskArtifact.job_id)
                 .where(or_(
+                    exists(
+                        select(ImageJob.id).where(
+                            ImageJob.task_id == ImageTask.id,
+                            ImageJob.quota_consumed.is_(True),
+                            ImageJob.quota_accounted.is_(False),
+                        ).correlate(ImageTask)
+                    ),
                     ImageTask.status.in_(active_statuses),
                     and_(
                         ImageTask.status == TaskStatus.SUCCESS.value,
@@ -3052,7 +3364,12 @@ class ImageQueueRepository:
                     ),
                     and_(
                         ImageTask.status.in_([TaskStatus.FAILED.value, TaskStatus.CANCELED.value]),
-                        ImageJob.status == JobStatus.SUCCESS.value,
+                        ImageTaskArtifact.kind == "final",
+                        ImageTaskArtifact.status == ArtifactStatus.READY.value,
+                        ImageJob.status.in_([
+                            JobStatus.SUCCESS.value,
+                            JobStatus.FAILED.value,
+                        ]),
                         delivery_protected,
                     ),
                 ))
@@ -3082,6 +3399,13 @@ class ImageQueueRepository:
                 self._delivery_cutoff(exported_at),
                 self._terminal_retention_cutoff(exported_at),
             )
+            quota_unaccounted = exists(
+                select(ImageJob.id).where(
+                    ImageJob.task_id == ImageTask.id,
+                    ImageJob.quota_consumed.is_(True),
+                    ImageJob.quota_accounted.is_(False),
+                )
+            ).correlate(ImageTask)
             protected_paths = {
                 str(path)
                 for path in session.execute(
@@ -3096,9 +3420,15 @@ class ImageQueueRepository:
                         ),
                         and_(
                             ImageTask.status.in_([TaskStatus.FAILED.value, TaskStatus.CANCELED.value]),
-                            ImageJob.status == JobStatus.SUCCESS.value,
+                            ImageTaskArtifact.kind == "final",
+                            ImageTaskArtifact.status == ArtifactStatus.READY.value,
+                            ImageJob.status.in_([
+                                JobStatus.SUCCESS.value,
+                                JobStatus.FAILED.value,
+                            ]),
                             delivery_protected,
                         ),
+                        quota_unaccounted,
                     ))
                 ).scalars()
                 if str(path or "").strip()
@@ -3276,12 +3606,19 @@ class ImageQueueRepository:
             exported_at = utc_now()
             tasks_by_id = {item.id: item for item in tasks}
             jobs_by_id = {item.id: item for item in jobs}
+            unaccounted_task_ids = {
+                item.task_id
+                for item in jobs
+                if item.quota_consumed and not item.quota_accounted
+            }
             delivery_cutoff = self._delivery_cutoff(exported_at)
 
             def backup_required(artifact: ImageTaskArtifact) -> bool:
                 task = tasks_by_id.get(artifact.task_id)
                 if task is None:
                     return False
+                if task.id in unaccounted_task_ids:
+                    return True
                 if task.status not in {item.value for item in TERMINAL_TASK_STATUSES}:
                     return True
                 if not self._task_delivery_still_protected(task, delivery_cutoff):
@@ -3430,7 +3767,15 @@ class ImageQueueRepository:
             raise ValueError("unsupported image queue backup version")
         collections = {
             name: payload.get(name, [])
-            for name in ("tasks", "jobs", "events", "artifacts", "legacy_imports")
+            for name in (
+                "tasks",
+                "jobs",
+                "events",
+                "artifacts",
+                "account_leases",
+                "workers",
+                "legacy_imports",
+            )
         }
         if any(not isinstance(items, list) for items in collections.values()):
             raise ValueError("image queue backup collections must be arrays")
@@ -3439,9 +3784,12 @@ class ImageQueueRepository:
                 raise TaskStateConflict("image queue restore requires an empty database")
             now = utc_now()
             task_ids: list[UUID] = []
+            task_id_set: set[UUID] = set()
             for raw in collections["tasks"]:
                 if not isinstance(raw, dict) or (task_id := _uuid(raw.get("id"))) is None:
                     raise ValueError("image queue backup contains an invalid task")
+                if task_id in task_id_set:
+                    raise ValueError("image queue backup contains duplicate task ids")
                 created_at = _backup_datetime(raw.get("created_at"), now) or now
                 status = TaskStatus(str(raw.get("status") or TaskStatus.QUEUED.value))
                 delivery = DeliveryStatus(str(raw.get("delivery_status") or DeliveryStatus.PENDING.value))
@@ -3456,7 +3804,7 @@ class ImageQueueRepository:
                     original_prompt=str(raw.get("original_prompt") or ""),
                     effective_prompt=str(raw.get("effective_prompt") or ""),
                     prompt_suffix_version=str(raw.get("prompt_suffix_version") or "") or None,
-                    request_payload=dict(raw.get("request_payload") or {}),
+                    request_payload=_backup_mapping(raw, "request_payload"),
                     required_jobs=max(1, int(raw.get("required_jobs") or 1)),
                     succeeded_jobs=max(0, int(raw.get("succeeded_jobs") or 0)),
                     failed_jobs=max(0, int(raw.get("failed_jobs") or 0)),
@@ -3467,18 +3815,20 @@ class ImageQueueRepository:
                     delivery_status=delivery.value,
                     response_attempted_at=_backup_datetime(raw.get("response_attempted_at")),
                     delivery_acked_at=_backup_datetime(raw.get("delivery_acked_at")),
-                    cancel_requested=bool(raw.get("cancel_requested")),
                     created_at=created_at,
                     queued_at=_backup_datetime(raw.get("queued_at"), created_at) or created_at,
                     started_at=_backup_datetime(raw.get("started_at")),
                     completed_at=_backup_datetime(raw.get("completed_at")),
                     updated_at=_backup_datetime(raw.get("updated_at"), created_at) or created_at,
                     version=max(1, int(raw.get("version") or 1)),
+                    cancel_requested=_backup_bool(raw, "cancel_requested"),
                 ))
                 task_ids.append(task_id)
+                task_id_set.add(task_id)
             session.flush()
 
             restored_job_ids: set[UUID] = set()
+            restored_job_task_ids: dict[UUID, UUID] = {}
             for raw in collections["jobs"]:
                 if not isinstance(raw, dict):
                     raise ValueError("image queue backup contains an invalid job")
@@ -3486,6 +3836,10 @@ class ImageQueueRepository:
                 task_id = _uuid(raw.get("task_id"))
                 if job_id is None or task_id is None:
                     raise ValueError("image queue backup contains an invalid job id")
+                if task_id not in task_id_set:
+                    raise ValueError("image queue backup job references an unknown task")
+                if job_id in restored_job_ids:
+                    raise ValueError("image queue backup contains duplicate job ids")
                 created_at = _backup_datetime(raw.get("created_at"), now) or now
                 status = JobStatus(str(raw.get("status") or JobStatus.QUEUED.value))
                 stage = JobStage(str(raw.get("stage") or JobStage.QUEUED.value))
@@ -3497,11 +3851,16 @@ class ImageQueueRepository:
                     JobStage.SAVING,
                     JobStage.SUCCESS,
                 }
-                quota_consumed = bool(raw.get("quota_consumed", inferred_quota_consumed))
-                quota_accounted = bool(raw.get(
+                quota_consumed = _backup_bool(
+                    raw,
+                    "quota_consumed",
+                    default=inferred_quota_consumed,
+                )
+                quota_accounted = _backup_bool(
+                    raw,
                     "quota_accounted",
-                    quota_consumed and status in TERMINAL_JOB_STATUSES,
-                ))
+                    default=quota_consumed and status in TERMINAL_JOB_STATUSES,
+                )
                 session.add(ImageJob(
                     id=job_id,
                     task_id=task_id,
@@ -3516,13 +3875,13 @@ class ImageQueueRepository:
                     lease_version=max(0, int(raw.get("lease_version") or 0)),
                     account_id=_uuid(raw.get("account_id")),
                     conversation_id=str(raw.get("conversation_id") or "") or None,
-                    image_urls=list(raw.get("image_urls") or []),
-                    file_ids=list(raw.get("file_ids") or []),
-                    sediment_ids=list(raw.get("sediment_ids") or []),
+                    image_urls=_backup_string_list(raw, "image_urls"),
+                    file_ids=_backup_string_list(raw, "file_ids"),
+                    sediment_ids=_backup_string_list(raw, "sediment_ids"),
                     quota_consumed=quota_consumed,
                     quota_accounted=quota_accounted,
-                    result_payload=dict(raw.get("result_payload") or {}),
-                    stage_timings=dict(raw.get("stage_timings") or {}),
+                    result_payload=_backup_mapping(raw, "result_payload"),
+                    stage_timings=_backup_mapping(raw, "stage_timings"),
                     error_code=str(raw.get("error_code") or "") or None,
                     error_message=str(raw.get("error_message") or "") or None,
                     created_at=created_at,
@@ -3531,8 +3890,10 @@ class ImageQueueRepository:
                     completed_at=_backup_datetime(raw.get("completed_at")),
                 ))
                 restored_job_ids.add(job_id)
+                restored_job_task_ids[job_id] = task_id
             session.flush()
 
+            restored_artifact_ids: set[UUID] = set()
             for raw in collections["artifacts"]:
                 if not isinstance(raw, dict):
                     raise ValueError("image queue backup contains an invalid artifact")
@@ -3541,6 +3902,13 @@ class ImageQueueRepository:
                 job_id = _uuid(raw.get("job_id"))
                 if artifact_id is None or task_id is None:
                     raise ValueError("image queue backup contains an invalid artifact id")
+                if task_id not in task_id_set:
+                    raise ValueError("image queue backup artifact references an unknown task")
+                if artifact_id in restored_artifact_ids:
+                    raise ValueError("image queue backup contains duplicate artifact ids")
+                restored_artifact_ids.add(artifact_id)
+                if job_id is not None and restored_job_task_ids.get(job_id) != task_id:
+                    raise ValueError("image queue backup artifact has an inconsistent job/task relationship")
                 payload_blob: bytes | None = None
                 encoded_payload = raw.get("payload_blob_b64")
                 if encoded_payload not in (None, ""):
@@ -3568,7 +3936,7 @@ class ImageQueueRepository:
                     status=ArtifactStatus(str(raw.get("status") or ArtifactStatus.READY.value)).value,
                     storage_backend=str(raw.get("storage_backend") or "local"),
                     worker_id=str(raw.get("worker_id") or ""),
-                    relative_path=str(raw.get("relative_path") or ""),
+                    relative_path=_backup_relative_path(raw.get("relative_path")),
                     sha256=str(raw.get("sha256") or ""),
                     mime_type=str(raw.get("mime_type") or "image/png"),
                     byte_size=max(0, int(raw.get("byte_size") or 0)),
@@ -3583,24 +3951,34 @@ class ImageQueueRepository:
             for raw in collections["events"]:
                 if not isinstance(raw, dict) or (task_id := _uuid(raw.get("task_id"))) is None:
                     raise ValueError("image queue backup contains an invalid event")
+                if task_id not in task_id_set:
+                    raise ValueError("image queue backup event references an unknown task")
+                event_job_id = _uuid(raw.get("job_id"))
+                if event_job_id is not None and restored_job_task_ids.get(event_job_id) != task_id:
+                    raise ValueError("image queue backup event has an inconsistent job/task relationship")
                 session.add(ImageTaskEvent(
                     task_id=task_id,
-                    job_id=_uuid(raw.get("job_id")),
+                    job_id=event_job_id,
                     attempt=max(0, int(raw.get("attempt") or 0)),
                     event_type=str(raw.get("event_type") or "restored_event"),
                     from_status=str(raw.get("from_status") or "") or None,
                     to_status=str(raw.get("to_status") or "") or None,
-                    event_data=dict(raw.get("event_data") or {}),
+                    event_data=_backup_mapping(raw, "event_data"),
                     created_at=_backup_datetime(raw.get("created_at"), now) or now,
                 ))
 
+            # Account leases and worker heartbeats are runtime coordination
+            # state, not durable application state. Restoring them would
+            # resurrect expired leases or make a different process look alive.
+            # Jobs leased/running at backup time were normalized to queued above;
+            # the next worker heartbeat/claim cycle rebuilds fresh runtime state.
             for raw in collections["legacy_imports"]:
                 if not isinstance(raw, dict) or not str(raw.get("file_sha256") or ""):
-                    continue
+                    raise ValueError("image queue backup contains an invalid legacy import")
                 session.add(ImageLegacyImport(
                     file_sha256=str(raw["file_sha256"]),
                     source_path=str(raw.get("source_path") or "backup"),
-                    summary=dict(raw.get("summary") or {}),
+                    summary=_backup_mapping(raw, "summary"),
                     imported_at=_backup_datetime(raw.get("imported_at"), now) or now,
                 ))
             for task_id in task_ids:

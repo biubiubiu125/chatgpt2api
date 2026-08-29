@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import time
@@ -29,16 +30,18 @@ def _clean(value: object) -> str:
 
 
 def _normalize_bool(value: object, default: bool) -> bool:
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"1", "true", "yes", "on"}:
-            return True
-        if lowered in {"0", "false", "no", "off"}:
-            return False
-        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
     if value is None:
         return default
-    return bool(value)
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on", "enabled"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off", "disabled", "none", "null", ""}:
+        return False
+    return default
 
 
 def normalize_node_role(value: object) -> str:
@@ -133,8 +136,13 @@ def load_cluster_settings(
         not settings.worker_id
         or not settings.wireguard_ip
         or not settings.image_base_url
+        or not settings.cluster_id
     ):
-        raise ValueError("worker role requires CHATGPT2API_WORKER_ID, CHATGPT2API_WIREGUARD_IP and CHATGPT2API_IMAGE_BASE_URL")
+        raise ValueError(
+            "worker role requires CHATGPT2API_WORKER_ID, "
+            "CHATGPT2API_WIREGUARD_IP, CHATGPT2API_IMAGE_BASE_URL and "
+            "CHATGPT2API_CLUSTER_ID"
+        )
     if settings.is_worker and len(settings.worker_id) > WORKER_ID_MAX_LENGTH:
         raise ValueError(f"worker id must be {WORKER_ID_MAX_LENGTH} characters or fewer")
     return settings
@@ -192,6 +200,27 @@ def _marker_pairs(path: Path) -> dict[str, str]:
     return result
 
 
+def _promote_worker_join_marker(path: Path, payload: Mapping[str, object]) -> None:
+    updated = {str(key): str(value) for key, value in payload.items()}
+    updated["status"] = WORKER_JOIN_STATUS_JOINED
+    updated.pop("activation_expires_at", None)
+    updated.setdefault("joined_at", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            "\n".join(f"{key}={updated[key]}" for key in sorted(updated)) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _validate_worker_join_marker(
     settings: ClusterSettings | None = None,
     *,
@@ -224,6 +253,7 @@ def _validate_worker_join_marker(
             f"expected {resolved_settings.cluster_id}, got {marker_cluster_id or '-'}"
         )
     marker_status = _clean(payload.get("status")).lower()
+    activation_expired = False
     if marker_status == WORKER_JOIN_STATUS_ACTIVATING:
         if not allow_activating:
             raise RuntimeError("worker join marker is not finalized")
@@ -231,8 +261,7 @@ def _validate_worker_join_marker(
             activation_expires_at = _parse_unix_timestamp(payload.get("activation_expires_at"))
         except (TypeError, ValueError) as exc:
             raise RuntimeError("worker join marker activation expiry is missing") from exc
-        if activation_expires_at <= int(time.time()):
-            raise RuntimeError("worker join marker activation window expired")
+        activation_expired = activation_expires_at <= int(time.time())
     elif marker_status != WORKER_JOIN_STATUS_JOINED:
         raise RuntimeError("worker join marker is not finalized")
     app_database_url = _clean(os.getenv("APP_DATABASE_URL"))
@@ -261,10 +290,28 @@ def _validate_worker_join_marker(
                     cluster_id=resolved_settings.cluster_id,
                     marker_status=marker_status,
                 )
+            if joined is None and marker_status == WORKER_JOIN_STATUS_JOINED and join_token_digest:
+                joined = store.activate_worker_join_by_token_digest(
+                    token_digest=join_token_digest,
+                    worker_id=worker_id,
+                    wireguard_ip=wireguard_ip,
+                    cluster_id=resolved_settings.cluster_id,
+                )
+            if (
+                joined is not None
+                and marker_status == WORKER_JOIN_STATUS_ACTIVATING
+                and str(joined.get("status", "")).strip().lower() == WORKER_JOIN_STATUS_JOINED
+            ):
+                _promote_worker_join_marker(marker, payload)
+                marker_status = WORKER_JOIN_STATUS_JOINED
         except Exception as exc:
             raise RuntimeError("worker join status cannot be verified against app database") from exc
         if joined is None:
+            if marker_status == WORKER_JOIN_STATUS_ACTIVATING and activation_expired:
+                raise RuntimeError("worker join marker activation window expired")
             raise RuntimeError("worker join status is not active in app database")
+    elif activation_expired:
+        raise RuntimeError("worker join marker activation window expired")
     return marker, marker_status
 
 

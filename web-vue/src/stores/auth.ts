@@ -73,17 +73,12 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  // 检查登录状态
-  async function checkAuth() {
+  async function refreshAuth() {
     if (!getAuthToken()) {
       clearIdentity()
       lastCheckedAt.value = 0
       checkPromise = null
       return false
-    }
-    const now = Date.now()
-    if (now - lastCheckedAt.value < AUTH_CACHE_MS) {
-      return isLoggedIn.value
     }
     if (checkPromise) {
       return checkPromise
@@ -109,6 +104,21 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
+  // 检查登录状态
+  async function checkAuth() {
+    if (!getAuthToken()) {
+      clearIdentity()
+      lastCheckedAt.value = 0
+      checkPromise = null
+      return false
+    }
+    const now = Date.now()
+    if (now - lastCheckedAt.value < AUTH_CACHE_MS) {
+      return isLoggedIn.value
+    }
+    return refreshAuth()
+  }
+
   return {
     isLoggedIn,
     isLoading,
@@ -121,6 +131,7 @@ export const useAuthStore = defineStore('auth', () => {
     login,
     logout,
     checkAuth,
+    refreshAuth,
     clearIdentity,
   }
 })

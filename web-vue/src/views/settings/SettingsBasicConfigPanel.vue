@@ -14,12 +14,23 @@
         />
       </FormField>
 
+      <FormField label="API 公开地址">
+        <template #label-extra>
+          <HelpTip text="用于 API 文档和非本机回调链接的公开访问前缀。" />
+        </template>
+        <Input
+          v-model.trim="settings.base_url"
+          block
+          placeholder="https://api.example.com"
+        />
+      </FormField>
+
       <FormField label="图片访问地址">
         <template #label-extra>
           <HelpTip text="用于生成图片结果的访问前缀地址。" />
         </template>
         <Input
-          v-model.trim="settings.base_url"
+          v-model.trim="settings.image_base_url"
           block
           placeholder="https://example.com"
         />
@@ -106,6 +117,19 @@
         />
       </FormField>
 
+      <FormField label="文本流超时">
+        <template #label-extra>
+          <HelpTip text="单位秒，限制文本对话 SSE 流最长等待时间。" />
+        </template>
+        <Input
+          :model-value="textStreamTimeoutField.input.value"
+          type="number"
+          block
+          placeholder="300"
+          @update:model-value="textStreamTimeoutField.update"
+        />
+      </FormField>
+
       <FormField label="单账号图片并发">
         <template #label-extra>
           <HelpTip text="限制每个账号同时处理的图片请求数量。默认 1，可设置为 1–3。" />
@@ -136,6 +160,7 @@ defineProps<{
   logRetentionDaysField: NumberSettingField
   imagePollTimeoutField: NumberSettingField
   imageStreamTimeoutField: NumberSettingField
+  textStreamTimeoutField: NumberSettingField
   imageAccountConcurrencyField: NumberSettingField
   proxyBusy: string
   proxyTestResult: ProxyTestResult | null

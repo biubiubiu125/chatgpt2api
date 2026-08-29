@@ -419,9 +419,9 @@ class AccountService:
         if isinstance(value, (int, float)):
             return bool(value)
         raw = str(value or "").strip().lower()
-        if raw in {"1", "true", "yes", "y", "on"}:
+        if raw in {"1", "true", "yes", "y", "on", "enabled"}:
             return True
-        if raw in {"0", "false", "no", "n", "off", "none", "null", ""}:
+        if raw in {"0", "false", "no", "n", "off", "disabled", "none", "null", ""}:
             return False
         return default
 

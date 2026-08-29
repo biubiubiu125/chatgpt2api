@@ -40,6 +40,21 @@ def normalize_proxy_url(url: str) -> str:
     return candidate
 
 
+def _bool_value(value: object, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    raw = str(value).strip().lower()
+    if raw in {"1", "true", "yes", "y", "on", "enabled"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off", "disabled", "none", "null", ""}:
+        return False
+    return default
+
+
 @dataclass(frozen=True)
 class ProxyRuntimeProfile:
     proxy_url: str = ""
@@ -63,7 +78,7 @@ class ProxyRuntimeProfile:
     def clearance_enabled(self) -> bool:
         return (
             self.runtime_enabled
-            and bool(self.clearance.get("enabled"))
+            and _bool_value(self.clearance.get("enabled"), False)
             and self.clearance_mode in {"manual", "flaresolverr"}
         )
 
@@ -229,7 +244,7 @@ class ProxySettingsStore:
     ) -> ProxyRuntimeProfile:
         runtime = self._get_runtime_settings()
         clearance = dict(runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {})
-        runtime_enabled = bool(runtime.get("enabled"))
+        runtime_enabled = _bool_value(runtime.get("enabled"), False)
         egress_mode = str(runtime.get("egress_mode") or "direct").strip().lower()
 
         runtime_proxy = ""
@@ -592,7 +607,7 @@ class ProxySettingsStore:
         if not group_id:
             return ""
         for group in self._config_dict_list("account_groups"):
-            if _clean(group.get("id")) != group_id or group.get("enabled") is False:
+            if _clean(group.get("id")) != group_id or not _bool_value(group.get("enabled"), True):
                 continue
             proxy = _clean(group.get("proxy"))
             if proxy:
@@ -655,7 +670,7 @@ class ProxySettingsStore:
         if not normalized:
             return ""
         for profile in self._config_dict_list("proxy_profiles"):
-            if _clean(profile.get("id")) == normalized and profile.get("enabled", True):
+            if _clean(profile.get("id")) == normalized and _bool_value(profile.get("enabled"), True):
                 return _clean(profile.get("proxy"))
         return ""
 
@@ -669,12 +684,12 @@ class ProxySettingsStore:
         if not normalized:
             return ProxyGroupSelection()
         for group in self._config_dict_list("proxy_groups"):
-            if _clean(group.get("id")) != normalized or group.get("enabled") is False:
+            if _clean(group.get("id")) != normalized or not _bool_value(group.get("enabled"), True):
                 continue
             nodes = [
                 node for node in group.get("nodes", [])
                 if isinstance(node, dict)
-                and node.get("enabled", True)
+                and _bool_value(node.get("enabled"), True)
                 and _clean(node.get("url"))
             ]
             if not nodes:

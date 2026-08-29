@@ -10,6 +10,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.env_loader import load_env_file_into_environment
+
+load_env_file_into_environment(os.getenv("CHATGPT2API_ENV_FILE"))
+
 from services.config import config
 
 
@@ -21,12 +25,17 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
     return max(minimum, value)
 
 
+def _configured_port() -> int:
+    persisted_port = _env_int("CHATGPT2API_PORT", 3000)
+    return _env_int("PORT", persisted_port)
+
+
 def run() -> None:
     runtime = config.get_runtime_capacity_settings()
     uvicorn.run(
         "main:app",
         host=str(os.getenv("HOST") or "0.0.0.0"),
-        port=_env_int("PORT", 80),
+        port=_configured_port(),
         access_log=False,
         log_level=str(os.getenv("LOG_LEVEL") or "info"),
         workers=_env_int("UVICORN_WORKERS", int(runtime.get("uvicorn_workers") or 1)),
