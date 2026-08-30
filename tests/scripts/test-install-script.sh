@@ -958,10 +958,22 @@ test_interactive_prompt_echoes_default() {
   local prompt_value=''
   prompt_value="$(prompt_input "$(text prompt_thread_tokens)" '80')"
   [[ "${prompt_value}" == '80' ]] || fail 'interactive prompt did not return its default'
-  [[ "$(cat "${UI_OUT}")" == '后端线程池容量: 80（默认）' ]] \
+  [[ "$(cat "${UI_OUT}")" == '后端线程池容量: 80（默认值）' ]] \
     || fail 'interactive prompt did not echo the accepted default'
 }
 assert_command_passes 'interactive prompt echoes default' test_interactive_prompt_echoes_default
+
+test_interactive_prompt_does_not_echo_manual_answer() {
+  INSTALL_LANG='zh'
+  NONINTERACTIVE='0'
+  printf 'manual-secret\n' >"${UI_IN}"
+  : >"${UI_OUT}"
+  local prompt_value=''
+  prompt_value="$(prompt_input 'GIT_TOKEN' '')"
+  [[ "${prompt_value}" == 'manual-secret' ]] || fail 'interactive prompt did not return manual answer'
+  [[ "$(cat "${UI_OUT}")" == 'GIT_TOKEN: ' ]] || fail 'interactive prompt did not keep the prompt visible without echoing the answer'
+}
+assert_command_passes 'interactive prompt hides manual answers' test_interactive_prompt_does_not_echo_manual_answer
 
 test_docker_preflight_requires_daemon() {
   MODE='docker'
