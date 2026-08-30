@@ -444,12 +444,13 @@ class ResourceController:
 
             ceiling = max(1, int(ceiling))
             current_tokens = max(1, int(current_tokens))
+            thread_headroom = int(self.settings.absolute_guard) - int(snapshot.thread_count)
             safe_cap = max(
                 1,
                 min(
                     ceiling,
                     self.settings.absolute_guard,
-                    max(1, self.settings.absolute_guard - int(snapshot.thread_count)),
+                    max(1, current_tokens + thread_headroom),
                 ),
             )
             if (

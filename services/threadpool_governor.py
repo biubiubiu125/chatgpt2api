@@ -21,6 +21,7 @@ def run_threadpool_governor(
     limiter: Any,
     ceiling: int,
     poll_seconds: float = 5.0,
+    set_tokens: Callable[[int], None] | None = None,
     on_update: ThreadpoolUpdateCallback | None = None,
 ) -> None:
     ceiling = max(1, int(ceiling))
@@ -50,7 +51,10 @@ def run_threadpool_governor(
         if recommended != current_tokens:
             previous_tokens = current_tokens
             current_tokens = recommended
-            _set_limiter_tokens(limiter, current_tokens)
+            if set_tokens is not None:
+                set_tokens(current_tokens)
+            else:
+                _set_limiter_tokens(limiter, current_tokens)
             if on_update is not None:
                 on_update(
                     previous_tokens=previous_tokens,
@@ -59,7 +63,10 @@ def run_threadpool_governor(
                     ceiling=ceiling,
                 )
         elif int(getattr(limiter, "total_tokens", current_tokens) or current_tokens) != current_tokens:
-            _set_limiter_tokens(limiter, current_tokens)
+            if set_tokens is not None:
+                set_tokens(current_tokens)
+            else:
+                _set_limiter_tokens(limiter, current_tokens)
         if stop_event.wait(max(0.0, float(poll_seconds))):
             break
 
@@ -70,6 +77,7 @@ class ThreadPoolGovernor:
     limiter: Any
     ceiling: int
     poll_seconds: float = 5.0
+    set_tokens: Callable[[int], None] | None = None
     on_update: ThreadpoolUpdateCallback | None = None
     stop_event: Event = field(default_factory=Event)
     _thread: Thread | None = field(default=None, init=False, repr=False)
@@ -87,6 +95,7 @@ class ThreadPoolGovernor:
                 "limiter": self.limiter,
                 "ceiling": self.ceiling,
                 "poll_seconds": self.poll_seconds,
+                "set_tokens": self.set_tokens,
                 "on_update": self.on_update,
             },
         )

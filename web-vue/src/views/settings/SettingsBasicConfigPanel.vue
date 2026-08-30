@@ -130,6 +130,19 @@
         />
       </FormField>
 
+      <FormField label="后端线程池容量">
+        <template #label-extra>
+          <HelpTip text="文本请求入口的默认并发上限；启动时会作为资源联动的基准值。" />
+        </template>
+        <Input
+          :model-value="runtimeCapacityThreadTokensField.input.value"
+          type="number"
+          block
+          placeholder="80"
+          @update:model-value="runtimeCapacityThreadTokensField.update"
+        />
+      </FormField>
+
       <FormField label="单账号图片并发">
         <template #label-extra>
           <HelpTip text="限制每个账号同时处理的图片请求数量。默认 1，可设置为 1–3。" />
@@ -161,6 +174,7 @@ defineProps<{
   imagePollTimeoutField: NumberSettingField
   imageStreamTimeoutField: NumberSettingField
   textStreamTimeoutField: NumberSettingField
+  runtimeCapacityThreadTokensField: NumberSettingField
   imageAccountConcurrencyField: NumberSettingField
   proxyBusy: string
   proxyTestResult: ProxyTestResult | null

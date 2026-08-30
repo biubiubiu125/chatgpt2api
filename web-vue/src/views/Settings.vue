@@ -35,6 +35,7 @@
               :image-poll-timeout-field="imagePollTimeoutField"
               :image-stream-timeout-field="imageStreamTimeoutField"
               :text-stream-timeout-field="textStreamTimeoutField"
+              :runtime-capacity-thread-tokens-field="runtimeCapacityThreadTokensField"
               :image-account-concurrency-field="imageAccountConcurrencyField"
               :proxy-busy="proxyBusy"
               :proxy-test-result="proxyTestResult"
@@ -490,6 +491,14 @@ const textStreamTimeoutField = useNumberSettingField(
     localSettings.value.text_stream_timeout_secs = value
   },
   { integer: true, min: 1, fallback: 300 },
+)
+const runtimeCapacityThreadTokensField = useNumberSettingField(
+  () => localSettings.value?.runtime_capacity?.text_concurrency_limit ?? 80,
+  (value) => {
+    if (!localSettings.value) return
+    localSettings.value.runtime_capacity.text_concurrency_limit = value
+  },
+  { integer: true, min: 1, fallback: 80 },
 )
 const imageAccountConcurrencyField = useNumberSettingField(
   () => localSettings.value?.image_account_concurrency ?? 1,

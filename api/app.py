@@ -3,7 +3,9 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import os
 from threading import Event, Thread
+from typing import Callable
 
+from anyio.from_thread import BlockingPortal
 from anyio.to_thread import current_default_thread_limiter
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +28,7 @@ from services.editable_file_task_service import editable_file_task_service
 from services.dashboard_metrics_service import dashboard_metrics_service
 from services.image_service import start_image_cleanup_scheduler
 from services.image_queue.database import ImageQueueUnavailableError
+from services.image_queue.resource_controller import ResourceController
 from services.image_queue.settings import ImageQueueConfigurationError
 from services.image_task_service import image_task_service
 from services.log_service import cleanup_old_logs, start_log_cleanup_scheduler
@@ -91,6 +94,7 @@ def _build_threadpool_governor(
     resource_controller,
     limiter,
     ceiling: int,
+    set_tokens: Callable[[int], None] | None = None,
 ) -> ThreadPoolGovernor:
     def on_update(*, previous_tokens: int, tokens: int, snapshot, ceiling: int) -> None:
         realtime_monitor_service.set_threadpool(tokens=tokens, previous_tokens=previous_tokens)
@@ -106,7 +110,20 @@ def _build_threadpool_governor(
         resource_controller=resource_controller,
         limiter=limiter,
         ceiling=ceiling,
+        set_tokens=set_tokens,
         on_update=on_update,
+    )
+
+
+def _resolve_threadpool_resource_controller(resource_controller=None):
+    if resource_controller is not None:
+        return resource_controller
+    settings = getattr(image_task_service, "settings", None)
+    if settings is None:
+        return None
+    return ResourceController(
+        settings,
+        database=getattr(image_task_service, "database", None),
     )
 
 
@@ -190,6 +207,39 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI):
         threadpool_ceiling = _configure_threadpool() or _resolve_threadpool_ceiling()
         thread_limiter = current_default_thread_limiter()
+        async with BlockingPortal() as limiter_portal:
+            def set_threadpool_tokens(tokens: int) -> None:
+                try:
+                    limiter_portal.call(_set_threadpool_tokens, thread_limiter, tokens)
+                except RuntimeError as exc:
+                    logger.warning({
+                        "event": "runtime_threadpool_apply_failed",
+                        "error": str(exc),
+                    })
+
+            async with _run_lifespan_services(
+                cluster_settings=cluster_settings,
+                threadpool_ceiling=threadpool_ceiling,
+                thread_limiter=thread_limiter,
+                set_threadpool_tokens=set_threadpool_tokens,
+            ):
+                yield
+
+    return _build_app(app_version, cluster_settings, lifespan)
+
+
+def _set_threadpool_tokens(limiter, tokens: int) -> None:
+    limiter.total_tokens = int(tokens)
+
+
+@asynccontextmanager
+async def _run_lifespan_services(
+    *,
+    cluster_settings,
+    threadpool_ceiling: int,
+    thread_limiter,
+    set_threadpool_tokens: Callable[[int], None] | None = None,
+):
         stop_event = Event()
         retry_thread: Thread | None = None
         register_scheduler_thread: Thread | None = None
@@ -202,13 +252,21 @@ def create_app() -> FastAPI:
 
         def start_threadpool_governor(resource_controller) -> None:
             nonlocal threadpool_governor
-            if resource_controller is None or threadpool_governor is not None:
+            controller = _resolve_threadpool_resource_controller(resource_controller)
+            if controller is None:
                 return
+            if threadpool_governor is not None:
+                if resource_controller is not None and threadpool_governor.resource_controller is not controller:
+                    threadpool_governor.stop(timeout=5)
+                    threadpool_governor = None
+                else:
+                    return
             try:
                 threadpool_governor = _build_threadpool_governor(
-                    resource_controller=resource_controller,
+                    resource_controller=controller,
                     limiter=thread_limiter,
                     ceiling=threadpool_ceiling,
+                    set_tokens=set_threadpool_tokens,
                 )
                 threadpool_governor.start()
             except Exception as exc:
@@ -272,6 +330,7 @@ def create_app() -> FastAPI:
                 on_recovered=start_register_scheduler_once,
                 on_resource_controller=start_threadpool_governor,
             )
+            start_threadpool_governor(None)
         if run_main_services:
             account_service.cleanup_auto_remove_accounts()
             account_watcher_thread = start_limited_account_watcher(stop_event)
@@ -313,6 +372,8 @@ def create_app() -> FastAPI:
                     logger.error({"event": "dashboard_metrics_shutdown_flush_failed", "error": str(exc)})
                 backup_service.stop()
 
+
+def _build_app(app_version: str, cluster_settings, lifespan) -> FastAPI:
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)
     app.add_middleware(
