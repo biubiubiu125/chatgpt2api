@@ -433,7 +433,7 @@ prompt_input() {
     used_default="1"
   fi
   if [[ "${used_default}" == "1" && -n "${default}" ]]; then
-    ui_println "${label}: ${answer}（默认）"
+    ui_println "${label}: ${answer}（默认值）"
   fi
   printf '%s' "${answer}"
 }
