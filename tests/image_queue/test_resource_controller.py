@@ -156,7 +156,14 @@ def test_recommend_thread_tokens_recovers_by_one_when_healthy() -> None:
 
 
 def test_recommend_thread_tokens_does_not_double_count_current_threadpool_threads() -> None:
-    controller = ResourceController(ImageQueueSettings(database_url="postgresql://test"))
+    controller = ResourceController(
+        ImageQueueSettings(
+            database_url="postgresql://test",
+            absolute_guard=128,
+            generation_concurrency_limit=128,
+            generation_concurrency_hard_cap=128,
+        )
+    )
     healthy = snapshot(
         cpu_percent=20,
         available_memory_bytes=8 * 1024**3,
