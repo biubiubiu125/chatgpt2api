@@ -149,7 +149,7 @@ GRANT USAGE, CREATE ON SCHEMA public TO chatgpt2api_runtime;
 服务器需要有 `bash`、`curl`、Docker 和 Docker Compose v2：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b77abfcfc210814a4ed125b8a3cb8b0/deploy/install.sh -o /tmp/chatgpt2api-install.sh
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh -o /tmp/chatgpt2api-install.sh
 sudo bash /tmp/chatgpt2api-install.sh
 ```
 
@@ -182,7 +182,7 @@ PostgreSQL DATABASE_URL: postgresql+psycopg2://.../chatgpt2api_app
 需要准备管理员密钥、账号库 PostgreSQL 地址和图片队列 PostgreSQL 地址：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b77abfcfc210814a4ed125b8a3cb8b0/deploy/install.sh -o /tmp/chatgpt2api-install.sh
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh -o /tmp/chatgpt2api-install.sh
   sudo env NONINTERACTIVE=1 MODE=docker INSTALL_DIR=/opt/chatgpt2api PORT=3000 \
   CHATGPT2API_INSTALL_TARGET=standalone \
   CHATGPT2API_AUTH_KEY='replace-with-a-manual-admin-key' \
@@ -207,7 +207,7 @@ curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b
 启用 WARP / Privoxy / FlareSolverr：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b77abfcfc210814a4ed125b8a3cb8b0/deploy/install.sh -o /tmp/chatgpt2api-install.sh
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh -o /tmp/chatgpt2api-install.sh
   sudo env NONINTERACTIVE=1 MODE=docker WITH_WARP=1 INSTALL_DIR=/opt/chatgpt2api \
   CHATGPT2API_INSTALL_TARGET=standalone \
   CHATGPT2API_AUTH_KEY='replace-with-a-manual-admin-key' \
@@ -325,7 +325,7 @@ docker compose -f docker-compose.local.yml up -d --build
 主节点准备：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b77abfcfc210814a4ed125b8a3cb8b0/deploy/install.sh -o /tmp/chatgpt2api-install.sh
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh -o /tmp/chatgpt2api-install.sh
 sudo env WIREGUARD_SERVER_ENDPOINT=主节点公网IP或域名 \
   CHATGPT2API_AUTH_KEY='replace-with-a-manual-admin-key' \
   POSTGRES_PASSWORD='主节点数据库密码' \
@@ -345,7 +345,7 @@ sudo bash /tmp/chatgpt2api-install.sh status
 把这两个文件安全复制到 Worker 主机的 `/opt/chatgpt2api/join/`。Worker 主机准备：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b77abfcfc210814a4ed125b8a3cb8b0/deploy/install.sh -o /tmp/chatgpt2api-install.sh
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh -o /tmp/chatgpt2api-install.sh
 sudo mkdir -p /opt/chatgpt2api/join
 # 将主节点生成的 worker-1.join 和 join-signing.pub 复制到上面的目录
 sudo env CHATGPT2API_IMAGE_BASE_URL=https://img-1.example.com/images \
@@ -665,7 +665,7 @@ register_offpeak:
 | :--- | :--- | :--- |
 | `CHATGPT2API_AUTH_KEY` | 无 | 管理员主密钥；也可在 `config.json` 使用 `auth-key`。 |
 | `CHATGPT2API_PORT` | `3000` | Docker Compose 宿主机端口，默认只绑定 `127.0.0.1`。 |
-| `CHATGPT2API_RELEASE_REF` | `d887be015b77abfcfc210814a4ed125b8a3cb8b0` | 一键安装使用的固定 Release 提交；Docker 模式必须是 40 位 SHA，Python 模式可使用版本标签。 |
+| `CHATGPT2API_RELEASE_REF` | `baa6567484c5a86c2e572b07d7d68cf854a0ab07` | 一键安装使用的固定 Release 提交；Docker 模式必须是 40 位 SHA，Python 模式可使用版本标签。 |
 | `CHATGPT2API_IMAGE` | `ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a` | Compose 使用的镜像。 |
 | `CHATGPT2API_IMAGE_DIGEST` | 无 | 仅传入 digest 时自动拼成 `ghcr.io/...@sha256:...`。 |
 | `CHATGPT2API_WARP_IMAGE` | `caomingjun/warp@sha256:da12ba946c7e44665ef25de1fc7d22ef432a9fa8b71fa32dc7790e1b5f27cd7f` | WARP 出口镜像；启用 WARP 时默认使用固定 digest。 |

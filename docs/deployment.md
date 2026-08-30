@@ -60,7 +60,7 @@ deploy/install.sh
 ### 交互式安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b77abfcfc210814a4ed125b8a3cb8b0/deploy/install.sh -o /tmp/chatgpt2api-install.sh
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh -o /tmp/chatgpt2api-install.sh
 sudo bash /tmp/chatgpt2api-install.sh
 ```
 
@@ -78,7 +78,7 @@ sudo bash /tmp/chatgpt2api-install.sh
 适合自动化部署。将下面的管理员密钥和两个 PostgreSQL 地址替换成真实值：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b77abfcfc210814a4ed125b8a3cb8b0/deploy/install.sh -o /tmp/chatgpt2api-install.sh
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh -o /tmp/chatgpt2api-install.sh
   sudo env NONINTERACTIVE=1 MODE=docker INSTALL_DIR=/opt/chatgpt2api PORT=3000 \
   CHATGPT2API_INSTALL_TARGET=standalone \
   CHATGPT2API_AUTH_KEY='replace-with-a-manual-admin-key' \
@@ -93,7 +93,7 @@ curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b
 启用 WARP / Privoxy / FlareSolverr：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b77abfcfc210814a4ed125b8a3cb8b0/deploy/install.sh -o /tmp/chatgpt2api-install.sh
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh -o /tmp/chatgpt2api-install.sh
   sudo env NONINTERACTIVE=1 MODE=docker WITH_WARP=1 INSTALL_DIR=/opt/chatgpt2api \
   CHATGPT2API_INSTALL_TARGET=standalone \
   CHATGPT2API_AUTH_KEY='replace-with-a-manual-admin-key' \
@@ -217,7 +217,7 @@ docker compose -f docker-compose.local.yml ps
 主节点需要公网 UDP `51820`，WireGuard 私网地址固定为 `10.77.0.1`：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b77abfcfc210814a4ed125b8a3cb8b0/deploy/install.sh -o /tmp/chatgpt2api-install.sh
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh -o /tmp/chatgpt2api-install.sh
 sudo env WIREGUARD_SERVER_ENDPOINT=主节点公网IP或域名 \
   CHATGPT2API_AUTH_KEY='replace-with-a-manual-admin-key' \
   POSTGRES_PASSWORD='主节点数据库密码' \
@@ -241,7 +241,7 @@ sudo bash /tmp/chatgpt2api-install.sh status
 Worker 编号 `1` 对应 WireGuard 地址 `10.77.0.11`。运行后脚本会自动生成公开图片配置，并在激活后用 `worker-check` 验收公开 URL：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b77abfcfc210814a4ed125b8a3cb8b0/deploy/install.sh -o /tmp/chatgpt2api-install.sh
+curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh -o /tmp/chatgpt2api-install.sh
 sudo mkdir -p /opt/chatgpt2api/join
 # 将主节点生成的 worker-1.join 和 join-signing.pub 复制到上面的目录
 sudo env CHATGPT2API_IMAGE_BASE_URL=https://img-1.example.com/images \

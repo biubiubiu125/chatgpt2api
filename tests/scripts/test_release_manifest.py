@@ -7,7 +7,7 @@ import pytest
 from scripts.validate_release_manifest import ManifestError, load_manifest, validate_manifest
 
 
-RELEASE_REF = "d887be015b77abfcfc210814a4ed125b8a3cb8b0"
+RELEASE_REF = "baa6567484c5a86c2e572b07d7d68cf854a0ab07"
 IMAGE = "ghcr.io/example/chatgpt2api@sha256:" + "a" * 64
 WARP_IMAGE = "caomingjun/warp@sha256:" + "b" * 64
 PRIVOXY_IMAGE = "vimagick/privoxy@sha256:" + "c" * 64

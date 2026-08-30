@@ -735,10 +735,14 @@ if grep -En '^FROM .*((node|python):|python:[^@[:space:]]|node:[^@[:space:]])' \
   fail 'mutable Dockerfile base image tag remains'
 fi
 
-if grep -En 'main/deploy/install\.sh|ghcr\.io/biubiubiu125/chatgpt2api:latest|caomingjun/warp:latest|vimagick/privoxy:latest|flaresolverr/flaresolverr:latest' \
+if grep -En 'ghcr\.io/biubiubiu125/chatgpt2api:latest|caomingjun/warp:latest|vimagick/privoxy:latest|flaresolverr/flaresolverr:latest|CHATGPT2API_RELEASE_REF=(main|master|latest)' \
   "${ROOT_DIR}/README.md" "${ROOT_DIR}/docs/deployment.md" "${ROOT_DIR}/.env.example" >/dev/null; then
-  fail 'deployment documentation still points at mutable release'
+  fail 'deployment documentation still points at a mutable runtime release'
 fi
+grep -Fq 'https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh' "${ROOT_DIR}/README.md" \
+  || fail 'README does not fetch the current installer entrypoint'
+grep -Fq 'https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh' "${ROOT_DIR}/docs/deployment.md" \
+  || fail 'deployment guide does not fetch the current installer entrypoint'
 
 if grep -En 'uses:.*@(v[0-9]+|main|master|latest)([[:space:]]|$)' \
   "${ROOT_DIR}/.github/workflows"/*.yml >/dev/null; then
@@ -1252,7 +1256,7 @@ CLUSTER_ID=cluster-1
 JOIN_NONCE=nonce
 EXPIRES_AT=9999999999
 SIGNING_PUBLIC_KEY_B64=public-key
-CHATGPT2API_RELEASE_REF=d887be015b77abfcfc210814a4ed125b8a3cb8b0
+CHATGPT2API_RELEASE_REF=baa6567484c5a86c2e572b07d7d68cf854a0ab07
 CHATGPT2API_IMAGE=ghcr.io/biubiubiu125/chatgpt2api@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 CHATGPT2API_IMAGE_DIGEST=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 UV_VERSION=0.8.17

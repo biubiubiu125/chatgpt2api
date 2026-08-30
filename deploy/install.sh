@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_OWNER="${REPO_OWNER:-biubiubiu125}"
 REPO_NAME="${REPO_NAME:-chatgpt2api}"
-DEFAULT_RELEASE_REF="d887be015b77abfcfc210814a4ed125b8a3cb8b0"
+DEFAULT_RELEASE_REF="baa6567484c5a86c2e572b07d7d68cf854a0ab07"
 DEFAULT_CHATGPT2API_IMAGE_DIGEST="sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a"
 DEFAULT_CHATGPT2API_WARP_IMAGE="caomingjun/warp@sha256:da12ba946c7e44665ef25de1fc7d22ef432a9fa8b71fa32dc7790e1b5f27cd7f"
 DEFAULT_CHATGPT2API_PRIVOXY_IMAGE="vimagick/privoxy@sha256:8db03d3e5a36800e2c7e32f17b47e21e18f476bf492f0a50e2fc43073f6bb21f"
@@ -160,7 +160,7 @@ usage() {
   bash deploy/install.sh rotate-worker 2
   bash deploy/install.sh status
   bash deploy/install.sh worker-check
-  curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/d887be015b77abfcfc210814a4ed125b8a3cb8b0/deploy/install.sh -o /tmp/chatgpt2api-install.sh
+  curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh -o /tmp/chatgpt2api-install.sh
   sudo bash /tmp/chatgpt2api-install.sh
 EOF
 
@@ -202,7 +202,7 @@ EOF
   POSTGRES_ADMIN_USER=chatgpt2api_admin
   POSTGRES_ADMIN_PASSWORD=main-node-only-admin-password
   INSTALL_LANG=zh|en
-  CHATGPT2API_RELEASE_REF=d887be015b77abfcfc210814a4ed125b8a3cb8b0
+  CHATGPT2API_RELEASE_REF=baa6567484c5a86c2e572b07d7d68cf854a0ab07
   CHATGPT2API_IMAGE=ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a
   CHATGPT2API_IMAGE_DIGEST=sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a
   CHATGPT2API_WARP_IMAGE=caomingjun/warp@sha256:da12ba946c7e44665ef25de1fc7d22ef432a9fa8b71fa32dc7790e1b5f27cd7f
@@ -222,7 +222,7 @@ EOF
   --thread-tokens 80
   --base-url https://api.example.com
   --install-dir /opt/chatgpt2api
-  --branch d887be015b77abfcfc210814a4ed125b8a3cb8b0
+  --branch baa6567484c5a86c2e572b07d7d68cf854a0ab07
   --auth-key your-auth-key
   --install-target standalone|api-main|worker
   --create-first-worker
