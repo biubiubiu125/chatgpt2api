@@ -962,7 +962,7 @@ test_interactive_prompt_echoes_default() {
   local prompt_value=''
   prompt_value="$(prompt_input "$(text prompt_thread_tokens)" '80')"
   [[ "${prompt_value}" == '80' ]] || fail 'interactive prompt did not return its default'
-  [[ "$(cat "${UI_OUT}")" == '后端线程池容量: 80（默认值）' ]] \
+  [[ "$(cat "${UI_OUT}")" == '后端线程池容量: 80（默认值：80）' ]] \
     || fail 'interactive prompt did not echo the accepted default'
 }
 assert_command_passes 'interactive prompt echoes default' test_interactive_prompt_echoes_default
@@ -1326,6 +1326,11 @@ test_install_summary_contains_credentials() {
 }
 
 assert_command_passes 'install summary contains credentials' test_install_summary_contains_credentials
+
+grep -Fq 'ui_println "${label}: ${answer}（默认值：${default}）"' "${INSTALL_SCRIPT}" \
+  || fail 'installer prompt default echo does not include the actual default value'
+grep -Fq '图片查看 URL（API/图片公网地址，建议包含 /images）' "${INSTALL_SCRIPT}" \
+  || fail 'installer public image URL prompt label was not updated'
 
 grep -Fq 'STORAGE_BACKEND="${STORAGE_BACKEND:-postgres}"' "${INSTALL_SCRIPT}" \
   || fail 'installer default storage backend is not PostgreSQL'

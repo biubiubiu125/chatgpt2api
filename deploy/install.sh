@@ -433,7 +433,7 @@ prompt_input() {
     used_default="1"
   fi
   if [[ "${used_default}" == "1" && -n "${default}" ]]; then
-    ui_println "${label}: ${answer}（默认值）"
+    ui_println "${label}: ${answer}（默认值：${default}）"
   fi
   printf '%s' "${answer}"
 }
@@ -4058,7 +4058,7 @@ cluster_main_cmd() {
   STORAGE_BACKEND="postgres"
   ensure_admin_auth_key || exit 1
   if ! is_noninteractive; then
-    BASE_URL="$(prompt_input "API 后台域名" "${BASE_URL}")"
+    BASE_URL="$(prompt_input "图片查看 URL（API/图片公网地址，建议包含 /images）" "${BASE_URL}")"
     PORT="$(prompt_input "$(text prompt_port)" "${PORT}")"
     if [[ -z "${POSTGRES_PASSWORD}" ]]; then
       POSTGRES_PASSWORD="$(prompt_input "PostgreSQL 密码" "")"
@@ -5019,7 +5019,7 @@ main() {
       MODE="$(normalize_mode_choice "${MODE}")" || { echo "[$(text prefix_error)] $(text err_mode)" >&2; exit 1; }
     fi
     ensure_admin_auth_key || exit 1
-    BASE_URL="$(prompt_input "CHATGPT2API_BASE_URL（API/图片公网地址）" "${BASE_URL}")"
+    BASE_URL="$(prompt_input "图片查看 URL（API/图片公网地址，建议包含 /images）" "${BASE_URL}")"
     PORT="$(prompt_input "$(text prompt_port)" "${PORT}")"
     THREAD_TOKENS="$(prompt_input "$(text prompt_thread_tokens)" "${THREAD_TOKENS}")"
     while [[ "${STORAGE_BACKEND}" == "postgres" && -z "${DATABASE_URL}" ]]; do
