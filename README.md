@@ -576,7 +576,8 @@ IMAGE_QUEUE_DATABASE_URL=postgresql+psycopg2://user:password@host:5432/chatgpt2a
 7. 更新 job、task、日志、配额和事件；客户端断开不会让成功结果丢失。
 
 运行约束：
-- `IMAGE_QUEUE_GENERATION_CONCURRENCY` 是显式生成并发上限，未设置时默认取运行时图片并发和 `IMAGE_QUEUE_GENERATION_CONCURRENCY_CAP` 的较小值；默认上限为 `64`。资源控制器会按 CPU、内存、Swap、数据库连接池和磁盘压力动态降速或暂停。
+- `IMAGE_QUEUE_GENERATION_CONCURRENCY` 是显式生成并发上限，未设置时按 CPU / 内存 / 运行时容量提示自动推算，最终不超过 `IMAGE_QUEUE_GENERATION_CONCURRENCY_CAP`；外层硬上限默认 `99999`。资源控制器会按 CPU、内存、Swap、数据库连接池和磁盘压力动态降速或暂停。
+- `IMAGE_QUEUE_ABSOLUTE_GUARD` 未设置时也会按同一组机器资源自动推算，用来限制队列总线程上限。
 - 外部图片模型使用 `gpt-image-2`，`n` 当前限制为 `1-4`。
 - PostgreSQL 暂不可用时，图片接口返回 `503 image_queue_unavailable`；文本接口仍可工作，应用会按 `IMAGE_QUEUE_STARTUP_RETRY_SECONDS` 自动重试连接。
 - 队列默认最多等待 `50` 个任务，单个未开始任务默认最多等待 `1800` 秒。
@@ -682,7 +683,9 @@ register_offpeak:
 | `CHATGPT2API_IMAGE_BASE_URL` | 无 | Worker 对外返回的图片基础 URL。 |
 | `CHATGPT2API_CLUSTER_ID` | 脚本自动生成 | 集群 ID，主节点和 Worker 必须一致。 |
 | `CHATGPT2API_WORKER_JOINED_MARKER_FILE` | `/app/data/worker.joined` | Worker join token 消费和激活标记。 |
-| `IMAGE_QUEUE_GENERATION_CONCURRENCY` | 自动计算，默认不超过 `64` | 图片生成 Worker 显式并发上限，最终不超过 `IMAGE_QUEUE_GENERATION_CONCURRENCY_CAP`。 |
+| `IMAGE_QUEUE_GENERATION_CONCURRENCY` | 自动计算 | 图片生成 Worker 显式并发上限，按 CPU / 内存 / 运行时容量自动推算，最终不超过 `IMAGE_QUEUE_GENERATION_CONCURRENCY_CAP`。 |
+| `IMAGE_QUEUE_GENERATION_CONCURRENCY_CAP` | `99999` | 图片生成 Worker 的外层硬上限，只做兜底。 |
+| `IMAGE_QUEUE_ABSOLUTE_GUARD` | 自动计算 | 图片队列总线程安全线，未设置时按 CPU / 内存自动推算。 |
 | `IMAGE_QUEUE_DATABASE_URL` | 无 | GPT-Image-2 持久队列 PostgreSQL；标准/WARP Compose 缺失时拒绝启动。 |
 | `IMAGE_QUEUE_ARTIFACT_ROOT` | `data/images` | 队列图片 artifact 根目录；容器中为 `/app/data/images`。 |
 | `IMAGE_QUEUE_MAX_BACKLOG` | `50` | 持久队列最多允许等待的未开始任务数。 |

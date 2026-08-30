@@ -155,6 +155,18 @@ def test_recommend_thread_tokens_recovers_by_one_when_healthy() -> None:
     assert controller.recommend_thread_tokens(healthy, ceiling=80, current_tokens=40) == 41
 
 
+def test_recommend_thread_tokens_does_not_double_count_current_threadpool_threads() -> None:
+    controller = ResourceController(ImageQueueSettings(database_url="postgresql://test"))
+    healthy = snapshot(
+        cpu_percent=20,
+        available_memory_bytes=8 * 1024**3,
+        memory_limit_bytes=16 * 1024**3,
+        thread_count=100,
+    )
+
+    assert controller.recommend_thread_tokens(healthy, ceiling=80, current_tokens=80) == 80
+
+
 def test_registration_pressure_check_does_not_mutate_generation_limit() -> None:
     controller = ResourceController(ImageQueueSettings(database_url="postgresql://test"))
     controller._adaptive_limit = 7

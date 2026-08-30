@@ -72,3 +72,42 @@ def test_run_threadpool_governor_updates_limiter_and_monitor() -> None:
     assert not thread.is_alive()
     assert limiter.total_tokens == 40
     assert updates == [(80, 40)]
+
+
+def test_run_threadpool_governor_uses_token_setter_when_provided() -> None:
+    stop_event = Event()
+    limiter = SimpleNamespace(total_tokens=80)
+    applied: list[int] = []
+    controller = ResourceController(ImageQueueSettings(database_url="postgresql://test"))
+
+    def sample() -> ResourceSnapshot:
+        return snapshot(cpu_percent=96)
+
+    def recommend(sampled: ResourceSnapshot, *, ceiling: int, current_tokens: int) -> int:
+        return 40
+
+    def on_update(**kwargs: object) -> None:
+        stop_event.set()
+
+    controller.sample = sample  # type: ignore[assignment]
+    controller.recommend_thread_tokens = recommend  # type: ignore[assignment]
+
+    thread = Thread(
+        target=run_threadpool_governor,
+        kwargs={
+            "stop_event": stop_event,
+            "resource_controller": controller,
+            "limiter": limiter,
+            "ceiling": 80,
+            "poll_seconds": 0,
+            "set_tokens": applied.append,
+            "on_update": on_update,
+        },
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert applied == [40]
+    assert limiter.total_tokens == 80

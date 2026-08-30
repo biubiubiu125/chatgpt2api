@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import asdict
 from datetime import datetime, timezone
+import math
 import os
 from threading import Event, RLock, Thread
 import time
@@ -56,8 +57,12 @@ class ImageWorkerManager:
         self.terminal_cleanup_callback = terminal_cleanup_callback
         cpu_limit = getattr(self.resource_controller, "cpu_limit_cores", lambda: None)()
         try:
-            cpu = max(1, int(float(cpu_limit))) if cpu_limit is not None else max(1, int(os.cpu_count() or 1))
-        except (TypeError, ValueError):
+            cpu = (
+                max(1, int(math.ceil(float(cpu_limit))))
+                if cpu_limit is not None
+                else max(1, int(os.cpu_count() or 1))
+            )
+        except (OverflowError, TypeError, ValueError):
             cpu = max(1, int(os.cpu_count() or 1))
         # Reserve non-generation floors first. absolute_guard is a hard ceiling, not a fill target.
         floors = {

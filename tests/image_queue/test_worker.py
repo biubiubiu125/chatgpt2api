@@ -214,6 +214,33 @@ def test_generation_pool_can_scale_above_legacy_fixed_cap(repository) -> None:
     manager.stop(2)
 
 
+def test_worker_pool_cpu_quota_uses_same_ceiling_as_settings(repository) -> None:
+    class FractionalCpuResources(AlwaysAllowedResources):
+        @staticmethod
+        def cpu_limit_cores():
+            return 8.5
+
+    settings = ImageQueueSettings(
+        database_url="sqlite://",
+        absolute_guard=256,
+        generation_concurrency_limit=16,
+        generation_concurrency_hard_cap=16,
+    )
+    manager = ImageWorkerManager(
+        repository,
+        FakeAccounts(),
+        lambda claim, token: None,
+        settings,
+        resource_controller=FractionalCpuResources(),
+    )
+
+    assert manager.pool_limits["recovery"] == 18
+    assert manager.pool_limits["io"] == 18
+    assert manager.pool_limits["upscale"] == 9
+    assert manager.pool_limits["register"] == 4
+    manager.stop(2)
+
+
 def test_auth_failure_retries_with_a_different_healthy_account(
     repository,
     generation_request,

@@ -560,6 +560,68 @@ def test_application_lifespan_starts_resource_linked_threadpool_governor(monkeyp
     assert "governor_stop" in order
 
 
+def test_application_lifespan_starts_threadpool_governor_without_image_worker(monkeypatch, tmp_path) -> None:
+    order: list[str] = []
+    captured: dict[str, object] = {}
+    cluster_settings = SimpleNamespace(
+        is_worker=False,
+        run_worker=False,
+        run_api=True,
+        node_role="api-main",
+        worker_id="",
+        wireguard_ip="",
+        image_base_url="",
+    )
+
+    class FakeGovernor:
+        def start(self):
+            order.append("governor_start")
+
+        def stop(self, timeout=None):
+            order.append("governor_stop")
+
+    monkeypatch.setattr(app_module, "load_cluster_settings", lambda **kwargs: cluster_settings)
+    monkeypatch.setattr(app_module, "_configure_threadpool", lambda: 80)
+    monkeypatch.setattr(app_module, "_build_threadpool_governor", lambda **kwargs: captured.update(kwargs) or FakeGovernor())
+    monkeypatch.setattr(app_module.account_service, "cleanup_auto_remove_accounts", lambda: None)
+    monkeypatch.setattr(app_module, "start_limited_account_watcher", lambda event: SimpleNamespace(join=lambda timeout=None: None))
+    monkeypatch.setattr(app_module, "start_image_cleanup_scheduler", lambda event: SimpleNamespace(join=lambda timeout=None: None))
+    monkeypatch.setattr(app_module, "start_log_cleanup_scheduler", lambda event: SimpleNamespace(join=lambda timeout=None: None))
+    monkeypatch.setattr(app_module.backup_service, "start", lambda: None)
+    monkeypatch.setattr(app_module.backup_service, "stop", lambda: None)
+    monkeypatch.setattr(app_module.config, "cleanup_old_images", lambda: None)
+    monkeypatch.setattr(app_module, "cleanup_old_logs", lambda: None)
+    monkeypatch.setattr(app_module.dashboard_metrics_service, "flush", lambda: None)
+    monkeypatch.setattr(app_module.editable_file_task_service, "start", lambda: None)
+    monkeypatch.setattr(app_module.editable_file_task_service, "stop", lambda timeout=None: None)
+    monkeypatch.setattr(
+        app_module,
+        "image_task_service",
+        SimpleNamespace(
+            start=lambda: None,
+            stop=lambda timeout=None: None,
+            settings=SimpleNamespace(artifact_root=tmp_path / "images", absolute_guard=128),
+            database=SimpleNamespace(pool_usage_percent=lambda: 0.0),
+            repository=SimpleNamespace(
+                queue_snapshot=lambda: {},
+                logical_backup=lambda: {},
+                restore_logical_backup=lambda payload: {},
+                protected_artifact_paths=lambda: set(),
+            ),
+            artifact_service=SimpleNamespace(root=None),
+            worker=None,
+        ),
+        raising=False,
+    )
+
+    with TestClient(app_module.create_app()):
+        assert order[0] == "governor_start"
+
+    assert captured["ceiling"] == 80
+    assert "resource_controller" in captured
+    assert "governor_stop" in order
+
+
 def test_image_queue_unavailable_returns_503(monkeypatch) -> None:
     from fastapi import FastAPI
     from services.image_queue.database import ImageQueueUnavailableError

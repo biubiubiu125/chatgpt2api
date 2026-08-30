@@ -152,6 +152,7 @@ quota_limits:
 runtime_capacity:
   uvicorn_workers: 1
   text_concurrency_limit: 80
+  # 图片并发提示上限；image queue 默认会按 CPU / 内存自适应，但不会超过这里。
   image_concurrency_limit: 2000
   request_queue_timeout_seconds: 0
 
