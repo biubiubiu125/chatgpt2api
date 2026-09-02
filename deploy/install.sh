@@ -5960,7 +5960,7 @@ main() {
       BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
       IMAGE_BASE_URL="${IMAGE_BASE_URL:-$(image_view_url_from_base_url "${BASE_URL}")}"
       ensure_admin_auth_key || exit 1
-      IMAGE_BASE_URL="$(prompt_input "图片查看 URL" "${IMAGE_BASE_URL}")"
+      IMAGE_BASE_URL="$(prompt_input "图片查看 URL（API/图片公网地址，建议包含 /images）" "${IMAGE_BASE_URL}")"
       if [[ -z "${explicit_base_url}" ]]; then
         BASE_URL="$(api_root_url_from_image_view_url "${IMAGE_BASE_URL}")"
       fi

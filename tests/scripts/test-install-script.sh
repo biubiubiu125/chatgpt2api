@@ -1115,7 +1115,7 @@ grep -q 'JOIN_RELEASE_REF' "${INSTALL_SCRIPT}" \
   || fail 'worker join file does not carry release metadata'
 grep -q 'public_key_tmp=' "${INSTALL_SCRIPT}" \
   || fail 'join signing public key is not regenerated from the private key'
-grep -q 'port 5432 proto tcp' "${INSTALL_SCRIPT}" \
+grep -q 'to any port "${POSTGRES_PORT}" proto tcp' "${INSTALL_SCRIPT}" \
   || fail 'cluster firewall does not handle PostgreSQL TCP'
 grep -q 'different listen port' "${INSTALL_SCRIPT}" \
   || fail 'managed WireGuard config does not validate listen port'
