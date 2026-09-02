@@ -4,6 +4,7 @@ set -euo pipefail
 REPO_OWNER="${REPO_OWNER:-biubiubiu125}"
 REPO_NAME="${REPO_NAME:-chatgpt2api}"
 DEFAULT_RELEASE_REF="baa6567484c5a86c2e572b07d7d68cf854a0ab07"
+DEFAULT_RELEASE_CHANNEL="chatgpt2api-latest"
 DEFAULT_CHATGPT2API_IMAGE_DIGEST="sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a"
 DEFAULT_CHATGPT2API_WARP_IMAGE="caomingjun/warp@sha256:da12ba946c7e44665ef25de1fc7d22ef432a9fa8b71fa32dc7790e1b5f27cd7f"
 DEFAULT_CHATGPT2API_PRIVOXY_IMAGE="vimagick/privoxy@sha256:8db03d3e5a36800e2c7e32f17b47e21e18f476bf492f0a50e2fc43073f6bb21f"
@@ -18,6 +19,14 @@ if [[ -n "${INITIAL_BRANCH_VALUE}" ]]; then
 elif [[ -n "${INITIAL_RELEASE_REF_VALUE}" ]]; then
   ENV_RELEASE_REF_SET="1"
   ENV_RELEASE_REF_VALUE="${INITIAL_RELEASE_REF_VALUE}"
+fi
+# A standalone install normally provisions its own PostgreSQL and generates the URLs.
+# Someone who passes a database URL explicitly is asking for an external database, so
+# record that before .env or the wizard can overwrite the values; silently replacing an
+# explicit URL with the built-in one would point the install at the wrong database.
+EXPLICIT_DATABASE_URL_SET="0"
+if [[ -n "${DATABASE_URL-}" || -n "${APP_DATABASE_URL-}" || -n "${IMAGE_QUEUE_DATABASE_URL-}" ]]; then
+  EXPLICIT_DATABASE_URL_SET="1"
 fi
 BRANCH="${BRANCH:-${CHATGPT2API_RELEASE_REF:-${DEFAULT_RELEASE_REF}}}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/chatgpt2api}"
@@ -41,6 +50,7 @@ WIREGUARD_INTERFACE="${CHATGPT2API_WIREGUARD_INTERFACE:-${WIREGUARD_INTERFACE:-w
 WIREGUARD_SERVER_IP="${WIREGUARD_SERVER_IP:-10.77.0.1}"
 WIREGUARD_SERVER_ENDPOINT="${WIREGUARD_SERVER_ENDPOINT:-}"
 WIREGUARD_PORT="${WIREGUARD_PORT:-51820}"
+POSTGRES_PORT="${CHATGPT2API_POSTGRES_PORT:-${POSTGRES_PORT:-5432}}"
 CLUSTER_ID="${CHATGPT2API_CLUSTER_ID:-${CLUSTER_ID:-}}"
 MODE="${MODE:-}"
 WITH_WARP="${WITH_WARP:-0}"
@@ -60,6 +70,11 @@ APP_DATABASE_URL="${APP_DATABASE_URL:-}"
 DATABASE_URL="${DATABASE_URL:-}"
 IMAGE_QUEUE_DATABASE_URL="${IMAGE_QUEUE_DATABASE_URL:-}"
 IMAGE_QUEUE_INSTANCE_ID="${IMAGE_QUEUE_INSTANCE_ID:-}"
+CHATGPT2API_INSTANCE_PREFIX="${CHATGPT2API_INSTANCE_PREFIX:-}"
+CHATGPT2API_COMPOSE_PROJECT_NAME="${CHATGPT2API_COMPOSE_PROJECT_NAME:-}"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-}"
+COMPOSE_PROFILES="${COMPOSE_PROFILES:-}"
+USE_BUILTIN_POSTGRES="${USE_BUILTIN_POSTGRES:-0}"
 IMAGE_QUEUE_VERIFY_RETURNED_URL="${IMAGE_QUEUE_VERIFY_RETURNED_URL:-true}"
 IMAGE_QUEUE_RETURNED_URL_VERIFY_TIMEOUT_SECONDS="${IMAGE_QUEUE_RETURNED_URL_VERIFY_TIMEOUT_SECONDS:-5}"
 IMAGE_QUEUE_RETURNED_URL_VERIFY_ATTEMPTS="${IMAGE_QUEUE_RETURNED_URL_VERIFY_ATTEMPTS:-3}"
@@ -121,6 +136,10 @@ FLARESOLVERR_LOG_LEVEL="${FLARESOLVERR_LOG_LEVEL:-info}"
 TZ="${TZ:-Asia/Shanghai}"
 CHATGPT2API_PYTHON_PID_FILE="${CHATGPT2API_PYTHON_PID_FILE:-}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
+POSTGRES_PASSWORD_WAS_KNOWN="0"
+if [[ -n "${POSTGRES_PASSWORD}" ]]; then
+  POSTGRES_PASSWORD_WAS_KNOWN="1"
+fi
 POSTGRES_ADMIN_USER="${POSTGRES_ADMIN_USER:-chatgpt2api_admin}"
 POSTGRES_ADMIN_PASSWORD="${POSTGRES_ADMIN_PASSWORD:-}"
 INSTALL_LANG="${INSTALL_LANG:-}"
@@ -184,6 +203,10 @@ EOF
   WIREGUARD_SERVER_ENDPOINT=main.example.com
   WIREGUARD_SERVER_IP=10.77.0.1
   WIREGUARD_PORT=51820
+  CHATGPT2API_POSTGRES_PORT=5432
+  CHATGPT2API_INSTANCE_PREFIX=chatgpt2api-standalone-demo
+  CHATGPT2API_COMPOSE_PROJECT_NAME=chatgpt2api-standalone-demo
+  COMPOSE_PROJECT_NAME=chatgpt2api-standalone-demo
   WIREGUARD_INTERFACE=wg-chatgpt2api
   APP_DATABASE_URL=postgresql://...
   MODE=docker|python
@@ -224,6 +247,7 @@ EOF
   --install-dir /opt/chatgpt2api
   --branch baa6567484c5a86c2e572b07d7d68cf854a0ab07
   --auth-key your-auth-key
+  --postgres-port 5432
   --install-target standalone|api-main|worker
   --create-first-worker
   --no-first-worker
@@ -327,6 +351,9 @@ text() {
       err_mode) printf 'MODE must be docker or python.' ;;
       err_storage) printf 'STORAGE_BACKEND must be json, sqlite, postgres or git.' ;;
       err_install_target) printf 'INSTALL_TARGET must be standalone, api-main or worker.' ;;
+      err_standalone_mode) printf 'New standalone installations must use Docker because PostgreSQL is provided by the Compose stack.' ;;
+      info_external_database) printf 'An explicit database URL was provided; keeping it and leaving the built-in PostgreSQL switched off.' ;;
+      err_builtin_password_missing) printf 'The built-in PostgreSQL data directory already exists but POSTGRES_PASSWORD is missing from the environment file. PostgreSQL keeps the password from its first start, so a newly generated one cannot authenticate. Restore .env from a backup, or move data/postgres aside to start a new database.' ;;
       err_auth_key) printf 'A manually entered administrator auth key is required.' ;;
       err_port) printf 'PORT must be a number.' ;;
       err_thread_tokens) printf 'CHATGPT2API_THREAD_TOKENS must be a positive number.' ;;
@@ -349,10 +376,16 @@ text() {
       prompt_auth) printf 'Admin auth key' ;;
       prompt_install_target) printf 'Deployment target' ;;
       prompt_warp) printf 'Enable WARP / Privoxy / FlareSolverr compose' ;;
+      summary_pending) printf 'Installation confirmation' ;;
       done_ready) printf 'ChatGPT2API is ready' ;;
       done_auth) printf 'Admin auth key' ;;
       summary_target) printf 'Deployment target' ;;
+      summary_prefix) printf 'Instance prefix' ;;
+      summary_postgres) printf 'PostgreSQL' ;;
+      summary_postgres_builtin) printf 'built-in (Compose service)' ;;
+      summary_postgres_external) printf 'external (kept as provided)' ;;
       summary_url) printf 'Public URL' ;;
+      summary_image_url) printf 'Image view URL' ;;
       summary_database) printf 'PostgreSQL DATABASE_URL' ;;
       summary_queue_database) printf 'Image queue DATABASE_URL' ;;
       prompt_confirm_install) printf 'Start installation with the above settings' ;;
@@ -378,6 +411,9 @@ text() {
     err_mode) printf '运行模式只能是 docker 或 python。' ;;
     err_storage) printf '存储后端只能是 json、sqlite、postgres 或 git。' ;;
     err_install_target) printf '安装端只能是 standalone、api-main 或 worker。' ;;
+    err_standalone_mode) printf '新单机安装必须使用 Docker，因为内置 PostgreSQL 由 Compose 服务提供。' ;;
+    info_external_database) printf '检测到显式指定的数据库 URL，将保留该外部数据库，并不启动内置 PostgreSQL。' ;;
+    err_builtin_password_missing) printf '内置 PostgreSQL 数据目录已存在，但环境文件里没有 POSTGRES_PASSWORD。PostgreSQL 会保留首次初始化时的密码，新生成的随机密码无法通过认证。请从备份恢复 .env，或先把 data/postgres 移走再重新初始化数据库。' ;;
     err_auth_key) printf '必须手动填写管理员登录密钥，不能自动生成。' ;;
     err_port) printf '端口必须是数字。' ;;
     err_not_git) printf '已存在，但不是 Git 仓库。' ;;
@@ -398,10 +434,16 @@ text() {
     prompt_auth) printf '管理员登录密钥' ;;
     prompt_install_target) printf '部署端类型' ;;
     prompt_warp) printf '启用 WARP / Privoxy / FlareSolverr 清障编排' ;;
+    summary_pending) printf '安装确认信息' ;;
     done_ready) printf 'ChatGPT2API 已就绪' ;;
     done_auth) printf '管理员密钥' ;;
     summary_target) printf '部署端' ;;
+    summary_prefix) printf '实例前缀' ;;
+    summary_postgres) printf 'PostgreSQL' ;;
+    summary_postgres_builtin) printf '内置（Compose 服务）' ;;
+    summary_postgres_external) printf '外部（保留原配置）' ;;
     summary_url) printf '公开访问地址' ;;
+    summary_image_url) printf '图片查看 URL' ;;
     summary_database) printf 'PostgreSQL DATABASE_URL' ;;
     summary_queue_database) printf '图片队列 DATABASE_URL' ;;
     prompt_confirm_install) printf '确认以上配置并开始安装' ;;
@@ -525,6 +567,27 @@ confirm() {
     2|y|Y|yes|YES|true|TRUE) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+print_worker_join_placement() {
+  local worker_install_dir="${1:-/opt/chatgpt2api}"
+  local worker_id="${2:-worker-N}"
+  worker_install_dir="${worker_install_dir%/}"
+  local worker_join_dir="${worker_install_dir}/join"
+
+  if is_en; then
+    ui_println "Worker file placement (on the Worker node):"
+    ui_println "  ${worker_join_dir}/${worker_id}.join"
+    ui_println "  ${worker_join_dir}/join-signing.pub"
+    ui_println "Copy both files into ${worker_join_dir}/ before running the Worker installer."
+    ui_println "If the Worker uses another install directory, replace this with <Worker install directory>/join/."
+  else
+    ui_println "Worker 文件放置位置（Worker 节点）："
+    ui_println "  ${worker_join_dir}/${worker_id}.join"
+    ui_println "  ${worker_join_dir}/join-signing.pub"
+    ui_println "请将这两个文件放入 Worker 节点的 ${worker_join_dir}/ 后再运行 Worker 安装脚本。"
+    ui_println "如果 Worker 安装目录不同，请改为 <Worker安装目录>/join/。"
+  fi
 }
 
 normalize_mode_choice() {
@@ -733,6 +796,94 @@ generate_auth_key() {
   date +%s%N
 }
 
+sanitize_compose_project_name() {
+  local value="${1:-}"
+  value="${value,,}"
+  value="${value//[^a-z0-9_-]/-}"
+  while [[ "${value}" == *--* ]]; do
+    value="${value//--/-}"
+  done
+  while [[ "${value}" == [-_]* ]]; do
+    value="${value:1}"
+  done
+  while [[ "${value}" == *[-_] ]]; do
+    value="${value:0:${#value}-1}"
+  done
+  if [[ -z "${value}" ]]; then
+    value="chatgpt2api"
+  fi
+  value="${value:0:63}"
+  while [[ "${value}" == *[-_] ]]; do
+    value="${value:0:${#value}-1}"
+  done
+  printf '%s' "${value:-chatgpt2api}"
+}
+
+compose_project_suffix() {
+  local seed="${1:-}"
+  local checksum=""
+  checksum="$(printf '%s' "${seed}" | cksum | awk '{print $1}' | cut -c1-8)"
+  printf '%s' "${checksum:-chatgpt2api}"
+}
+
+# The install directory is the identity of an instance, so `/opt/chatgpt2api` and
+# `/opt/chatgpt2api/` must hash to the same project name; otherwise a trailing
+# slash would silently create a second Compose stack over the same files.
+normalize_install_dir_seed() {
+  local value="${1:-}"
+  while [[ "${value}" == */ && "${value}" != "/" ]]; do
+    value="${value%/}"
+  done
+  printf '%s' "${value}"
+}
+
+derive_compose_project_name() {
+  local role_label=""
+  local suffix=""
+  local install_dir_seed=""
+
+  if [[ -n "${CHATGPT2API_COMPOSE_PROJECT_NAME:-}" ]]; then
+    sanitize_compose_project_name "${CHATGPT2API_COMPOSE_PROJECT_NAME}"
+    return
+  fi
+  if [[ -n "${CHATGPT2API_INSTANCE_PREFIX:-}" ]]; then
+    sanitize_compose_project_name "${CHATGPT2API_INSTANCE_PREFIX}"
+    return
+  fi
+  if [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then
+    sanitize_compose_project_name "${COMPOSE_PROJECT_NAME}"
+    return
+  fi
+
+  case "${INSTALL_TARGET:-${NODE_ROLE:-standalone}}" in
+    api-main) role_label="main" ;;
+    worker) role_label="worker" ;;
+    *) role_label="standalone" ;;
+  esac
+
+  install_dir_seed="$(normalize_install_dir_seed "${INSTALL_DIR:-chatgpt2api}")"
+  suffix="$(compose_project_suffix "${install_dir_seed:-chatgpt2api}|${role_label}")"
+  printf '%s' "$(sanitize_compose_project_name "chatgpt2api-${role_label}-${suffix}")"
+}
+
+ensure_instance_prefix() {
+  local resolved=""
+  resolved="$(derive_compose_project_name)"
+  CHATGPT2API_INSTANCE_PREFIX="${resolved}"
+  CHATGPT2API_COMPOSE_PROJECT_NAME="${resolved}"
+  COMPOSE_PROJECT_NAME="${resolved}"
+  export CHATGPT2API_INSTANCE_PREFIX
+  export CHATGPT2API_COMPOSE_PROJECT_NAME
+  export COMPOSE_PROJECT_NAME
+}
+
+# An exported COMPOSE_PROFILES wins over the value in .env, so export it explicitly
+# rather than leaving an empty inherited value to mask what was just written.
+export_compose_profiles() {
+  COMPOSE_PROFILES="$(compose_profiles_value)"
+  export COMPOSE_PROFILES
+}
+
 install_target_label() {
   case "${INSTALL_TARGET:-${NODE_ROLE:-standalone}}" in
     api-main) printf '主控/监控端' ;;
@@ -742,15 +893,33 @@ install_target_label() {
 }
 
 print_install_summary() {
+  local phase="${1:-done}"
   local config_path="${INSTALL_DIR}/data/config.json"
   local public_url="${BASE_URL:-${IMAGE_BASE_URL:-http://localhost:${PORT}}}"
   if [[ "${MODE}" == "python" ]]; then
     config_path="${INSTALL_DIR}/config.json"
   fi
 
-  printf '\n[%s] %s\n' "$(text prefix_done)" "$(text done_ready)"
+  if [[ "${phase}" == "pending" ]]; then
+    printf '\n[%s] %s\n' "$(text prefix_info)" "$(text summary_pending)"
+  else
+    printf '\n[%s] %s\n' "$(text prefix_done)" "$(text done_ready)"
+  fi
   printf '%s: %s\n' "$(text summary_target)" "$(install_target_label)"
+  if [[ -n "${CHATGPT2API_INSTANCE_PREFIX:-}" ]]; then
+    printf '%s: %s\n' "$(text summary_prefix)" "${CHATGPT2API_INSTANCE_PREFIX}"
+  fi
+  if [[ "${NODE_ROLE:-standalone}" != "worker" ]]; then
+    if [[ "${USE_BUILTIN_POSTGRES:-0}" == "1" ]]; then
+      printf '%s: %s\n' "$(text summary_postgres)" "$(text summary_postgres_builtin)"
+    else
+      printf '%s: %s\n' "$(text summary_postgres)" "$(text summary_postgres_external)"
+    fi
+  fi
   printf '%s: %s\n' "$(text summary_url)" "${public_url}"
+  if [[ -n "${IMAGE_BASE_URL:-}" ]]; then
+    printf '%s: %s\n' "$(text summary_image_url)" "${IMAGE_BASE_URL}"
+  fi
   printf '%s: %s\n' "$(text prompt_thread_tokens)" "${THREAD_TOKENS}"
   if [[ "${NODE_ROLE:-standalone}" == "api-main" ]]; then
     printf '运行状态: API 存活；Worker 运行态需加入 Worker 后验证\n'
@@ -816,6 +985,10 @@ parse_args() {
         AUTH_KEY="${2:-}"
         shift 2
         ;;
+      --postgres-port)
+        POSTGRES_PORT="${2:-}"
+        shift 2
+        ;;
       --install-target)
         INSTALL_TARGET="${2:-}"
         CLI_INSTALL_TARGET_SET="1"
@@ -835,10 +1008,12 @@ parse_args() {
         ;;
       --database-url)
         DATABASE_URL="${2:-}"
+        EXPLICIT_DATABASE_URL_SET="1"
         shift 2
         ;;
       --image-queue-database-url)
         IMAGE_QUEUE_DATABASE_URL="${2:-}"
+        EXPLICIT_DATABASE_URL_SET="1"
         shift 2
         ;;
       --git-repo-url)
@@ -912,6 +1087,10 @@ validate_inputs() {
     echo "[$(text prefix_error)] $(text err_port)" >&2
     exit 1
   fi
+  if [[ -z "${POSTGRES_PORT}" || ! "${POSTGRES_PORT}" =~ ^[0-9]+$ || "${POSTGRES_PORT}" -lt 1 || "${POSTGRES_PORT}" -gt 65535 ]]; then
+    echo "[$(text prefix_error)] CHATGPT2API_POSTGRES_PORT must be a number between 1 and 65535." >&2
+    exit 1
+  fi
 
   if ! is_valid_release_ref "${BRANCH}"; then
     echo "[$(text prefix_error)] release ref must be a 40-character commit SHA or a version tag; mutable branches are not allowed." >&2
@@ -930,6 +1109,8 @@ validate_inputs() {
     echo "[$(text prefix_error)] $(text err_thread_tokens)" >&2
     exit 1
   fi
+
+  normalize_public_urls
 
   if [[ -n "${install_target_requested}" && "${NODE_ROLE}" != "worker" ]] && auth_key_is_placeholder "${AUTH_KEY}"; then
     echo "[$(text prefix_error)] $(text err_auth_key)" >&2
@@ -1031,6 +1212,54 @@ validate_named_postgres_url() {
   local database_name="${2-}"
   local pattern="^postgres(ql)?([+][Pp][Ss][Yy][Cc][Oo][Pp][Gg]2)?://[^[:space:]/?#]+/${database_name}([?][^#[:space:]]*)?$"
   [[ -n "${database_name}" && "${url}" =~ ${pattern} ]]
+}
+
+strip_public_url_trailing_slash() {
+  local value="${1-}"
+  while [[ "${value}" == */ && "${value}" != "http://" && "${value}" != "https://" ]]; do
+    value="${value%/}"
+  done
+  printf '%s' "${value}"
+}
+
+image_view_url_from_base_url() {
+  local root=""
+  root="$(strip_public_url_trailing_slash "${1-}")"
+  if [[ -z "${root}" ]]; then
+    printf ''
+    return
+  fi
+  case "${root}" in
+    */images) printf '%s' "${root}" ;;
+    *) printf '%s/images' "${root}" ;;
+  esac
+}
+
+api_root_url_from_image_view_url() {
+  local image_url=""
+  image_url="$(strip_public_url_trailing_slash "${1-}")"
+  case "${image_url}" in
+    */images) printf '%s' "${image_url%/images}" ;;
+    *) printf '%s' "${image_url}" ;;
+  esac
+}
+
+normalize_public_urls() {
+  BASE_URL="$(strip_public_url_trailing_slash "${BASE_URL:-}")"
+  IMAGE_BASE_URL="$(strip_public_url_trailing_slash "${IMAGE_BASE_URL:-}")"
+
+  if [[ "${NODE_ROLE:-standalone}" == "standalone" && -z "${IMAGE_BASE_URL}" ]]; then
+    case "${BASE_URL}" in
+      http://*/images|https://*/images)
+        IMAGE_BASE_URL="${BASE_URL}"
+        BASE_URL="$(api_root_url_from_image_view_url "${IMAGE_BASE_URL}")"
+        ;;
+    esac
+  fi
+
+  if [[ "${NODE_ROLE:-standalone}" == "standalone" && -n "${IMAGE_BASE_URL}" && -z "${BASE_URL}" ]]; then
+    BASE_URL="$(api_root_url_from_image_view_url "${IMAGE_BASE_URL}")"
+  fi
 }
 
 validate_http_base_url() {
@@ -1153,6 +1382,15 @@ release_asset_url() {
   fi
   printf 'https://github.com/%s/%s/releases/download/chatgpt2api-%s/release-manifest.env' \
     "${REPO_OWNER}" "${REPO_NAME}" "${BRANCH}"
+}
+
+default_release_channel_asset_url() {
+  if [[ ! "${REPO_OWNER}" =~ ^[A-Za-z0-9_.-]+$ || ! "${REPO_NAME}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    echo "invalid GitHub repository owner or name" >&2
+    return 1
+  fi
+  printf 'https://github.com/%s/%s/releases/download/%s/release-manifest.env' \
+    "${REPO_OWNER}" "${REPO_NAME}" "${DEFAULT_RELEASE_CHANNEL}"
 }
 
 download_file() {
@@ -1355,6 +1593,22 @@ apply_release_manifest_file() {
   return 0
 }
 
+# A fresh install that never pinned a release ref should adopt the stable release
+# channel instead of the ref that happened to be baked into this copy of the script.
+default_release_channel_applies() {
+  [[ "${INSTALL_EXISTING}" != "1" \
+    && "${BRANCH}" == "${DEFAULT_RELEASE_REF}" \
+    && "${CLI_BRANCH_SET}" != "1" \
+    && "${ENV_RELEASE_REF_SET}" != "1" \
+    && -z "${CHATGPT2API_IMAGE:-}" \
+    && -z "${CHATGPT2API_IMAGE_DIGEST:-}" ]]
+}
+
+should_load_release_manifest() {
+  [[ "${RELEASE_REF_SELECTED}" == "1" ]] && return 0
+  default_release_channel_applies
+}
+
 load_release_manifest() {
   local manifest_file="${INSTALL_DIR}/deploy/release-manifest.env"
   local manifest_dir="${INSTALL_DIR}/deploy"
@@ -1362,6 +1616,38 @@ load_release_manifest() {
   local requested_release_ref=""
   local raw_expected_release_ref=""
   local asset_expected_release_ref=""
+
+  # Preferring the stable channel keeps a fresh install on the newest published build,
+  # but it must stay a preference: the channel release is created by the publish
+  # workflow, so it is absent before the first publish and after any failed one. The
+  # pinned default below is not stale metadata -- it is the release this copy of the
+  # script was cut from, and it is validated the same way -- so falling back to it is
+  # strictly better than refusing to install at all.
+  if default_release_channel_applies; then
+    local channel_manifest="${INSTALL_DIR}/deploy/release-manifest.env.channel.tmp.$$"
+    mkdir -p "$(dirname "${channel_manifest}")"
+    if default_release_channel_asset_url >/dev/null 2>&1 \
+      && curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 --retry-all-errors \
+        "$(default_release_channel_asset_url)" -o "${channel_manifest}"; then
+      if apply_release_manifest_file "${channel_manifest}" ""; then
+        if [[ -e "${manifest_file}" || -L "${manifest_file}" ]]; then
+          trash_path "${manifest_file}"
+        fi
+        mv -f "${channel_manifest}" "${manifest_file}"
+        RELEASE_REF_SELECTED="1"
+        printf '%s\n' "loaded the stable release channel ${DEFAULT_RELEASE_CHANNEL}." >&2
+        return 0
+      fi
+      # A malformed channel manifest must not be applied, but the pinned release below
+      # is a separate, independently validated source; keep going rather than abort.
+      printf '%s\n' "stable release channel ${DEFAULT_RELEASE_CHANNEL} is unusable; falling back to the pinned default release ${DEFAULT_RELEASE_REF}." >&2
+    else
+      printf '%s\n' "stable release channel ${DEFAULT_RELEASE_CHANNEL} is unavailable; falling back to the pinned default release ${DEFAULT_RELEASE_REF}." >&2
+    fi
+    trash_path "${channel_manifest}"
+  fi
+
   if release_ref_override_active; then
     requested_release_ref="$(release_ref_override_value)"
   elif [[ "${RELEASE_REF_SELECTED}" == "1" ]]; then
@@ -1452,15 +1738,8 @@ load_release_manifest() {
   if [[ -d "${manifest_dir}" ]] && [[ -z "$(find "${manifest_dir}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     rmdir -- "${manifest_dir}" 2>/dev/null || true
   fi
-  if [[ "${REPO_OWNER}/${REPO_NAME}" != "biubiubiu125/chatgpt2api" || "${BRANCH}" != "${DEFAULT_RELEASE_REF}" ]]; then
-    printf '%s\n' "release manifest unavailable for ${REPO_OWNER}/${REPO_NAME}@${BRANCH}; refusing to continue without release-matched image metadata." >&2
-    return 1
-  fi
-  if [[ -z "${CHATGPT2API_IMAGE:-}" && -z "${CHATGPT2API_IMAGE_DIGEST:-}" ]]; then
-    CHATGPT2API_IMAGE_DIGEST="${DEFAULT_CHATGPT2API_IMAGE_DIGEST}"
-  fi
-  printf '%s\n' "release manifest unavailable; using built-in metadata for the pinned default release." >&2
-  return 0
+  printf '%s\n' "release manifest unavailable for ${REPO_OWNER}/${REPO_NAME}@${BRANCH}; refusing to continue without release-matched image metadata." >&2
+  return 1
 }
 
 json_escape() {
@@ -1575,8 +1854,13 @@ prepare_docker_bundle() {
     download_file "scripts/init_proxy_config.py"
     download_file "scripts/privoxy-warp.conf"
   fi
+  download_file "deploy/postgres-init/001-create-cluster-databases.sh"
   download_file "scripts/bootstrap_database_roles.py"
   download_file "scripts/env_loader.py"
+  # The PostgreSQL entrypoint runs an executable init script as a child process but
+  # sources a non-executable one, which would leak this script's `set -eu` into the
+  # entrypoint's own shell. Keep it executable, as the cluster bundle does.
+  chmod +x "${INSTALL_DIR}/deploy/postgres-init/001-create-cluster-databases.sh" || true
 }
 
 prepare_repo() {
@@ -1655,6 +1939,10 @@ CHATGPT2API_PYTHON_BIN=$(dotenv_escape "${PYTHON_BIN}")
 CHATGPT2API_IMAGE_PORT=$(dotenv_escape "${IMAGE_PORT}")
 MODE=$(dotenv_escape "${MODE}")
 WITH_WARP=$(dotenv_escape "${WITH_WARP}")
+CHATGPT2API_INSTANCE_PREFIX=$(dotenv_escape "${CHATGPT2API_INSTANCE_PREFIX}")
+CHATGPT2API_COMPOSE_PROJECT_NAME=$(dotenv_escape "${CHATGPT2API_COMPOSE_PROJECT_NAME}")
+COMPOSE_PROJECT_NAME=$(dotenv_escape "${COMPOSE_PROJECT_NAME}")
+COMPOSE_PROFILES=$(dotenv_escape "$(compose_profiles_value)")
 CHATGPT2API_NODE_ROLE=$(dotenv_escape "${NODE_ROLE}")
 CHATGPT2API_RUN_API=$(dotenv_escape "${RUN_API}")
 CHATGPT2API_RUN_WORKER=$(dotenv_escape "${RUN_WORKER}")
@@ -1668,6 +1956,7 @@ WIREGUARD_INTERFACE=$(dotenv_escape "${WIREGUARD_INTERFACE}")
 WIREGUARD_SERVER_IP=$(dotenv_escape "${WIREGUARD_SERVER_IP}")
 WIREGUARD_SERVER_ENDPOINT=$(dotenv_escape "${WIREGUARD_SERVER_ENDPOINT}")
 WIREGUARD_PORT=$(dotenv_escape "${WIREGUARD_PORT}")
+CHATGPT2API_POSTGRES_PORT=$(dotenv_escape "${POSTGRES_PORT}")
 
 STORAGE_BACKEND=$(dotenv_escape "${STORAGE_BACKEND}")
 APP_DATABASE_URL=$(dotenv_escape "${APP_DATABASE_URL}")
@@ -1745,7 +2034,10 @@ FLARESOLVERR_LOG_LEVEL=$(dotenv_escape "${FLARESOLVERR_LOG_LEVEL}")
 TZ=$(dotenv_escape "${TZ}")
 EOF
 
-  if [[ "${NODE_ROLE}" == "api-main" ]]; then
+  # The PostgreSQL admin credentials only belong to nodes that own the database.
+  # A Worker reaches the main node's PostgreSQL over WireGuard with the runtime
+  # role and must never carry the admin password in its environment file.
+  if [[ "${NODE_ROLE}" != "worker" ]]; then
     cat >>"${tmp_file}" <<EOF
 POSTGRES_ADMIN_USER=$(dotenv_escape "${POSTGRES_ADMIN_USER}")
 POSTGRES_ADMIN_PASSWORD=$(dotenv_escape "${POSTGRES_ADMIN_PASSWORD}")
@@ -1780,6 +2072,37 @@ wait_docker_app_health() {
   exit 1
 }
 
+wait_docker_service_healthy() {
+  local service="$1"
+  local timeout_seconds="$2"
+  shift 2
+  local compose_args=("$@")
+  local container_id=""
+  local status=""
+  local deadline=$(( $(date +%s) + timeout_seconds ))
+
+  while (( $(date +%s) < deadline )); do
+    container_id="$(cd "${INSTALL_DIR}" && docker compose "${compose_args[@]}" ps -q "${service}" 2>/dev/null || true)"
+    if [[ -n "${container_id}" ]]; then
+      status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${container_id}" 2>/dev/null || true)"
+      case "${status}" in
+        healthy)
+          return 0
+          ;;
+        exited|dead)
+          break
+          ;;
+      esac
+    fi
+    sleep 2
+  done
+
+  echo "[$(text prefix_error)] Docker service ${service} did not become healthy; recent status:" >&2
+  (cd "${INSTALL_DIR}" && docker compose "${compose_args[@]}" ps >&2 || true)
+  (cd "${INSTALL_DIR}" && docker compose "${compose_args[@]}" logs --tail=120 "${service}" >&2 || true)
+  return 1
+}
+
 wait_cluster_main_liveness() {
   need_cmd curl
   local port="${PORT:-3000}"
@@ -1802,6 +2125,27 @@ wait_cluster_main_liveness() {
   return 1
 }
 
+# PostgreSQL keeps the password it was initialized with, so a data directory that
+# already exists cannot be reached with a freshly generated random password. Catching
+# it here points at the real cause instead of failing later inside the init script with
+# an opaque authentication error.
+builtin_postgres_is_initialized() {
+  [[ -f "${INSTALL_DIR}/data/postgres/PG_VERSION" ]]
+}
+
+ensure_builtin_postgres_password() {
+  if ! builtin_postgres_is_initialized; then
+    return 0
+  fi
+  if [[ "${POSTGRES_PASSWORD_WAS_KNOWN:-0}" == "1" ]]; then
+    return 0
+  fi
+  echo "[$(text prefix_error)] $(text err_builtin_password_missing)" >&2
+  echo "  ${INSTALL_DIR}/data/postgres" >&2
+  echo "  ${INSTALL_DIR}/.env" >&2
+  return 1
+}
+
 run_docker() {
   need_cmd docker
   if ! docker compose version >/dev/null 2>&1; then
@@ -1814,11 +2158,36 @@ run_docker() {
     compose_args=(-f docker-compose.warp.yml)
   fi
 
+  export_compose_profiles
   (cd "${INSTALL_DIR}" && docker compose "${compose_args[@]}" config --quiet)
   prepare_docker_data_permissions
   ui_println "[$(text prefix_info)] $(text info_start_docker)"
   (cd "${INSTALL_DIR}" && docker compose "${compose_args[@]}" pull)
-  stop_python_runtime
+  if ! stop_python_runtime; then
+    echo "[$(text prefix_error)] failed to stop the previous managed Python runtime before starting Docker." >&2
+    exit 1
+  fi
+  # The instance prefix decides the Compose project name, so a rerun that changes it
+  # would otherwise leave the previous stack running and fighting for the host port.
+  if ! stop_docker_runtime; then
+    echo "[$(text prefix_error)] failed to stop the previous managed Docker runtime before starting Docker." >&2
+    exit 1
+  fi
+  # Only an install that owns its database starts the built-in service and reconciles
+  # the two databases; one pointed at an external PostgreSQL leaves both alone.
+  if [[ "${USE_BUILTIN_POSTGRES:-0}" == "1" ]]; then
+    if ! ensure_builtin_postgres_password; then
+      exit 1
+    fi
+    (cd "${INSTALL_DIR}" && docker compose "${compose_args[@]}" up -d postgres)
+    if ! wait_docker_service_healthy postgres 180 "${compose_args[@]}"; then
+      exit 1
+    fi
+    if ! (cd "${INSTALL_DIR}" && docker compose "${compose_args[@]}" exec -T postgres sh /docker-entrypoint-initdb.d/001-create-cluster-databases.sh); then
+      echo "[$(text prefix_error)] failed to reconcile the built-in PostgreSQL databases and role markers." >&2
+      exit 1
+    fi
+  fi
   (cd "${INSTALL_DIR}" && docker compose "${compose_args[@]}" up -d --remove-orphans)
   wait_docker_app_health "${compose_args[@]}"
 }
@@ -1978,7 +2347,144 @@ stop_python_runtime() {
   fi
 }
 
+# Compose derives container, network and volume names from the project name, so a
+# rerun that changes the instance prefix would otherwise leave the previous stack
+# running and fighting for the host port. Installs from before the instance-prefix
+# change ran under Compose's default project name and pinned `container_name`, so
+# ask Docker which projects Compose actually created from this directory instead of
+# guessing at names. Only containers Compose labelled with this exact working
+# directory are considered, so an unrelated stack is never touched.
+docker_compose_projects_for_install_dir() {
+  local resolved_install_dir=""
+  resolved_install_dir="$(cd "${INSTALL_DIR}" 2>/dev/null && pwd -P)" || return 0
+  docker ps -a \
+    --filter "label=com.docker.compose.project.working_dir=${resolved_install_dir}" \
+    --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null \
+    | awk 'NF' | sort -u
+}
+
+# Bring one Compose stack down. `project` overrides COMPOSE_PROJECT_NAME so the same
+# compose file can be torn down under both the current instance prefix and whatever
+# project an older install used. Every variable a compose file marks as required must
+# be supplied even for `down`: Compose refuses to parse the file without them, and an
+# old .env that pointed at an external PostgreSQL carries no password at all.
+compose_down_stack() {
+  local compose_file="$1"
+  local project="${2:-}"
+  local -a project_args=()
+  if [[ -n "${project}" ]]; then
+    project_args=(-p "${project}")
+  fi
+
+  case "${compose_file}" in
+    docker-compose.cluster-main.yml)
+      (
+        cd "${INSTALL_DIR}" && \
+        CHATGPT2API_CLUSTER_ID="${CHATGPT2API_CLUSTER_ID:-cluster-placeholder}" \
+        WIREGUARD_SERVER_IP="${WIREGUARD_SERVER_IP:-10.77.0.1}" \
+        POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-placeholder}" \
+        POSTGRES_ADMIN_PASSWORD="${POSTGRES_ADMIN_PASSWORD:-placeholder}" \
+        POSTGRES_PASSWORD_URLENCODED="${POSTGRES_PASSWORD_URLENCODED:-placeholder}" \
+        CHATGPT2API_POSTGRES_PORT="${CHATGPT2API_POSTGRES_PORT:-${POSTGRES_PORT:-5432}}" \
+        POSTGRES_ADMIN_USER="${POSTGRES_ADMIN_USER:-chatgpt2api_admin}" \
+        docker compose "${project_args[@]}" -f "${compose_file}" down --remove-orphans
+      )
+      ;;
+    docker-compose.cluster-worker.yml)
+      (
+        cd "${INSTALL_DIR}" && \
+        CHATGPT2API_CLUSTER_ID="${CHATGPT2API_CLUSTER_ID:-cluster-placeholder}" \
+        CHATGPT2API_WORKER_ID="${CHATGPT2API_WORKER_ID:-worker-placeholder}" \
+        CHATGPT2API_WIREGUARD_IP="${CHATGPT2API_WIREGUARD_IP:-10.77.0.11}" \
+        CHATGPT2API_IMAGE_BASE_URL="${CHATGPT2API_IMAGE_BASE_URL:-http://127.0.0.1/images}" \
+        APP_DATABASE_URL="${APP_DATABASE_URL:-postgresql://placeholder:placeholder@127.0.0.1:5432/chatgpt2api_app}" \
+        IMAGE_QUEUE_DATABASE_URL="${IMAGE_QUEUE_DATABASE_URL:-postgresql://placeholder:placeholder@127.0.0.1:5432/chatgpt2api_image_queue}" \
+        docker compose "${project_args[@]}" -f "${compose_file}" down --remove-orphans
+      )
+      ;;
+    *)
+      # docker-compose.yml and docker-compose.warp.yml now ship a built-in
+      # PostgreSQL, so `down` needs the same required variables as `up`.
+      (
+        cd "${INSTALL_DIR}" && \
+        IMAGE_QUEUE_DATABASE_URL="${IMAGE_QUEUE_DATABASE_URL:-postgresql://placeholder:placeholder@127.0.0.1:5432/chatgpt2api_image_queue}" \
+        POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-placeholder}" \
+        POSTGRES_ADMIN_PASSWORD="${POSTGRES_ADMIN_PASSWORD:-placeholder}" \
+        POSTGRES_ADMIN_USER="${POSTGRES_ADMIN_USER:-chatgpt2api_admin}" \
+        CHATGPT2API_WARP_IMAGE="${CHATGPT2API_WARP_IMAGE:-${DEFAULT_CHATGPT2API_WARP_IMAGE}}" \
+        CHATGPT2API_PRIVOXY_IMAGE="${CHATGPT2API_PRIVOXY_IMAGE:-${DEFAULT_CHATGPT2API_PRIVOXY_IMAGE}}" \
+        CHATGPT2API_FLARESOLVERR_IMAGE="${CHATGPT2API_FLARESOLVERR_IMAGE:-${DEFAULT_CHATGPT2API_FLARESOLVERR_IMAGE}}" \
+        docker compose "${project_args[@]}" -f "${compose_file}" down --remove-orphans
+      )
+      ;;
+  esac
+}
+
+# Installs from before the instance-prefix change pinned `container_name`, so their
+# containers survive a `down` that targets a different project name and keep holding
+# the published host port. Remove them by name, but only after confirming Compose
+# created them from this install directory.
+remove_legacy_named_containers() {
+  local container=""
+  local resolved_install_dir=""
+  local working_dir=""
+  local removal_failed="0"
+  local -a legacy_containers=()
+  resolved_install_dir="$(cd "${INSTALL_DIR}" 2>/dev/null && pwd -P)" || return 0
+
+  legacy_containers=(
+    chatgpt2api
+    chatgpt2api-data-permissions
+    chatgpt2api-database-init
+    chatgpt2api-postgres
+    chatgpt2api-warp
+    chatgpt2api-warp-data-permissions
+    chatgpt2api-warp-database-init
+    chatgpt2api-warp-init
+    chatgpt2api-warp-proxy
+    chatgpt2api-privoxy
+    chatgpt2api-flaresolverr
+    chatgpt2api-local
+    chatgpt2api-local-data-permissions
+    chatgpt2api-postgres-local
+    chatgpt2api-postgres-local-init
+    chatgpt2api-main
+    chatgpt2api-main-data-permissions
+    # A Worker's containers were named after CHATGPT2API_WORKER_ID, falling back to
+    # `chatgpt2api-worker`. They publish the image port, so leaving one behind makes
+    # the new stack fail to bind.
+    chatgpt2api-worker
+    chatgpt2api-worker-data-permissions
+  )
+  if [[ -n "${WORKER_ID:-}" && "${WORKER_ID}" != "chatgpt2api-worker" ]]; then
+    legacy_containers+=("${WORKER_ID}" "${WORKER_ID}-data-permissions")
+  fi
+
+  for container in "${legacy_containers[@]}"; do
+    [[ -z "${container}" ]] && continue
+    working_dir="$(docker inspect -f \
+      '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' \
+      "${container}" 2>/dev/null || true)"
+    if [[ -z "${working_dir}" || "${working_dir}" != "${resolved_install_dir}" ]]; then
+      continue
+    fi
+    ui_println "[$(text prefix_info)] removing the legacy fixed-name container: ${container}"
+    if ! docker rm -f "${container}" >/dev/null 2>&1; then
+      echo "[$(text prefix_error)] failed to remove the legacy container: ${container}" >&2
+      removal_failed="1"
+    fi
+  done
+
+  [[ "${removal_failed}" == "0" ]]
+}
+
 stop_docker_runtime() {
+  if declare -F cluster_stop_join_helper >/dev/null 2>&1; then
+    if ! cluster_stop_join_helper; then
+      echo "[$(text prefix_error)] failed to stop the previous Worker join helper." >&2
+      return 1
+    fi
+  fi
   if ! command -v docker >/dev/null 2>&1; then
     return 0
   fi
@@ -1989,6 +2495,20 @@ stop_docker_runtime() {
     return 0
   fi
 
+  # Tear the stack down once per project Compose ever created from this directory,
+  # not just under the project name this run resolved to. An install from before the
+  # instance-prefix change lives under Compose's default project name, and skipping
+  # it would leave its containers holding the published host port.
+  local -a projects=()
+  local project=""
+  projects=("${COMPOSE_PROJECT_NAME:-}")
+  while IFS= read -r project; do
+    [[ -z "${project}" ]] && continue
+    [[ "${project}" == "${COMPOSE_PROJECT_NAME:-}" ]] && continue
+    projects+=("${project}")
+    ui_println "[$(text prefix_info)] found a previous Compose project for this directory: ${project}"
+  done < <(docker_compose_projects_for_install_dir)
+
   local compose_file=""
   for compose_file in \
     docker-compose.yml \
@@ -1996,48 +2516,23 @@ stop_docker_runtime() {
     docker-compose.local.yml \
     docker-compose.cluster-main.yml \
     docker-compose.cluster-worker.yml; do
-    if [[ -f "${INSTALL_DIR}/${compose_file}" ]]; then
-      ui_println "[$(text prefix_info)] stopping the previous managed Docker stack: ${compose_file}"
+    if [[ ! -f "${INSTALL_DIR}/${compose_file}" ]]; then
+      continue
+    fi
+    for project in "${projects[@]}"; do
+      ui_println "[$(text prefix_info)] stopping the previous managed Docker stack: ${compose_file} (${project:-default project})"
       local down_status=0
-      case "${compose_file}" in
-        docker-compose.cluster-main.yml)
-          (
-            cd "${INSTALL_DIR}" && \
-            CHATGPT2API_CLUSTER_ID="${CHATGPT2API_CLUSTER_ID:-cluster-placeholder}" \
-            WIREGUARD_SERVER_IP="${WIREGUARD_SERVER_IP:-10.77.0.1}" \
-            POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-placeholder}" \
-            POSTGRES_ADMIN_PASSWORD="${POSTGRES_ADMIN_PASSWORD:-placeholder}" \
-            POSTGRES_PASSWORD_URLENCODED="${POSTGRES_PASSWORD_URLENCODED:-placeholder}" \
-            POSTGRES_ADMIN_USER="${POSTGRES_ADMIN_USER:-chatgpt2api_admin}" \
-            docker compose -f "${compose_file}" down --remove-orphans
-          ) || down_status=$?
-          ;;
-        docker-compose.cluster-worker.yml)
-          (
-            cd "${INSTALL_DIR}" && \
-            CHATGPT2API_CLUSTER_ID="${CHATGPT2API_CLUSTER_ID:-cluster-placeholder}" \
-            CHATGPT2API_WORKER_ID="${CHATGPT2API_WORKER_ID:-worker-placeholder}" \
-            CHATGPT2API_WIREGUARD_IP="${CHATGPT2API_WIREGUARD_IP:-10.77.0.11}" \
-            CHATGPT2API_IMAGE_BASE_URL="${CHATGPT2API_IMAGE_BASE_URL:-http://127.0.0.1/images}" \
-            APP_DATABASE_URL="${APP_DATABASE_URL:-postgresql://placeholder:placeholder@127.0.0.1:5432/chatgpt2api_app}" \
-            IMAGE_QUEUE_DATABASE_URL="${IMAGE_QUEUE_DATABASE_URL:-postgresql://placeholder:placeholder@127.0.0.1:5432/chatgpt2api_image_queue}" \
-            docker compose -f "${compose_file}" down --remove-orphans
-          ) || down_status=$?
-          ;;
-        *)
-          (
-            cd "${INSTALL_DIR}" && \
-            IMAGE_QUEUE_DATABASE_URL="${IMAGE_QUEUE_DATABASE_URL:-postgresql://placeholder:placeholder@127.0.0.1:5432/chatgpt2api_image_queue}" \
-            docker compose -f "${compose_file}" down --remove-orphans
-          ) || down_status=$?
-          ;;
-      esac
+      compose_down_stack "${compose_file}" "${project}" || down_status=$?
       if (( down_status != 0 )); then
         echo "[$(text prefix_error)] failed to stop the previous managed Docker stack: ${compose_file}" >&2
         return 1
       fi
-    fi
+    done
   done
+
+  if ! remove_legacy_named_containers; then
+    return 1
+  fi
 }
 
 build_frontend() {
@@ -2388,9 +2883,17 @@ cluster_validate_wireguard_server_ip() {
 
 cluster_validate_wireguard_port() {
   local port="${WIREGUARD_PORT:-}"
-  if [[ "${port}" != "51820" ]]; then
-    echo "[$(text prefix_error)] WireGuard port must be 51820/udp for chatgpt2api cluster private network." >&2
+  if [[ -z "${port}" || ! "${port}" =~ ^[0-9]+$ || "${port}" -lt 1 || "${port}" -gt 65535 ]]; then
+    echo "[$(text prefix_error)] WireGuard port must be a UDP port between 1 and 65535." >&2
     exit 1
+  fi
+}
+
+cluster_validate_postgres_port() {
+  local port="${1:-${POSTGRES_PORT:-5432}}"
+  if [[ -z "${port}" || ! "${port}" =~ ^[0-9]+$ || "${port}" -lt 1 || "${port}" -gt 65535 ]]; then
+    echo "[$(text prefix_error)] PostgreSQL port must be a TCP port between 1 and 65535." >&2
+    return 1
   fi
 }
 
@@ -2459,11 +2962,12 @@ cluster_validate_worker_public_image_base_url() {
 dotenv_key_allowed() {
   case "$1" in
     AUTH_KEY|BASE_URL|IMAGE_BASE_URL|IMAGE_PORT|WORKER_ID|WIREGUARD_IP|NODE_ROLE|CLUSTER_ID| \
-     CHATGPT2API_AUTH_KEY|CHATGPT2API_BACKUP_PASSPHRASE|CHATGPT2API_CONFIG_FILE| \
+    CHATGPT2API_AUTH_KEY|CHATGPT2API_BACKUP_PASSPHRASE|CHATGPT2API_CONFIG_FILE| \
      CHATGPT2API_MONITOR_COMPLETED_LIMIT|CHATGPT2API_MONITOR_EVENT_LIMIT| \
      CHATGPT2API_PORT|CHATGPT2API_QUOTA_RESERVATION_TTL_SECONDS|CHATGPT2API_RUNTIME_LOG_FILE| \
      CHATGPT2API_THREAD_TOKENS|CHATGPT2API_IMAGE| \
      CHATGPT2API_IMAGE_DIGEST|CHATGPT2API_RELEASE_REF|UV_VERSION| \
+    CHATGPT2API_INSTANCE_PREFIX|CHATGPT2API_COMPOSE_PROJECT_NAME|COMPOSE_PROJECT_NAME|COMPOSE_PROFILES| \
      CHATGPT2API_BASE_URL|CHATGPT2API_IMAGE_BASE_URL|CHATGPT2API_PYTHON_BIN|CHATGPT2API_IMAGE_PORT|CHATGPT2API_NODE_ROLE|CHATGPT2API_INSTALL_TARGET|CHATGPT2API_CREATE_FIRST_WORKER| \
     CHATGPT2API_WARP_IMAGE|CHATGPT2API_PRIVOXY_IMAGE|CHATGPT2API_FLARESOLVERR_IMAGE| \
      CHATGPT2API_RUN_API|CHATGPT2API_RUN_WORKER|CHATGPT2API_WORKER_ID|CHATGPT2API_WORKER_PUBLIC_ENTRY_MODE| \
@@ -2487,7 +2991,7 @@ dotenv_key_allowed() {
     CHATGPT2API_PROXY_RUNTIME_USER_AGENT|CHATGPT2API_FLARESOLVERR_URL|WARP_LICENSE_KEY| \
      CHATGPT2API_PYTHON_PID_FILE| \
      MODE|WITH_WARP| \
-     WIREGUARD_INTERFACE|WIREGUARD_SERVER_IP|WIREGUARD_SERVER_ENDPOINT|WIREGUARD_PORT| \
+     WIREGUARD_INTERFACE|WIREGUARD_SERVER_IP|WIREGUARD_SERVER_ENDPOINT|WIREGUARD_PORT|CHATGPT2API_POSTGRES_PORT| \
     STORAGE_BACKEND|APP_DATABASE_URL|DATABASE_URL|IMAGE_QUEUE_DATABASE_URL|IMAGE_QUEUE_INSTANCE_ID| \
     IMAGE_QUEUE_VERIFY_RETURNED_URL|IMAGE_QUEUE_RETURNED_URL_VERIFY_TIMEOUT_SECONDS| \
     IMAGE_QUEUE_RETURNED_URL_VERIFY_ATTEMPTS|IMAGE_QUEUE_RETURNED_URL_VERIFY_MAX_BYTES| \
@@ -2712,6 +3216,10 @@ load_existing_install_env() {
     CHATGPT2API_BASE_URL="${CHATGPT2API_BASE_URL:-${BASE_URL:-}}"
     CHATGPT2API_IMAGE_BASE_URL="${CHATGPT2API_IMAGE_BASE_URL:-${IMAGE_BASE_URL:-}}"
     CHATGPT2API_IMAGE_PORT="${CHATGPT2API_IMAGE_PORT:-${IMAGE_PORT:-}}"
+    CHATGPT2API_INSTANCE_PREFIX="${CHATGPT2API_INSTANCE_PREFIX:-}"
+    CHATGPT2API_COMPOSE_PROJECT_NAME="${CHATGPT2API_COMPOSE_PROJECT_NAME:-}"
+    COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-}"
+    COMPOSE_PROFILES="${COMPOSE_PROFILES:-}"
     MODE="${MODE:-}"
     WITH_WARP="${WITH_WARP:-0}"
     BRANCH="${CHATGPT2API_RELEASE_REF:-${BRANCH:-}}"
@@ -2719,6 +3227,9 @@ load_existing_install_env() {
     APP_DATABASE_URL="${APP_DATABASE_URL:-}"
     DATABASE_URL="${DATABASE_URL:-}"
     IMAGE_QUEUE_DATABASE_URL="${IMAGE_QUEUE_DATABASE_URL:-}"
+    POSTGRES_ADMIN_USER="${POSTGRES_ADMIN_USER:-chatgpt2api_admin}"
+    POSTGRES_ADMIN_PASSWORD="${POSTGRES_ADMIN_PASSWORD:-}"
+    POSTGRES_PORT="${CHATGPT2API_POSTGRES_PORT:-${POSTGRES_PORT:-5432}}"
     if [[ "${storage_backend_declared}" != "1" ]]; then
       STORAGE_BACKEND="$(infer_existing_storage_backend)"
     fi
@@ -2762,6 +3273,11 @@ load_existing_install_env() {
     POSTGRES_ADMIN_USER="${POSTGRES_ADMIN_USER:-chatgpt2api_admin}"
     POSTGRES_ADMIN_PASSWORD="${POSTGRES_ADMIN_PASSWORD:-}"
     POSTGRES_PASSWORD_URLENCODED="${POSTGRES_PASSWORD_URLENCODED:-}"
+    # Remember that the password came from somewhere real, so a later run can tell an
+    # existing data directory with a lost password from a genuine first install.
+    if [[ -n "${POSTGRES_PASSWORD}" ]]; then
+      POSTGRES_PASSWORD_WAS_KNOWN="1"
+    fi
     AUTH_KEY="${CHATGPT2API_AUTH_KEY:-${AUTH_KEY:-}}"
     IMAGE_BASE_URL="${CHATGPT2API_IMAGE_BASE_URL:-${IMAGE_BASE_URL:-}}"
     IMAGE_PORT="${CHATGPT2API_IMAGE_PORT:-${IMAGE_PORT:-}}"
@@ -2793,6 +3309,10 @@ load_existing_install_env() {
       BRANCH="$(release_ref_override_value)"
       CHATGPT2API_RELEASE_REF="$(release_ref_override_value)"
     fi
+
+    ensure_instance_prefix
+  else
+    INSTALL_EXISTING="0"
   fi
 }
 
@@ -2889,6 +3409,16 @@ cluster_ensure_join_signing_key() {
     return 1
   fi
   mv -f "${public_key_tmp}" "${public_key}"
+  local shared_public_key="${INSTALL_DIR}/data/join-signing.pub"
+  local shared_public_key_tmp="${shared_public_key}.tmp.$$"
+  mkdir -p "${INSTALL_DIR}/data"
+  if ! cp -- "${public_key}" "${shared_public_key_tmp}" \
+    || ! chmod 644 "${shared_public_key_tmp}" \
+    || ! mv -f "${shared_public_key_tmp}" "${shared_public_key}"; then
+    trash_path "${shared_public_key_tmp}"
+    echo "[$(text prefix_error)] failed to publish the Worker join signing public key for the management API." >&2
+    return 1
+  fi
   chmod 600 "${private_key}" || true
 }
 
@@ -2932,8 +3462,8 @@ cluster_allow_wireguard_firewall() {
       echo "[$(text prefix_error)] failed to allow WireGuard UDP port ${WIREGUARD_PORT} in UFW." >&2
       return 1
     fi
-    if ! ufw allow from 10.77.0.0/24 to any port 5432 proto tcp >/dev/null 2>&1; then
-      echo "[$(text prefix_error)] failed to allow PostgreSQL TCP 5432 from the WireGuard subnet in UFW." >&2
+    if ! ufw allow from 10.77.0.0/24 to any port "${POSTGRES_PORT}" proto tcp >/dev/null 2>&1; then
+      echo "[$(text prefix_error)] failed to allow PostgreSQL TCP ${POSTGRES_PORT} from the WireGuard subnet in UFW." >&2
       return 1
     fi
   fi
@@ -2942,8 +3472,8 @@ cluster_allow_wireguard_firewall() {
       echo "[$(text prefix_error)] failed to allow WireGuard UDP port ${WIREGUARD_PORT} in firewalld." >&2
       return 1
     fi
-    if ! firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=10.77.0.0/24 port port=5432 protocol=tcp accept' >/dev/null 2>&1; then
-      echo "[$(text prefix_error)] failed to allow PostgreSQL TCP 5432 from the WireGuard subnet in firewalld." >&2
+    if ! firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=10.77.0.0/24 port port=${POSTGRES_PORT} protocol=tcp accept" >/dev/null 2>&1; then
+      echo "[$(text prefix_error)] failed to allow PostgreSQL TCP ${POSTGRES_PORT} from the WireGuard subnet in firewalld." >&2
       return 1
     fi
     if ! firewall-cmd --reload >/dev/null 2>&1; then
@@ -3021,18 +3551,29 @@ cluster_remove_wireguard_peer() {
   config_file="$(cluster_wireguard_config_file)"
   if [[ -f "${config_file}" ]]; then
     local tmp_file="${config_file}.tmp.$$"
-    awk -v marker="# chatgpt2api ${worker_id}" '
+    if ! awk -v marker="# chatgpt2api ${worker_id}" '
       $0 == marker { skip = 1; next }
       skip && $0 ~ /^\[Peer\]$/ { next }
       skip && $0 ~ /^PublicKey = / { next }
       skip && $0 ~ /^AllowedIPs = / { skip = 0; next }
       { print }
-    ' "${config_file}" >"${tmp_file}" && cat "${tmp_file}" >"${config_file}"
+    ' "${config_file}" >"${tmp_file}"; then
+      trash_path "${tmp_file}"
+      return 1
+    fi
+    if ! cat "${tmp_file}" >"${config_file}"; then
+      trash_path "${tmp_file}"
+      return 1
+    fi
     trash_path "${tmp_file}"
   fi
   if command -v wg >/dev/null 2>&1 && wg show "${WIREGUARD_INTERFACE}" >/dev/null 2>&1; then
-    wg set "${WIREGUARD_INTERFACE}" peer "${worker_public_key}" remove >/dev/null 2>&1 || true
-    wg syncconf "${WIREGUARD_INTERFACE}" <(wg-quick strip "${WIREGUARD_INTERFACE}") >/dev/null 2>&1 || true
+    if ! wg set "${WIREGUARD_INTERFACE}" peer "${worker_public_key}" remove >/dev/null 2>&1; then
+      return 1
+    fi
+    if ! wg syncconf "${WIREGUARD_INTERFACE}" <(wg-quick strip "${WIREGUARD_INTERFACE}") >/dev/null 2>&1; then
+      return 1
+    fi
   fi
 }
 
@@ -3042,10 +3583,18 @@ cluster_check_worker_database_record() {
     echo "[$(text prefix_error)] Docker is required to verify the existing Worker database record." >&2
     return 1
   fi
+  local compose_file="docker-compose.cluster-main.yml"
+  if [[ ! -f "${INSTALL_DIR}/${compose_file}" ]]; then
+    echo "[$(text prefix_error)] cluster main Compose file is missing: ${INSTALL_DIR}/${compose_file}" >&2
+    return 1
+  fi
   local found=""
-  if ! found="$(docker exec -e PGPASSWORD="${POSTGRES_PASSWORD}" chatgpt2api-postgres \
-    psql -U chatgpt2api_runtime -d chatgpt2api_image_queue -tAc \
-    "SELECT 1 FROM image_worker_state WHERE worker_id='${worker_id}' LIMIT 1;" 2>/dev/null)"; then
+  if ! found="$(
+    cd "${INSTALL_DIR}" && \
+    docker compose -f "${compose_file}" exec -T -e PGPASSWORD="${POSTGRES_PASSWORD}" postgres \
+      psql -U chatgpt2api_runtime -d chatgpt2api_image_queue -tAc \
+      "SELECT 1 FROM image_worker_state WHERE worker_id='${worker_id}' LIMIT 1;" 2>/dev/null
+  )"; then
     echo "[$(text prefix_error)] failed to query the existing Worker database record: ${worker_id}" >&2
     return 1
   fi
@@ -3084,17 +3633,81 @@ cluster_urlencode() {
 }
 
 cluster_external_app_db_url() {
-  printf 'postgresql://%s:%s@%s:5432/chatgpt2api_app' \
+  printf 'postgresql://%s:%s@%s:%s/chatgpt2api_app' \
     "$(cluster_urlencode "chatgpt2api_runtime")" \
     "$(cluster_urlencode "${POSTGRES_PASSWORD}")" \
-    "${WIREGUARD_SERVER_IP}"
+    "${WIREGUARD_SERVER_IP}" \
+    "${POSTGRES_PORT}"
 }
 
 cluster_external_queue_db_url() {
-  printf 'postgresql://%s:%s@%s:5432/chatgpt2api_image_queue' \
+  printf 'postgresql://%s:%s@%s:%s/chatgpt2api_image_queue' \
     "$(cluster_urlencode "chatgpt2api_runtime")" \
     "$(cluster_urlencode "${POSTGRES_PASSWORD}")" \
-    "${WIREGUARD_SERVER_IP}"
+    "${WIREGUARD_SERVER_IP}" \
+    "${POSTGRES_PORT}"
+}
+
+# The built-in PostgreSQL runs inside the Compose project and is only reachable at the
+# `postgres` service hostname, so the URLs are the reliable signal for whether an
+# install owns its database. An existing install that points somewhere else keeps using
+# that database, and its built-in service stays switched off.
+database_url_targets_builtin_postgres() {
+  local url="${1-}"
+  [[ "${url}" == *"@postgres:5432/"* ]]
+}
+
+resolve_builtin_postgres_usage() {
+  # A Worker reaches the main node's database over WireGuard and never owns one.
+  if [[ "${NODE_ROLE:-standalone}" == "worker" ]]; then
+    USE_BUILTIN_POSTGRES="0"
+    return
+  fi
+  # The main node always owns the cluster database. Its URLs point at the WireGuard
+  # address rather than the service hostname, so they cannot be used to detect this.
+  if [[ "${NODE_ROLE:-standalone}" == "api-main" ]]; then
+    USE_BUILTIN_POSTGRES="1"
+    return
+  fi
+  if [[ "${STORAGE_BACKEND:-postgres}" != "postgres" ]]; then
+    # A legacy JSON/SQLite/Git install still needs the image queue database, so decide
+    # from the queue URL alone.
+    if database_url_targets_builtin_postgres "${IMAGE_QUEUE_DATABASE_URL:-}"; then
+      USE_BUILTIN_POSTGRES="1"
+    else
+      USE_BUILTIN_POSTGRES="0"
+    fi
+    return
+  fi
+  if database_url_targets_builtin_postgres "${DATABASE_URL:-}" \
+    || database_url_targets_builtin_postgres "${APP_DATABASE_URL:-}" \
+    || database_url_targets_builtin_postgres "${IMAGE_QUEUE_DATABASE_URL:-}"; then
+    USE_BUILTIN_POSTGRES="1"
+    return
+  fi
+  USE_BUILTIN_POSTGRES="0"
+}
+
+# Compose reads COMPOSE_PROFILES from .env, so persisting it keeps a bare
+# `docker compose up -d` in the install directory consistent with the installer.
+compose_profiles_value() {
+  if [[ "${USE_BUILTIN_POSTGRES:-0}" == "1" ]]; then
+    printf 'builtin-postgres'
+    return
+  fi
+  printf ''
+}
+
+cluster_internal_app_db_url() {
+  printf 'postgresql+psycopg2://%s:%s@postgres:5432/chatgpt2api_app' \
+    "$(cluster_urlencode "chatgpt2api_runtime")" \
+    "$(cluster_urlencode "${POSTGRES_PASSWORD}")"
+}
+
+cluster_internal_queue_db_url() {
+  printf 'postgresql+psycopg2://%s:%s@postgres:5432/chatgpt2api_image_queue' \
+    "$(cluster_urlencode "chatgpt2api_runtime")" \
+    "$(cluster_urlencode "${POSTGRES_PASSWORD}")"
 }
 
 cluster_join_payload_json() {
@@ -3153,7 +3766,6 @@ cluster_run_join_payload_python() {
   local payload_json="$4"
   local python_code=""
   python_code="$(cat <<'PY'
-import json
 import os
 import sys
 
@@ -3227,6 +3839,7 @@ cluster_revoke_join_token() {
 cluster_revoke_pending_worker() {
   local worker_id="$1"
   if ! (cd "${INSTALL_DIR}" && CHATGPT2API_WORKER_ID_TO_REVOKE="${worker_id}" docker compose -f docker-compose.cluster-main.yml exec -T -e CHATGPT2API_WORKER_ID_TO_REVOKE app /app/.venv/bin/python - <<'PY'
+import json
 import os
 import sys
 
@@ -3241,11 +3854,74 @@ except Exception as exc:
 if revoked is None:
     print("pending worker join not found", file=sys.stderr)
     sys.exit(1)
+print(revoked["status"])
 PY
   ); then
     echo "[$(text prefix_error)] failed to revoke pending worker join for ${worker_id}." >&2
     return 1
   fi
+}
+
+cluster_restore_rotated_worker_join() {
+  local worker_id="$1"
+  local worker_ip="$2"
+  local worker_public_key="$3"
+  local registry="$4"
+  local join_file="$5"
+  local registry_backup="$6"
+  local join_backup="$7"
+  local peer_removed="${8:-0}"
+  local original_status="${9:-joined}"
+  local restore_failed="0"
+  local restore_payload_json=""
+
+  if [[ -f "${registry_backup}" ]]; then
+    if ! cp -f -- "${registry_backup}" "${registry}"; then
+      restore_failed="1"
+    fi
+  fi
+
+  if [[ -f "${join_backup}" ]]; then
+    if ! cp -f -- "${join_backup}" "${join_file}"; then
+      restore_failed="1"
+    fi
+    restore_payload_json="$(
+      (
+        cluster_read_join_file "${join_backup}"
+        cluster_join_payload_json
+      )
+    )" || restore_failed="1"
+    if [[ -n "${restore_payload_json}" ]]; then
+      if ! cluster_run_join_payload_python docker-compose.cluster-main.yml exec issue "${restore_payload_json}"; then
+        restore_failed="1"
+      elif [[ "${original_status}" == "joined" ]]; then
+        if ! cluster_run_join_payload_python docker-compose.cluster-main.yml exec consume "${restore_payload_json}"; then
+          restore_failed="1"
+        elif ! cluster_run_join_payload_python docker-compose.cluster-main.yml exec activate "${restore_payload_json}"; then
+          restore_failed="1"
+        fi
+      elif [[ "${original_status}" == "activation_failed" ]]; then
+        if ! cluster_run_join_payload_python docker-compose.cluster-main.yml exec consume "${restore_payload_json}"; then
+          restore_failed="1"
+        elif ! cluster_run_join_payload_python docker-compose.cluster-main.yml exec mark-failed "${restore_payload_json}"; then
+          restore_failed="1"
+        fi
+      fi
+    fi
+  fi
+
+  if [[ "${peer_removed}" == "1" ]]; then
+    if ! cluster_add_wireguard_peer "${worker_id}" "${worker_ip}" "${worker_public_key}"; then
+      restore_failed="1"
+    fi
+  fi
+
+  if [[ "${restore_failed}" == "1" ]]; then
+    echo "[$(text prefix_warn)] failed to fully restore the old worker join after rotation failure; please verify ${worker_id} manually." >&2
+    return 1
+  fi
+
+  trash_path "${registry_backup}" "${join_backup}" || true
 }
 
 cluster_validate_join_token() {
@@ -3322,13 +3998,113 @@ cluster_prepare_main_bundle() {
   need_cmd curl
   validate_existing_deployment_dir || exit 1
   mkdir -p "${INSTALL_DIR}/deploy/postgres-init" "${INSTALL_DIR}/data" "${INSTALL_DIR}/join"
+  download_file "deploy/install.sh"
+  download_file "deploy/cluster-join-helper.sh"
   download_file "docker-compose.cluster-main.yml"
   download_file "deploy/postgres-init/001-create-cluster-databases.sh"
   download_file "deploy/nginx-worker-images.example.conf"
   if [[ ! -f "${INSTALL_DIR}/deploy/release-manifest.env" ]]; then
     download_optional_or_fail "deploy/release-manifest.env"
   fi
+  chmod +x "${INSTALL_DIR}/deploy/install.sh" "${INSTALL_DIR}/deploy/cluster-join-helper.sh" || true
   chmod +x "${INSTALL_DIR}/deploy/postgres-init/001-create-cluster-databases.sh" || true
+}
+
+cluster_join_helper_service_name() {
+  local prefix="${CHATGPT2API_INSTANCE_PREFIX:-chatgpt2api}"
+  prefix="$(sanitize_compose_project_name "${prefix}")"
+  printf 'chatgpt2api-%s-join-helper.service' "${prefix}"
+}
+
+cluster_stop_join_helper() {
+  local service_name=""
+  local unit_file=""
+  local pid_file="${INSTALL_DIR}/data/chatgpt2api-join-helper.pid"
+  service_name="$(cluster_join_helper_service_name)"
+  unit_file="/etc/systemd/system/${service_name}"
+
+  if [[ -f "${unit_file}" ]] && command -v systemctl >/dev/null 2>&1 && [[ "${EUID:-$(id -u)}" == "0" ]]; then
+    if systemctl is-active --quiet "${service_name}"; then
+      systemctl stop "${service_name}" >/dev/null 2>&1 || return 1
+    fi
+    systemctl disable "${service_name}" >/dev/null 2>&1 || true
+  fi
+
+  if [[ -f "${pid_file}" ]]; then
+    local pid=""
+    pid="$(cat "${pid_file}" 2>/dev/null || true)"
+    if [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
+      local command_line=""
+      command_line="$(ps -p "${pid}" -o args= 2>/dev/null || true)"
+      if [[ "${command_line}" == *"cluster-join-helper.sh"* && "${command_line}" == *"${INSTALL_DIR}"* ]]; then
+        kill -TERM "${pid}" 2>/dev/null || true
+        local stop_deadline=$(( $(date +%s) + 10 ))
+        while kill -0 "${pid}" 2>/dev/null && (( $(date +%s) < stop_deadline )); do
+          sleep 1
+        done
+        if kill -0 "${pid}" 2>/dev/null; then
+          kill -KILL "${pid}" 2>/dev/null || true
+        fi
+      fi
+    fi
+    trash_path "${pid_file}" || true
+  fi
+}
+
+cluster_start_join_helper() {
+  if [[ "${NODE_ROLE:-}" != "api-main" ]]; then
+    return 0
+  fi
+  local helper_script="${INSTALL_DIR}/deploy/cluster-join-helper.sh"
+  if [[ ! -x "${helper_script}" ]]; then
+    echo "[$(text prefix_error)] Worker join helper is missing: ${helper_script}" >&2
+    return 1
+  fi
+  mkdir -p "${INSTALL_DIR}/data/cluster-join-requests"
+  chmod 700 "${INSTALL_DIR}/data/cluster-join-requests" || true
+  chown 10001:10001 "${INSTALL_DIR}/data/cluster-join-requests" 2>/dev/null || true
+  cluster_stop_join_helper
+
+  local service_name=""
+  service_name="$(cluster_join_helper_service_name)"
+  local unit_file="/etc/systemd/system/${service_name}"
+  if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1 && [[ "${EUID:-$(id -u)}" == "0" ]]; then
+    local install_dir_escaped=""
+    local helper_script_escaped=""
+    install_dir_escaped="$(systemd_escape_path_value "${INSTALL_DIR}")"
+    helper_script_escaped="$(systemd_escape_path_value "${helper_script}")"
+    cat >"${unit_file}" <<EOF
+[Unit]
+Description=chatgpt2api Worker join helper
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${install_dir_escaped}
+ExecStart=/bin/bash ${helper_script_escaped} ${install_dir_escaped}
+Restart=always
+RestartSec=2
+StandardOutput=append:${install_dir_escaped}/data/cluster-join-helper.log
+StandardError=append:${install_dir_escaped}/data/cluster-join-helper.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    if systemctl daemon-reload \
+      && systemctl enable --now "${service_name}" >/dev/null 2>&1; then
+      ui_println "[$(text prefix_info)] Worker join helper is running: ${service_name}"
+      return 0
+    fi
+    echo "[$(text prefix_warn)] failed to start ${service_name}; using the managed fallback process." >&2
+  fi
+
+  local pid_file="${INSTALL_DIR}/data/chatgpt2api-join-helper.pid"
+  local log_file="${INSTALL_DIR}/data/cluster-join-helper.log"
+  nohup /bin/bash "${helper_script}" "${INSTALL_DIR}" >>"${log_file}" 2>&1 &
+  printf '%s\n' "$!" >"${pid_file}"
+  chmod 600 "${pid_file}" || true
+  ui_println "[$(text prefix_info)] Worker join helper is running in the background."
 }
 
 cluster_prepare_worker_bundle() {
@@ -3565,6 +4341,7 @@ WIREGUARD_IP=${worker_ip}
 WIREGUARD_SERVER_IP=${WIREGUARD_SERVER_IP}
 WIREGUARD_SERVER_ENDPOINT=${WIREGUARD_SERVER_ENDPOINT}
 WIREGUARD_PORT=${WIREGUARD_PORT}
+POSTGRES_PORT=${POSTGRES_PORT}
 WIREGUARD_SERVER_PUBLIC_KEY=${server_public_key}
 WIREGUARD_WORKER_PRIVATE_KEY=${worker_private_key}
 WIREGUARD_WORKER_PUBLIC_KEY=${worker_public_key}
@@ -3631,9 +4408,10 @@ EOF
 
   ui_println "Worker join file:"
   ui_println "${join_file}"
+  print_worker_join_placement "/opt/chatgpt2api" "${worker_id}"
   ui_println "Copy this join file to the worker and run:"
-  ui_println "bash install.sh worker ${INSTALL_DIR}/join/${worker_id}.join"
-  ui_println "Copy join-signing.pub independently to ${INSTALL_DIR}/join/join-signing.pub on that worker, or set CHATGPT2API_JOIN_SIGNING_PUBLIC_KEY_B64."
+  ui_println "bash install.sh worker /opt/chatgpt2api/join/${worker_id}.join"
+  ui_println "If the Worker uses another install directory, replace /opt/chatgpt2api with that directory."
   ui_println "Do not reuse ${worker_id}."
 }
 
@@ -3655,12 +4433,19 @@ cluster_verify_join_file() {
     exit 1
   fi
   local trusted_public_key_b64="${CHATGPT2API_JOIN_SIGNING_PUBLIC_KEY_B64:-}"
+  local join_file_dir=""
+  local colocated_public_key_file=""
+  join_file_dir="$(cd "$(dirname "${join_file}")" && pwd -P)"
+  colocated_public_key_file="${join_file_dir}/join-signing.pub"
   local trusted_public_key_file="${INSTALL_DIR}/join/join-signing.pub"
+  if [[ -z "${trusted_public_key_b64}" && -f "${colocated_public_key_file}" ]]; then
+    trusted_public_key_b64="$(cluster_base64_file "${colocated_public_key_file}")"
+  fi
   if [[ -z "${trusted_public_key_b64}" && -f "${trusted_public_key_file}" ]]; then
     trusted_public_key_b64="$(cluster_base64_file "${trusted_public_key_file}")"
   fi
   if [[ -z "${trusted_public_key_b64}" ]]; then
-    echo "[$(text prefix_error)] trusted join signing public key is required. Copy join-signing.pub independently or set CHATGPT2API_JOIN_SIGNING_PUBLIC_KEY_B64." >&2
+    echo "[$(text prefix_error)] trusted join signing public key is required. Put join-signing.pub next to the join file, copy it to ${INSTALL_DIR}/join/, or set CHATGPT2API_JOIN_SIGNING_PUBLIC_KEY_B64." >&2
     exit 1
   fi
   if [[ "${trusted_public_key_b64}" != "${public_key_b64}" ]]; then
@@ -3703,6 +4488,7 @@ cluster_read_join_file() {
   WIREGUARD_SERVER_IP=""
   WIREGUARD_SERVER_ENDPOINT=""
   WIREGUARD_PORT=""
+  POSTGRES_PORT=""
   WIREGUARD_SERVER_PUBLIC_KEY=""
   WIREGUARD_WORKER_PRIVATE_KEY=""
   WIREGUARD_WORKER_PUBLIC_KEY=""
@@ -3726,6 +4512,7 @@ cluster_read_join_file() {
       WIREGUARD_SERVER_IP) WIREGUARD_SERVER_IP="${value}" ;;
       WIREGUARD_SERVER_ENDPOINT) WIREGUARD_SERVER_ENDPOINT="${value}" ;;
       WIREGUARD_PORT) WIREGUARD_PORT="${value}" ;;
+      POSTGRES_PORT) POSTGRES_PORT="${value}" ;;
       WIREGUARD_SERVER_PUBLIC_KEY) WIREGUARD_SERVER_PUBLIC_KEY="${value}" ;;
       WIREGUARD_WORKER_PRIVATE_KEY) WIREGUARD_WORKER_PRIVATE_KEY="${value}" ;;
       WIREGUARD_WORKER_PUBLIC_KEY) WIREGUARD_WORKER_PUBLIC_KEY="${value}" ;;
@@ -3750,6 +4537,12 @@ cluster_read_join_file() {
 
   if [[ "${JOIN_VERSION}" != "1" ]]; then
     echo "[$(text prefix_error)] unsupported join file version: ${JOIN_VERSION}" >&2
+    exit 1
+  fi
+  if [[ -z "${POSTGRES_PORT}" ]]; then
+    POSTGRES_PORT="5432"
+  fi
+  if ! cluster_validate_postgres_port "${POSTGRES_PORT}"; then
     exit 1
   fi
   if [[ ! "${WORKER_ID}" =~ ^worker-[0-9]+$ ]]; then
@@ -4057,8 +4850,9 @@ cluster_main_cmd() {
   RUN_WORKER="false"
   STORAGE_BACKEND="postgres"
   ensure_admin_auth_key || exit 1
+  BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
   if ! is_noninteractive; then
-    BASE_URL="$(prompt_input "图片查看 URL（API/图片公网地址，建议包含 /images）" "${BASE_URL}")"
+    BASE_URL="$(prompt_input "主控后台/API 公开访问根 URL（不要带 /images）" "${BASE_URL}")"
     PORT="$(prompt_input "$(text prompt_port)" "${PORT}")"
     if [[ -z "${POSTGRES_PASSWORD}" ]]; then
       POSTGRES_PASSWORD="$(prompt_input "PostgreSQL 密码" "")"
@@ -4070,11 +4864,12 @@ cluster_main_cmd() {
       WIREGUARD_SERVER_ENDPOINT="$(prompt_input "WireGuard 主节点公网 IP/域名" "${WIREGUARD_SERVER_ENDPOINT}")"
     fi
     WIREGUARD_PORT="$(prompt_input "WireGuard 端口" "${WIREGUARD_PORT}")"
+    POSTGRES_PORT="$(prompt_input "PostgreSQL 对外端口" "${POSTGRES_PORT}")"
     INSTALL_DIR="$(prompt_input "$(text prompt_dir)" "${INSTALL_DIR}")"
     BRANCH="$(prompt_input "$(text prompt_branch)" "${BRANCH}")"
     RELEASE_REF_SELECTED="1"
   fi
-  if [[ "${RELEASE_REF_SELECTED}" == "1" ]]; then
+  if should_load_release_manifest; then
     load_release_manifest
   fi
   if [[ -z "${POSTGRES_PASSWORD}" ]]; then
@@ -4091,6 +4886,11 @@ cluster_main_cmd() {
   APP_DATABASE_URL="$(cluster_external_app_db_url)"
   DATABASE_URL="${APP_DATABASE_URL}"
   IMAGE_QUEUE_DATABASE_URL="$(cluster_external_queue_db_url)"
+  ensure_instance_prefix
+  resolve_builtin_postgres_usage
+  if ! ensure_builtin_postgres_password; then
+    exit 1
+  fi
 
   local first_worker_choice_status="0"
   resolve_create_first_worker || first_worker_choice_status="$?"
@@ -4101,7 +4901,7 @@ cluster_main_cmd() {
     create_first_worker="1"
   fi
   validate_inputs
-  print_install_summary
+  print_install_summary pending
   confirm_installation
   cluster_prepare_main_bundle
   write_default_config_json
@@ -4122,6 +4922,14 @@ cluster_main_cmd() {
   cluster_up_compose "docker-compose.cluster-main.yml" app
   cluster_wait_service_healthy "docker-compose.cluster-main.yml" app 180
   wait_cluster_main_liveness
+  if ! cluster_ensure_join_signing_key; then
+    echo "[$(text prefix_error)] failed to initialize the Worker join signing key." >&2
+    exit 1
+  fi
+  if ! cluster_start_join_helper; then
+    echo "[$(text prefix_error)] failed to start the Worker join helper." >&2
+    exit 1
+  fi
 
   if [[ "${create_first_worker}" == "1" ]]; then
     local first_worker=""
@@ -4159,7 +4967,11 @@ cluster_worker_cmd() {
   if [[ -z "${join_file}" ]]; then
     join_file="$(cluster_resolve_worker_join_file)" || exit 1
     if [[ ! -f "${join_file}" ]] && ! is_noninteractive; then
-      join_file="$(prompt_input "Worker join 文件路径" "${join_file}")"
+      ui_println "请将主节点生成的 worker-N.join 和 join-signing.pub 放到 Worker 节点的 ${INSTALL_DIR%/}/join/："
+      ui_println "  ${INSTALL_DIR%/}/join/worker-N.join"
+      ui_println "  ${INSTALL_DIR%/}/join/join-signing.pub"
+      ui_println "下方也可以填写其他 join 文件路径。"
+      join_file="$(prompt_input "Worker join 文件路径（默认查找目录：${INSTALL_DIR%/}/join）" "${join_file}")"
     fi
   fi
   cluster_verify_join_file "${join_file}"
@@ -4183,6 +4995,7 @@ cluster_worker_cmd() {
     IMAGE_PORT="$(prompt_input "图片端口" "${IMAGE_PORT}")"
     INSTALL_DIR="$(prompt_input "$(text prompt_dir)" "${INSTALL_DIR}")"
   fi
+  print_worker_join_placement "${INSTALL_DIR}" "${WORKER_ID:-worker-N}"
   if [[ -z "${IMAGE_BASE_URL}" ]]; then
     echo "[$(text prefix_error)] CHATGPT2API_IMAGE_BASE_URL is required." >&2
     exit 1
@@ -4193,8 +5006,10 @@ cluster_worker_cmd() {
   POSTGRES_ADMIN_USER=""
   POSTGRES_ADMIN_PASSWORD=""
   DATABASE_URL="${APP_DATABASE_URL}"
+  ensure_instance_prefix
+  resolve_builtin_postgres_usage
   validate_inputs
-  print_install_summary
+  print_install_summary pending
   confirm_installation
   cluster_prepare_worker_bundle
   cluster_write_worker_nginx_config
@@ -4314,6 +5129,7 @@ cluster_wait_worker_runtime_health() {
 cluster_create_worker_cmd() {
   choose_language
   if [[ -z "${INSTALL_DIR}" ]]; then INSTALL_DIR="$(prompt_input "$(text prompt_dir)" "${INSTALL_DIR}")"; fi
+  load_existing_install_env
   cluster_write_join_file "${1:-}"
 }
 
@@ -4324,8 +5140,14 @@ cluster_rotate_worker_cmd() {
   local worker_id="worker-${worker_no}"
   local registry="${INSTALL_DIR}/join/workers.tsv"
   local join_file="${INSTALL_DIR}/join/${worker_id}.join"
+  local registry_backup="${registry}.bak.$$"
+  local join_backup="${join_file}.bak.$$"
   local worker_public_key=""
+  local worker_ip=""
+  local peer_removed="0"
+  local revoked_status=""
   cluster_worker_ip "${worker_no}" >/dev/null
+  worker_ip="$(cluster_worker_ip "${worker_no}")"
   cluster_load_env
   if [[ ! -f "${registry}" ]]; then
     echo "[$(text prefix_error)] worker registry does not exist: ${registry}" >&2
@@ -4336,14 +5158,42 @@ cluster_rotate_worker_cmd() {
     echo "[$(text prefix_error)] ${worker_id} does not exist in the worker registry." >&2
     exit 1
   fi
-  if ! cluster_revoke_pending_worker "${worker_id}"; then
+  if [[ ! -f "${join_file}" ]]; then
+    echo "[$(text prefix_error)] worker join file does not exist: ${join_file}" >&2
     exit 1
   fi
-  cluster_remove_wireguard_peer "${worker_id}" "${worker_public_key}"
+  if ! cp -f -- "${registry}" "${registry_backup}"; then
+    echo "[$(text prefix_error)] failed to back up the worker registry before rotation." >&2
+    exit 1
+  fi
+  if ! cp -f -- "${join_file}" "${join_backup}"; then
+    trash_path "${registry_backup}"
+    echo "[$(text prefix_error)] failed to back up the worker join file before rotation." >&2
+    exit 1
+  fi
+  if ! revoked_status="$(cluster_revoke_pending_worker "${worker_id}")"; then
+    trash_path "${registry_backup}" "${join_backup}"
+    return 1
+  fi
+  if ! cluster_remove_wireguard_peer "${worker_id}" "${worker_public_key}"; then
+    cluster_restore_rotated_worker_join "${worker_id}" "${worker_ip}" "${worker_public_key}" "${registry}" "${join_file}" "${registry_backup}" "${join_backup}" "${peer_removed}" "${revoked_status:-joined}"
+    return 1
+  fi
+  peer_removed="1"
   awk -F '\t' -v worker="${worker_id}" '$1 != worker { print }' "${registry}" >"${registry}.tmp.$$"
-  mv "${registry}.tmp.$$" "${registry}"
-  trash_path "${join_file}"
-  cluster_write_join_file "${worker_no}"
+  if ! mv "${registry}.tmp.$$" "${registry}"; then
+    cluster_restore_rotated_worker_join "${worker_id}" "${worker_ip}" "${worker_public_key}" "${registry}" "${join_file}" "${registry_backup}" "${join_backup}" "${peer_removed}" "${revoked_status:-joined}"
+    return 1
+  fi
+  if ! trash_path "${join_file}"; then
+    cluster_restore_rotated_worker_join "${worker_id}" "${worker_ip}" "${worker_public_key}" "${registry}" "${join_file}" "${registry_backup}" "${join_backup}" "${peer_removed}" "${revoked_status:-joined}"
+    return 1
+  fi
+  if ! ( cluster_write_join_file "${worker_no}" ); then
+    cluster_restore_rotated_worker_join "${worker_id}" "${worker_ip}" "${worker_public_key}" "${registry}" "${join_file}" "${registry_backup}" "${join_backup}" "${peer_removed}" "${revoked_status:-joined}"
+    return 1
+  fi
+  trash_path "${registry_backup}" "${join_backup}" || true
 }
 
 cluster_cleanup_consumed_join_files() {
@@ -4411,33 +5261,49 @@ cluster_status_cmd() {
       fi
     done <"${INSTALL_DIR}/join/workers.tsv"
   fi
-  if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx chatgpt2api-postgres; then
+  local postgres_compose_file=""
+  if [[ -f "${INSTALL_DIR}/docker-compose.cluster-main.yml" ]]; then
+    postgres_compose_file="docker-compose.cluster-main.yml"
+  elif [[ -f "${INSTALL_DIR}/docker-compose.yml" ]]; then
+    postgres_compose_file="docker-compose.yml"
+  elif [[ -f "${INSTALL_DIR}/docker-compose.warp.yml" ]]; then
+    postgres_compose_file="docker-compose.warp.yml"
+  fi
+  if command -v docker >/dev/null 2>&1 \
+    && docker compose version >/dev/null 2>&1 \
+    && [[ -n "${postgres_compose_file}" ]] \
+    && [[ -n "$(cd "${INSTALL_DIR}" && docker compose -f "${postgres_compose_file}" ps -q postgres 2>/dev/null || true)" ]]; then
     ui_println "PostgreSQL status:"
-    if docker exec chatgpt2api-postgres pg_isready -U chatgpt2api_runtime -d chatgpt2api_app >/dev/null 2>&1; then
+    if (cd "${INSTALL_DIR}" && docker compose -f "${postgres_compose_file}" exec -T postgres \
+      pg_isready -U chatgpt2api_runtime -d chatgpt2api_app) >/dev/null 2>&1; then
       ui_println "[OK] app database chatgpt2api_app is ready"
     else
       ui_println "[WARN] app database chatgpt2api_app is not ready"
     fi
-    if docker exec chatgpt2api-postgres pg_isready -U chatgpt2api_runtime -d chatgpt2api_image_queue >/dev/null 2>&1; then
+    if (cd "${INSTALL_DIR}" && docker compose -f "${postgres_compose_file}" exec -T postgres \
+      pg_isready -U chatgpt2api_runtime -d chatgpt2api_image_queue) >/dev/null 2>&1; then
       ui_println "[OK] image queue database chatgpt2api_image_queue is ready"
     else
       ui_println "[WARN] image queue database chatgpt2api_image_queue is not ready"
     fi
     ui_println "Queue depth:"
-    docker exec -e PGPASSWORD="${POSTGRES_PASSWORD}" chatgpt2api-postgres \
+    (cd "${INSTALL_DIR}" && docker compose -f "${postgres_compose_file}" exec -T \
+      -e PGPASSWORD="${POSTGRES_PASSWORD}" postgres \
       psql -U chatgpt2api_runtime -d chatgpt2api_image_queue -P pager=off -c \
       "SELECT (SELECT count(*) FROM image_tasks WHERE status IN ('queued','retrying')) AS queued_tasks, (SELECT count(*) FROM image_jobs WHERE status IN ('queued','retry_wait')) AS queued_jobs, (SELECT count(*) FROM image_jobs WHERE status IN ('leased','running')) AS active_jobs, (SELECT count(*) FROM image_account_leases WHERE expires_at > now()) AS active_account_leases, (SELECT count(*) FROM image_tasks WHERE status = 'success' AND delivery_status <> 'acknowledged') AS unacknowledged_success, (SELECT min(created_at) FROM image_tasks WHERE status = 'queued') AS oldest_queued_at;" \
-      >"${UI_OUT}" 2>&1 || true
+      >"${UI_OUT}" 2>&1 || true)
     ui_println "Join records:"
-    docker exec -e PGPASSWORD="${POSTGRES_PASSWORD}" chatgpt2api-postgres \
+    (cd "${INSTALL_DIR}" && docker compose -f "${postgres_compose_file}" exec -T \
+      -e PGPASSWORD="${POSTGRES_PASSWORD}" postgres \
       psql -U chatgpt2api_runtime -d chatgpt2api_app -P pager=off -c \
       "SELECT worker_id, wireguard_ip, status, expires_at, joined_at FROM chatgpt2api_worker_join_token ORDER BY worker_no;" \
-      >"${UI_OUT}" 2>&1 || true
+      >"${UI_OUT}" 2>&1 || true)
     ui_println "Worker heartbeats:"
-    docker exec -e PGPASSWORD="${POSTGRES_PASSWORD}" chatgpt2api-postgres \
+    (cd "${INSTALL_DIR}" && docker compose -f "${postgres_compose_file}" exec -T \
+      -e PGPASSWORD="${POSTGRES_PASSWORD}" postgres \
       psql -U chatgpt2api_runtime -d chatgpt2api_image_queue -P pager=off -c \
       "SELECT worker_id, heartbeat_at, effective_concurrency, pause_reason FROM image_worker_state ORDER BY heartbeat_at DESC;" \
-      >"${UI_OUT}" 2>&1 || true
+      >"${UI_OUT}" 2>&1 || true)
   fi
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 && [[ -d "${INSTALL_DIR}" ]]; then
     if [[ "${NODE_ROLE:-}" == "worker" ]]; then
@@ -4651,18 +5517,22 @@ cluster_worker_check_cmd() {
     fi
   fi
 
-  if command -v nc >/dev/null 2>&1; then
-    if nc -z -w 3 "${WIREGUARD_SERVER_IP}" 5432 >/dev/null 2>&1; then
-      ui_println "[OK] PostgreSQL ${WIREGUARD_SERVER_IP}:5432 reachable"
+  local postgres_port="${POSTGRES_PORT:-5432}"
+  if ! cluster_validate_postgres_port "${postgres_port}"; then
+    ui_println "[FAILED] PostgreSQL port is invalid: ${postgres_port}"
+    failures=$((failures + 1))
+  elif command -v nc >/dev/null 2>&1; then
+    if nc -z -w 3 "${WIREGUARD_SERVER_IP}" "${postgres_port}" >/dev/null 2>&1; then
+      ui_println "[OK] PostgreSQL ${WIREGUARD_SERVER_IP}:${postgres_port} reachable"
     else
-      ui_println "[FAILED] cannot connect PostgreSQL ${WIREGUARD_SERVER_IP}:5432"
+      ui_println "[FAILED] cannot connect PostgreSQL ${WIREGUARD_SERVER_IP}:${postgres_port}"
       failures=$((failures + 1))
     fi
   elif command -v timeout >/dev/null 2>&1; then
-    if timeout 3 bash -c "cat < /dev/null > /dev/tcp/${WIREGUARD_SERVER_IP}/5432" >/dev/null 2>&1; then
-      ui_println "[OK] PostgreSQL ${WIREGUARD_SERVER_IP}:5432 reachable"
+    if timeout 3 bash -c "cat < /dev/null > /dev/tcp/${WIREGUARD_SERVER_IP}/${postgres_port}" >/dev/null 2>&1; then
+      ui_println "[OK] PostgreSQL ${WIREGUARD_SERVER_IP}:${postgres_port} reachable"
     else
-      ui_println "[FAILED] cannot connect PostgreSQL ${WIREGUARD_SERVER_IP}:5432"
+      ui_println "[FAILED] cannot connect PostgreSQL ${WIREGUARD_SERVER_IP}:${postgres_port}"
       failures=$((failures + 1))
     fi
   else
@@ -4970,6 +5840,7 @@ main() {
   parse_args "$@"
 
   local noninteractive="0"
+  local explicit_base_url=""
   if [[ "${NONINTERACTIVE}" =~ ^(1|true|TRUE|yes|YES|y|Y)$ ]]; then
     noninteractive="1"
     INSTALL_LANG="${INSTALL_LANG:-zh}"
@@ -5008,48 +5879,97 @@ main() {
       ;;
   esac
   apply_install_storage_defaults
+  if [[ "${INSTALL_TARGET}" == "standalone" && "${INSTALL_EXISTING}" != "1" ]]; then
+    if [[ -n "${MODE}" ]]; then
+      MODE="$(normalize_mode_choice "${MODE}")" || {
+        echo "[$(text prefix_error)] $(text err_mode)" >&2
+        exit 1
+      }
+      if [[ "${MODE}" != "docker" ]]; then
+        echo "[$(text prefix_error)] $(text err_standalone_mode)" >&2
+        exit 1
+      fi
+    else
+      MODE="docker"
+    fi
+  fi
+  ensure_instance_prefix
 
   if [[ "${noninteractive}" == "1" ]]; then
     MODE="${MODE:-docker}"
     MODE="$(normalize_mode_choice "${MODE}")" || { echo "[$(text prefix_error)] $(text err_mode)" >&2; exit 1; }
   else
-    if [[ -z "${MODE}" ]]; then
-      MODE="$(prompt_mode_choice "docker")"
-    else
-      MODE="$(normalize_mode_choice "${MODE}")" || { echo "[$(text prefix_error)] $(text err_mode)" >&2; exit 1; }
-    fi
-    ensure_admin_auth_key || exit 1
-    BASE_URL="$(prompt_input "图片查看 URL（API/图片公网地址，建议包含 /images）" "${BASE_URL}")"
-    PORT="$(prompt_input "$(text prompt_port)" "${PORT}")"
-    THREAD_TOKENS="$(prompt_input "$(text prompt_thread_tokens)" "${THREAD_TOKENS}")"
-    while [[ "${STORAGE_BACKEND}" == "postgres" && -z "${DATABASE_URL}" ]]; do
-      DATABASE_URL="$(prompt_input "PostgreSQL DATABASE_URL" "${DATABASE_URL}")"
-      if [[ -z "${DATABASE_URL}" ]]; then
-        ui_println "[$(text prefix_error)] PostgreSQL DATABASE_URL is required."
-      fi
-    done
-    while [[ -z "${IMAGE_QUEUE_DATABASE_URL}" ]]; do
-      IMAGE_QUEUE_DATABASE_URL="$(prompt_input "Image queue PostgreSQL DATABASE_URL" "${IMAGE_QUEUE_DATABASE_URL}")"
-      if [[ -z "${IMAGE_QUEUE_DATABASE_URL}" ]]; then
-        ui_println "[$(text prefix_error)] Image queue PostgreSQL DATABASE_URL is required."
-      fi
-    done
-    INSTALL_DIR="$(prompt_input "$(text prompt_dir)" "${INSTALL_DIR}")"
-    BRANCH="$(prompt_input "$(text prompt_branch)" "${BRANCH}")"
-    RELEASE_REF_SELECTED="1"
-
-    if [[ "${MODE}" == "docker" ]]; then
-      if confirm "$(text prompt_warp)" "${WITH_WARP}"; then
-        WITH_WARP="1"
+    if [[ "${INSTALL_TARGET}" == "standalone" ]]; then
+      # Only a new install gets to decide these. Rerunning the installer over an
+      # existing deployment must not silently switch its runtime or tear down an
+      # egress stack it was configured with, so a rerun keeps whatever .env holds.
+      if [[ "${INSTALL_EXISTING}" == "1" ]]; then
+        if [[ -n "${MODE}" ]]; then
+          MODE="$(normalize_mode_choice "${MODE}")" || { echo "[$(text prefix_error)] $(text err_mode)" >&2; exit 1; }
+        else
+          MODE="docker"
+        fi
       else
+        MODE="docker"
         WITH_WARP="0"
+      fi
+      PORT="${PORT:-3000}"
+      THREAD_TOKENS="${THREAD_TOKENS:-80}"
+      explicit_base_url="${BASE_URL:-}"
+      BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
+      IMAGE_BASE_URL="${IMAGE_BASE_URL:-$(image_view_url_from_base_url "${BASE_URL}")}"
+      ensure_admin_auth_key || exit 1
+      IMAGE_BASE_URL="$(prompt_input "图片查看 URL" "${IMAGE_BASE_URL}")"
+      if [[ -z "${explicit_base_url}" ]]; then
+        BASE_URL="$(api_root_url_from_image_view_url "${IMAGE_BASE_URL}")"
+      fi
+      BRANCH="${BRANCH:-${DEFAULT_RELEASE_REF}}"
+      RELEASE_REF_SELECTED="1"
+    else
+      if [[ -z "${MODE}" ]]; then
+        MODE="$(prompt_mode_choice "docker")"
+      else
+        MODE="$(normalize_mode_choice "${MODE}")" || { echo "[$(text prefix_error)] $(text err_mode)" >&2; exit 1; }
+      fi
+      ensure_admin_auth_key || exit 1
+      BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
+      BASE_URL="$(prompt_input "公开访问根 URL（后台/API，不要带 /images）" "${BASE_URL}")"
+      PORT="$(prompt_input "$(text prompt_port)" "${PORT}")"
+      THREAD_TOKENS="$(prompt_input "$(text prompt_thread_tokens)" "${THREAD_TOKENS}")"
+      while [[ "${STORAGE_BACKEND}" == "postgres" && -z "${DATABASE_URL}" ]]; do
+        DATABASE_URL="$(prompt_input "PostgreSQL DATABASE_URL" "${DATABASE_URL}")"
+        if [[ -z "${DATABASE_URL}" ]]; then
+          ui_println "[$(text prefix_error)] PostgreSQL DATABASE_URL is required."
+        fi
+      done
+      while [[ -z "${IMAGE_QUEUE_DATABASE_URL}" ]]; do
+        IMAGE_QUEUE_DATABASE_URL="$(prompt_input "Image queue PostgreSQL DATABASE_URL" "${IMAGE_QUEUE_DATABASE_URL}")"
+        if [[ -z "${IMAGE_QUEUE_DATABASE_URL}" ]]; then
+          ui_println "[$(text prefix_error)] Image queue PostgreSQL DATABASE_URL is required."
+        fi
+      done
+      INSTALL_DIR="$(prompt_input "$(text prompt_dir)" "${INSTALL_DIR}")"
+      BRANCH="$(prompt_input "$(text prompt_branch)" "${BRANCH}")"
+      RELEASE_REF_SELECTED="1"
+
+      if [[ "${MODE}" == "docker" ]]; then
+        if confirm "$(text prompt_warp)" "${WITH_WARP}"; then
+          WITH_WARP="1"
+        else
+          WITH_WARP="0"
+        fi
       fi
     fi
   fi
 
+  if [[ "${INSTALL_TARGET}" == "standalone" && "${INSTALL_EXISTING}" != "1" && "${MODE}" != "docker" ]]; then
+    echo "[$(text prefix_error)] $(text err_standalone_mode)" >&2
+    exit 1
+  fi
+
   preflight_install_environment
 
-  if [[ "${MODE}" == "docker" && "${RELEASE_REF_SELECTED}" == "1" ]]; then
+  if [[ "${MODE}" == "docker" ]] && should_load_release_manifest; then
     load_release_manifest
   fi
 
@@ -5059,9 +5979,24 @@ main() {
   if [[ -z "${POSTGRES_PASSWORD}" ]]; then
     POSTGRES_PASSWORD="$(generate_auth_key)"
   fi
+  if [[ "${NODE_ROLE}" != "worker" && -z "${POSTGRES_ADMIN_PASSWORD}" ]]; then
+    POSTGRES_ADMIN_PASSWORD="$(generate_auth_key)"
+  fi
+  # A fresh standalone install provisions its own PostgreSQL, unless the caller asked
+  # for an external database by passing a URL explicitly.
+  if [[ "${INSTALL_TARGET}" == "standalone" && "${INSTALL_EXISTING}" != "1" ]]; then
+    if [[ "${EXPLICIT_DATABASE_URL_SET}" == "1" ]]; then
+      ui_println "[$(text prefix_info)] $(text info_external_database)"
+    else
+      APP_DATABASE_URL="$(cluster_internal_app_db_url)"
+      DATABASE_URL="${APP_DATABASE_URL}"
+      IMAGE_QUEUE_DATABASE_URL="$(cluster_internal_queue_db_url)"
+    fi
+  fi
+  resolve_builtin_postgres_usage
 
   validate_inputs
-  print_install_summary
+  print_install_summary pending
   confirm_installation
   if [[ "${MODE}" == "docker" ]]; then
     prepare_docker_bundle

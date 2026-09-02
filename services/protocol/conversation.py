@@ -615,6 +615,7 @@ class ImageOutput:
     created: int = field(default_factory=lambda: int(time.time()))
     text: str = ""
     upstream_event_type: str = ""
+    progress_fields: dict[str, Any] = field(default_factory=dict)
     data: list[dict[str, Any]] = field(default_factory=list)
     image_urls: list[str] = field(default_factory=list)
     image_attempts: list[dict[str, Any]] = field(default_factory=list)
@@ -2870,11 +2871,12 @@ def stream_image_chunks(
     outputs: Iterable[ImageOutput],
     event_prefix: str = "image_generation",
     usage_builder: Callable[[list[dict[str, Any]]], dict[str, Any]] | None = None,
-    partial_images: object = 0,
 ) -> Iterator[dict[str, Any]]:
     prefix = str(event_prefix or "image_generation").strip() or "image_generation"
-    # ChatGPT Web only gives us final image bytes here. Emitting those bytes as a
-    # synthetic partial_image makes some clients display the same image twice.
+    # ChatGPT Web only gives us final image bytes here, so there is no partial
+    # frame to forward: the request-level partial_images field is accepted for
+    # OpenAI compatibility and ignored. Emitting the final bytes as a synthetic
+    # partial_image makes some clients display the same image twice.
     for output in outputs:
         if output.kind == "progress" and output.task_id:
             status = (
@@ -2885,7 +2887,7 @@ def stream_image_chunks(
             yield _image_stream_payload(
                 output,
                 f"{prefix}.{status}",
-                {"status": status},
+                {"status": status, **output.progress_fields},
             )
         elif output.kind == "result":
             for item_index, item in enumerate(output.data):

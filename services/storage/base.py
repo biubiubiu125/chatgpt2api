@@ -43,6 +43,14 @@ class StorageBackend(ABC):
         self.save_auth_keys(auth_keys)
         return auth_keys
 
+    def reset_after_fork(self) -> None:
+        """Re-isolate process-owned resources after a fork.
+
+        File-based backends share nothing that a fork breaks, so the default is a
+        no-op. Backends holding sockets or connection pools must override this.
+        """
+        return None
+
     @abstractmethod
     def health_check(self) -> dict[str, Any]:
         """健康检查，返回存储后端状态"""

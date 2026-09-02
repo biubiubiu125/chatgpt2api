@@ -17,6 +17,24 @@
           <Button size="sm" variant="outline" :disabled="loading" @click="loadClusterState(false)">
             {{ loading ? '刷新中...' : '立即刷新' }}
           </Button>
+          <Button
+            v-if="clusterState?.node.node_role === 'api-main'"
+            size="sm"
+            variant="outline"
+            :disabled="joinFileLoading"
+            @click="openJoinFileModal('create')"
+          >
+            生成 Worker 配置
+          </Button>
+          <Button
+            v-if="clusterState?.node.node_role === 'api-main'"
+            size="sm"
+            variant="outline"
+            :disabled="joinFileLoading"
+            @click="openJoinFileModal('rotate')"
+          >
+            轮换 Worker 配置
+          </Button>
         </template>
       </PanelHeader>
 
@@ -181,30 +199,149 @@
         <StateBlock compact dashed title="暂无 Worker 心跳" description="从节点启动并连上队列库后，会在这里显示心跳和容量。" />
       </div>
     </PagePanel>
+
+    <ModalShell
+      :open="joinFileModalOpen"
+      max-width="34rem"
+      :z-index="140"
+      :close-on-backdrop="true"
+      @close="closeJoinFileModal"
+    >
+      <ModalHeader
+        :title="joinModalTitle"
+        :subtitle="joinModalSubtitle"
+        :close-disabled="false"
+        compact
+        @close="closeJoinFileModal"
+      />
+      <ModalBody density="compact" class="space-y-3">
+        <FormField label="Worker 编号">
+          <Input
+            v-model.trim="joinWorkerNo"
+            type="number"
+            min="1"
+            max="244"
+            step="1"
+            block
+            :disabled="joinFileLoading || joinFileDone"
+            placeholder="1-244"
+            @keydown.enter.prevent="createJoinFile"
+          />
+        </FormField>
+        <p v-if="joinOperation === 'create'" class="text-xs leading-5 text-muted-foreground">
+          当前自动建议编号为 {{ nextWorkerNo }}。生成后会下载对应的
+          <span class="font-mono">worker-N-config.zip</span>，里面包含 join 文件和
+          <span class="font-mono">join-signing.pub</span>；该编号不能重复使用。
+        </p>
+        <p v-else class="text-xs leading-5 text-muted-foreground">
+          轮换会先吊销该编号原有的加入凭据和 WireGuard peer，再重新签发一份新的
+          <span class="font-mono">worker-N-config.zip</span>。原有 join 文件立即失效，
+          该 Worker 需要用新配置包重新加入。
+        </p>
+        <p class="text-xs leading-5 text-muted-foreground">
+          Worker 节点默认文件放置目录：
+          <span class="font-mono">/opt/chatgpt2api/join/</span>。
+          请将压缩包内的 <span class="font-mono">worker-N.join</span> 和
+          <span class="font-mono">join-signing.pub</span> 一起放入该目录；
+          如果 Worker 安装目录不同，则放到该目录下的
+          <span class="font-mono">join/</span>。
+        </p>
+        <StateBlock
+          v-if="joinFileError"
+          compact
+          dashed
+          :title="joinOperation === 'rotate' ? 'Worker 配置轮换失败' : 'Worker 配置生成失败'"
+          :description="joinFileError"
+        />
+        <div
+          v-if="joinFileNotice"
+          class="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs leading-5 text-emerald-800 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-200"
+        >
+          {{ joinFileNotice }}
+        </div>
+      </ModalBody>
+      <ModalFooter :bordered="false">
+        <Button size="sm" variant="outline" @click="closeJoinFileModal">
+          {{ joinFileLoading ? '取消生成' : joinFileDone ? '关闭' : '取消' }}
+        </Button>
+        <Button
+          v-if="!joinFileDone"
+          size="sm"
+          variant="primary"
+          :disabled="joinFileLoading"
+          @click="createJoinFile"
+        >
+          {{ joinFileSubmitLabel }}
+        </Button>
+      </ModalFooter>
+    </ModalShell>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { Button } from 'nanocat-ui'
-import { clusterApi, type ClusterState } from '@/api/cluster'
+import { Button, FormField, Input } from 'nanocat-ui'
+import { clusterApi, type ClusterState, type WorkerJoinOperation } from '@/api/cluster'
 import MetaChip from '@/components/ai/MetaChip.vue'
+import ModalBody from '@/components/ai/ModalBody.vue'
+import ModalFooter from '@/components/ai/ModalFooter.vue'
+import ModalHeader from '@/components/ai/ModalHeader.vue'
+import ModalShell from '@/components/ai/ModalShell.vue'
 import PageLoadingState from '@/components/ai/PageLoadingState.vue'
 import PagePanel from '@/components/ai/PagePanel.vue'
 import PanelHeader from '@/components/ai/PanelHeader.vue'
 import StateBadge from '@/components/ai/StateBadge.vue'
 import StateBlock from '@/components/ai/StateBlock.vue'
 import TableShell from '@/components/ai/TableShell.vue'
+import { saveBlob } from '@/lib/downloads'
 import { errorMessage } from '@/lib/errorMessage'
 
 defineOptions({ name: 'Cluster' })
 
 const clusterState = ref<ClusterState | null>(null)
 const loading = ref(false)
+const joinFileLoading = ref(false)
+const joinFileModalOpen = ref(false)
+const joinFileDone = ref(false)
+const joinOperation = ref<WorkerJoinOperation>('create')
+const joinWorkerNo = ref('1')
+const joinFileError = ref('')
+const joinFileNotice = ref('')
 const error = ref('')
+const joinFileController = ref<AbortController | null>(null)
 let timer: number | null = null
 
 const workerRows = computed(() => clusterState.value?.workers || [])
+const registeredWorkerNos = computed(() =>
+  workerRows.value
+    .map((item) => String(item.worker_id || '').match(/^worker-(\d+)$/)?.[1])
+    .filter(Boolean)
+    .map((value) => Number(value))
+    .filter((value) => Number.isSafeInteger(value) && value >= 1 && value <= 244)
+    .sort((left, right) => left - right),
+)
+// Only Workers that reported a heartbeat show up here, so this is a suggestion rather
+// than an authoritative free number; the installer rejects a number already in use.
+const nextWorkerNo = computed(() => {
+  const used = new Set(registeredWorkerNos.value)
+  for (let workerNo = 1; workerNo <= 244; workerNo += 1) {
+    if (!used.has(workerNo)) return workerNo
+  }
+  return 1
+})
+const firstRegisteredWorkerNo = computed(() => registeredWorkerNos.value[0] ?? 1)
+const joinModalTitle = computed(() =>
+  joinOperation.value === 'rotate' ? '轮换 Worker 配置' : '生成 Worker 配置',
+)
+const joinModalSubtitle = computed(() =>
+  joinOperation.value === 'rotate'
+    ? '主节点会吊销该编号原有凭据，重新登记 WireGuard peer 并下载新的配置包。'
+    : '主节点会登记 WireGuard peer 和一次性加入凭据，并下载完整配置包。',
+)
+const joinFileSubmitLabel = computed(() => {
+  if (joinFileLoading.value) return joinOperation.value === 'rotate' ? '轮换中...' : '生成中...'
+  return joinOperation.value === 'rotate' ? '轮换并下载配置包' : '生成并下载配置包'
+})
 const onlineWorkerCount = computed(() => workerRows.value.filter((item) => item.online).length)
 const totalCurrentConcurrency = computed(() => sumWorkers('current_concurrency'))
 const totalEffectiveConcurrency = computed(() => sumWorkers('effective_concurrency'))
@@ -280,6 +417,108 @@ async function loadClusterState(silent = true) {
   } finally {
     loading.value = false
   }
+}
+
+function openJoinFileModal(operation: WorkerJoinOperation = 'create') {
+  joinOperation.value = operation
+  // Rotating targets an existing Worker, so suggest the lowest registered number
+  // instead of the next free one.
+  joinWorkerNo.value =
+    operation === 'rotate' ? String(firstRegisteredWorkerNo.value) : String(nextWorkerNo.value)
+  joinFileError.value = ''
+  joinFileNotice.value = ''
+  joinFileDone.value = false
+  joinFileModalOpen.value = true
+}
+
+function cancelJoinFileRequest(
+  notice = joinOperation.value === 'rotate' ? '已取消 Worker 配置轮换。' : '已取消 Worker 配置生成。',
+) {
+  joinFileController.value?.abort()
+  joinFileController.value = null
+  joinFileLoading.value = false
+  joinFileModalOpen.value = false
+  joinFileError.value = ''
+  joinFileDone.value = false
+  joinFileNotice.value = notice
+}
+
+function closeJoinFileModal() {
+  if (joinFileLoading.value) {
+    cancelJoinFileRequest()
+    return
+  }
+  joinFileModalOpen.value = false
+  joinFileError.value = ''
+  joinFileNotice.value = ''
+  joinFileDone.value = false
+}
+
+function isAbortError(err: unknown) {
+  if (!err || typeof err !== 'object') return false
+  const code = String((err as { code?: string }).code || '')
+  return code === 'ERR_CANCELED' || code === 'ECONNABORTED'
+}
+
+async function createJoinFile() {
+  const value = joinWorkerNo.value.trim()
+  if (!/^[0-9]+$/.test(value)) {
+    joinFileError.value = 'Worker 编号必须是 1 到 244 之间的整数'
+    return
+  }
+  const workerNo = Number(value)
+  if (!Number.isSafeInteger(workerNo) || workerNo < 1 || workerNo > 244) {
+    joinFileError.value = 'Worker 编号必须是 1 到 244 之间的整数'
+    return
+  }
+
+  joinFileError.value = ''
+  joinFileNotice.value = ''
+  joinFileDone.value = false
+  const controller = new AbortController()
+  joinFileController.value = controller
+  joinFileLoading.value = true
+  const operation = joinOperation.value
+  const actionLabel = operation === 'rotate' ? '轮换' : '生成'
+  try {
+    const blob = await clusterApi.createJoinFile(workerNo, {
+      operation,
+      signal: controller.signal,
+    })
+    if (controller.signal.aborted) {
+      return
+    }
+    saveBlob(blob, `worker-${workerNo}-config.zip`)
+    joinFileDone.value = true
+    joinFileNotice.value = `worker-${workerNo}-config.zip 已${actionLabel}并开始下载。请在 Worker 节点解压，并将 worker-${workerNo}.join 和 join-signing.pub 放到 /opt/chatgpt2api/join/；如果 Worker 安装目录不同，则放到该目录下的 join/。`
+  } catch (err) {
+    if (controller.signal.aborted || isAbortError(err)) {
+      joinFileNotice.value = `worker-${workerNo} 配置${actionLabel}已取消。`
+      return
+    }
+    joinFileError.value = await joinFileErrorMessage(err)
+  } finally {
+    if (joinFileController.value === controller) {
+      joinFileController.value = null
+    }
+    joinFileLoading.value = false
+  }
+}
+
+async function joinFileErrorMessage(err: unknown) {
+  if (err && typeof err === 'object') {
+    const value = err as { data?: unknown; status?: number }
+    const data = value.data
+    if (typeof Blob !== 'undefined' && data instanceof Blob) {
+      try {
+        const parsed = JSON.parse(await data.text())
+        return errorMessage({ data: parsed, status: value.status })
+      } catch {
+        // Keep the regular Axios error message when the response is not JSON.
+      }
+    }
+  }
+  return errorMessage(err)
 }
 
 function startPolling() {

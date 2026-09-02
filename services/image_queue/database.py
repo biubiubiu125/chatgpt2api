@@ -414,3 +414,16 @@ class ImageQueueDatabase:
             self._started = False
             if self.engine is not None and self._owns_engine:
                 self.engine.dispose()
+
+    def reset_after_fork(self) -> None:
+        """Drop pooled connections inherited from the parent process.
+
+        A forked child must never reuse a socket the parent still owns. Passing
+        ``close=False`` disposes the pool without closing those connections, so
+        the parent keeps working while the child opens its own on next checkout.
+        Unlike :meth:`dispose` this keeps the started flag, because the schema is
+        already there and the child has to keep issuing queries.
+        """
+        with self._lock:
+            if self.engine is not None and self._owns_engine:
+                self.engine.dispose(close=False)

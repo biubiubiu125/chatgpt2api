@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import multiprocessing
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import asdict
 from datetime import datetime, timezone
+import inspect
 import math
 import os
 from threading import Event, RLock, Thread
@@ -25,13 +27,129 @@ from utils.log import logger
 
 T = TypeVar("T")
 
+CLAIM_MAX_RUNTIME_MESSAGE = "image job claim exceeded maximum runtime"
+
+
+class ClaimMaxRuntimeExceeded(RuntimeError):
+    """A claim outlived ``claim_max_runtime_seconds``.
+
+    Distinct from a plain RuntimeError so the failure path can route it to
+    ``fail_timed_out_claim``, which stamps ``image_claim_timeout``. That error
+    code is what ``list_local_recovery_candidates`` looks for, so a job whose
+    image was already downloaded or saved stays recoverable instead of ending
+    up as a generic internal error the recovery sweep ignores.
+    """
+
+    def __init__(self, message: str = CLAIM_MAX_RUNTIME_MESSAGE) -> None:
+        super().__init__(message)
+
+
+def _claim_account_service(image_task_service: Any) -> Any:
+    """Resolve the account pool the child must use to prepare its account.
+
+    ``ImageTaskService`` does not own an ``account_service`` attribute: the
+    production wiring passes the pool to ``ImageWorkerManager`` instead. Prefer
+    an explicitly attached pool (tests inject one), then the parent manager's,
+    and only then fall back to the module singleton.
+    """
+    attached = getattr(image_task_service, "account_service", None)
+    if attached is not None:
+        return attached
+    parent_worker = getattr(image_task_service, "worker", None)
+    from_worker = getattr(parent_worker, "account_service", None)
+    if from_worker is not None:
+        return from_worker
+    from services.account_service import account_service
+
+    return account_service
+
+
+def _reset_inherited_child_state(image_task_service: Any) -> None:
+    """Re-isolate everything the fork handed this child before it does work.
+
+    Order matters: the shared service singletons rebuild their locks and drop
+    the parent's in-flight counters first, then the queue database drops the
+    inherited connection pool. The queue must stay ``started`` -- its schema is
+    already in place and the child keeps querying it -- so this uses the
+    fork-specific reset rather than ``dispose()``, which would mark the database
+    stopped and make every later query raise ImageQueueUnavailableError.
+    """
+    from services.fork_safety import reset_inherited_process_state
+
+    reset_inherited_process_state()
+    database = getattr(getattr(image_task_service, "repository", None), "database", None)
+    reset_database = getattr(database, "reset_after_fork", None)
+    if callable(reset_database):
+        reset_database()
+
+
+def _run_claim_in_subprocess(
+    claim: ClaimedJob,
+    account_id: object | None,
+    stage_sender: Any | None = None,
+) -> None:
+    from services.image_task_service import image_task_service
+
+    class _SynchronousWorkerAdapter:
+        def __init__(self, worker_id: str) -> None:
+            self.worker_id = worker_id
+
+        @staticmethod
+        def _completed(operation: Callable[[], T]) -> Future[T]:
+            future: Future[T] = Future()
+            try:
+                future.set_result(operation())
+            except Exception as exc:
+                future.set_exception(exc)
+            return future
+
+        def submit_io(self, operation: Callable[[], T]) -> Future[T]:
+            return self._completed(operation)
+
+        def submit_upscale(self, operation: Callable[[], T]) -> Future[T]:
+            return self._completed(operation)
+
+        def submit_registration(self, operation: Callable[[], T]) -> Future[T]:
+            return self._completed(operation)
+
+        def note_claim_stage(self, _claim: object, stage: object) -> None:
+            # Forward the stage to the parent so its resource accounting keeps
+            # seeing which phase this claim is in; the parent owns the maps that
+            # drive generation and recovery concurrency limits.
+            if stage_sender is None:
+                return
+            value = getattr(stage, "value", None) or str(stage or "")
+            if not value:
+                return
+            try:
+                stage_sender.send(value)
+            except Exception:
+                pass
+
+    account_service = _claim_account_service(image_task_service)
+    _reset_inherited_child_state(image_task_service)
+    parent_worker = getattr(image_task_service, "worker", None)
+    worker_id = str(getattr(parent_worker, "worker_id", "") or "")
+    image_task_service.worker = _SynchronousWorkerAdapter(worker_id)
+    try:
+        access_token = ""
+        if account_id is not None:
+            access_token = account_service.prepare_image_account(account_id)
+        image_task_service.execute_claim(claim, access_token)
+    finally:
+        if stage_sender is not None:
+            try:
+                stage_sender.close()
+            except Exception:
+                pass
+
 
 class ImageWorkerManager:
     def __init__(
         self,
         repository: ImageQueueRepository,
         account_service: Any,
-        executor: Callable[[ClaimedJob, str], None],
+        executor: Callable[..., None],
         settings: ImageQueueSettings,
         *,
         resource_controller: ResourceController | None = None,
@@ -45,6 +163,7 @@ class ImageWorkerManager:
         self.repository = repository
         self.account_service = account_service
         self.execute_job = executor
+        self._execute_job_accepts_runtime_guard = self._callable_accepts_runtime_guard(executor)
         self.settings = settings
         self.resource_controller = resource_controller or ResourceController(
             settings,
@@ -156,6 +275,259 @@ class ImageWorkerManager:
     @staticmethod
     def _is_worker_identity_conflict(exc: Exception) -> bool:
         return "worker identity conflict" in str(exc or "").lower()
+
+    def _should_run_claim_in_subprocess(self) -> bool:
+        executor = self.execute_job
+        owner = getattr(executor, "__self__", None)
+        if not (
+            owner is not None
+            and owner.__class__.__name__ == "ImageTaskService"
+            and owner.__class__.__module__ == "services.image_task_service"
+            and getattr(executor, "__name__", "") == "execute_claim"
+        ):
+            return False
+        # The child inherits the started queue, artifact service and account pool
+        # through the fork. A spawned child re-imports everything from scratch, so
+        # its image_task_service has no repository and every claim would die with
+        # image_queue_unavailable. Without fork, stay in-thread and rely on the
+        # runtime guard instead.
+        return "fork" in multiprocessing.get_all_start_methods()
+
+    @staticmethod
+    def _callable_accepts_runtime_guard(executor: Callable[..., None]) -> bool:
+        try:
+            signature = inspect.signature(executor)
+        except (TypeError, ValueError):
+            return False
+        parameters = tuple(signature.parameters.values())
+        return any(parameter.kind == inspect.Parameter.VAR_POSITIONAL for parameter in parameters) or len(parameters) >= 3
+
+    def _claim_runtime_guard(self, claim: ClaimedJob) -> Callable[[], None]:
+        max_runtime = max(1.0, float(self.settings.claim_max_runtime_seconds))
+        started_at = self._claim_started_at.get(claim.job.id, time.monotonic())
+
+        def guard() -> None:
+            if time.monotonic() - started_at < max_runtime:
+                return
+            with self._lock:
+                if claim.job.id not in self._overdue_claims_logged:
+                    self._overdue_claims_logged.add(claim.job.id)
+                    logger.error({
+                        "event": "image_worker_claim_max_runtime_exceeded",
+                        "worker_id": self.worker_id,
+                        "task_id": str(claim.job.task_id),
+                        "job_id": str(claim.job.id),
+                        "lease_version": claim.lease_version,
+                        "max_runtime_seconds": max_runtime,
+                    })
+            raise ClaimMaxRuntimeExceeded()
+
+        return guard
+
+    @staticmethod
+    def _job_is_active(job: Any | None) -> bool:
+        if job is None:
+            return False
+        status = getattr(job, "status", "")
+        status_value = getattr(status, "value", str(status or ""))
+        return status_value in {"leased", "running"}
+
+    def _handle_claim_exception(
+        self,
+        claim: ClaimedJob,
+        current_job: Any | None,
+        exc: Exception,
+        initial_stage: JobStage,
+    ) -> None:
+        self._recent_error = str(exc)[:300]
+        if (
+            self.repository.is_cancel_requested(claim.job.task_id)
+            and not bool(getattr(current_job or claim.job, "quota_consumed", False))
+        ):
+            self.repository.release_claim(claim)
+            return
+        stage = current_job.stage if current_job is not None else initial_stage
+        attempts = self._stage_attempts(current_job or claim.job, stage)
+        decision = self.retry_policy.decision(stage, attempts, exc, datetime.now(timezone.utc))
+        failure = classify_image_exception(exc)
+        self._note_upstream_outcome(success=False, failure=failure, stage=stage)
+        self._record_claim_account_result(
+            claim,
+            current_job,
+            success=False,
+            failure=failure,
+            error=exc,
+        )
+        if isinstance(exc, ClaimMaxRuntimeExceeded):
+            # A runtime timeout is not a generation error: the job may already own a
+            # downloaded or upscaled artifact. Stamp image_claim_timeout so the local
+            # recovery sweep picks it up instead of leaving it as internal_error.
+            self.repository.fail_timed_out_claim(
+                claim,
+                error_code="image_claim_timeout",
+                error_message=str(exc),
+                quota_consumed=bool(getattr(current_job or claim.job, "quota_consumed", False)),
+            )
+            return
+        if decision.retry and decision.next_retry_at is not None:
+            self.repository.schedule_retry(
+                claim,
+                error_code=decision.error_code,
+                error_message=decision.error_message,
+                next_retry_at=decision.next_retry_at,
+            )
+        else:
+            self.repository.fail_job(
+                claim,
+                error_code=decision.error_code,
+                error_message=decision.error_message,
+            )
+
+    def _handle_claim_success(self, claim: ClaimedJob, initial_stage: JobStage) -> None:
+        current_job = self.repository.get_job(claim.job.id)
+        self._note_upstream_outcome(success=True, stage=getattr(current_job, "stage", initial_stage))
+        self._record_claim_account_result(
+            claim,
+            current_job,
+            success=True,
+        )
+
+    @staticmethod
+    def _subprocess_target_accepts_stage_sender(target: Callable[..., None]) -> bool:
+        try:
+            signature = inspect.signature(target)
+        except (TypeError, ValueError):
+            return False
+        parameters = tuple(signature.parameters.values())
+        if any(parameter.kind == inspect.Parameter.VAR_POSITIONAL for parameter in parameters):
+            return True
+        positional = [
+            parameter
+            for parameter in parameters
+            if parameter.kind
+            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        return len(positional) >= 3
+
+    def _drain_claim_stage_updates(self, claim: ClaimedJob, receiver: Any | None) -> None:
+        """Apply stage updates the subprocess reported, so concurrency accounting stays live."""
+        if receiver is None:
+            return
+        while True:
+            try:
+                if not receiver.poll():
+                    return
+                stage = receiver.recv()
+            except (EOFError, OSError):
+                return
+            except Exception:
+                return
+            if stage:
+                self.note_claim_stage(claim, str(stage))
+
+    def _run_claim_subprocess(self, claim: ClaimedJob, access_token: str) -> bool:
+        # Only fork carries the started queue and account pool into the child;
+        # _should_run_claim_in_subprocess already refuses anything else.
+        context = multiprocessing.get_context("fork")
+        target = _run_claim_in_subprocess
+        stage_receiver: Any | None = None
+        stage_sender: Any | None = None
+        process_args: tuple[Any, ...] = (claim, access_token)
+        if self._subprocess_target_accepts_stage_sender(target):
+            try:
+                stage_receiver, stage_sender = context.Pipe(duplex=False)
+            except OSError:
+                stage_receiver = None
+                stage_sender = None
+            else:
+                process_args = (claim, access_token, stage_sender)
+        try:
+            return self._await_claim_subprocess(
+                claim,
+                context.Process(target=target, args=process_args, daemon=False),
+                stage_receiver,
+                stage_sender,
+            )
+        finally:
+            for endpoint in (stage_sender, stage_receiver):
+                if endpoint is None:
+                    continue
+                try:
+                    endpoint.close()
+                except Exception:
+                    pass
+
+    def _await_claim_subprocess(
+        self,
+        claim: ClaimedJob,
+        process: Any,
+        stage_receiver: Any | None,
+        stage_sender: Any | None,
+    ) -> bool:
+        process.start()
+        # The parent must drop its copy of the write end, otherwise the pipe never
+        # reaches EOF and stage draining would block forever.
+        if stage_sender is not None:
+            try:
+                stage_sender.close()
+            except Exception:
+                pass
+        timeout = max(1.0, float(self.settings.claim_max_runtime_seconds))
+        deadline = time.monotonic() + timeout
+        while process.is_alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self._drain_claim_stage_updates(claim, stage_receiver)
+            process.join(min(0.2, remaining))
+        self._drain_claim_stage_updates(claim, stage_receiver)
+        if process.is_alive():
+            self._recent_error = "image job claim exceeded maximum runtime"
+            logger.error({
+                "event": "image_worker_claim_max_runtime_exceeded",
+                "worker_id": self.worker_id,
+                "task_id": str(claim.job.task_id),
+                "job_id": str(claim.job.id),
+                "lease_version": claim.lease_version,
+                "max_runtime_seconds": timeout,
+                "mode": "subprocess",
+            })
+            process.terminate()
+            process.join(timeout=5)
+            if process.is_alive():
+                kill = getattr(process, "kill", None)
+                if callable(kill):
+                    kill()
+                    process.join(timeout=5)
+            current_job = self.repository.get_job(claim.job.id)
+            if self._job_is_active(current_job):
+                self._handle_claim_exception(
+                    claim,
+                    current_job,
+                    ClaimMaxRuntimeExceeded(),
+                    claim.job.stage,
+                )
+            return False
+        if process.exitcode != 0:
+            self._recent_error = "image job subprocess exited unexpectedly"
+            logger.error({
+                "event": "image_worker_claim_subprocess_failed",
+                "worker_id": self.worker_id,
+                "task_id": str(claim.job.task_id),
+                "job_id": str(claim.job.id),
+                "lease_version": claim.lease_version,
+                "exitcode": process.exitcode,
+            })
+            current_job = self.repository.get_job(claim.job.id)
+            if self._job_is_active(current_job):
+                self._handle_claim_exception(
+                    claim,
+                    current_job,
+                    RuntimeError("image job subprocess exited unexpectedly"),
+                    claim.job.stage,
+                )
+            return False
+        return True
 
     def _set_fatal_error(self, exc: Exception) -> None:
         message = str(exc or "fatal image worker error")[:300]
@@ -351,11 +723,14 @@ class ImageWorkerManager:
                 started_at = self._claim_started_at.get(claim.job.id, now)
                 if now - started_at >= max_runtime:
                     if claim.job.id not in self._overdue_claims_logged:
-                        self._overdue_claims_logged.add(claim.job.id)
                         overdue.append(claim)
                     continue
                 heartbeatable.append(claim)
         for claim in overdue:
+            with self._lock:
+                if claim.job.id in self._overdue_claims_logged:
+                    continue
+                self._overdue_claims_logged.add(claim.job.id)
             logger.error({
                 "event": "image_worker_claim_max_runtime_exceeded",
                 "worker_id": self.worker_id,
@@ -662,12 +1037,23 @@ class ImageWorkerManager:
             ):
                 self.repository.release_claim(claim)
                 return
+            if self._should_run_claim_in_subprocess():
+                if self._run_claim_subprocess(
+                    claim,
+                    None if accountless_recovery else claim.account_id,
+                ):
+                    self._handle_claim_success(claim, initial_stage)
+                return
             access_token = (
                 ""
                 if accountless_recovery
                 else self.account_service.prepare_image_account(claim.account_id)
             )
-            self.execute_job(claim, access_token)
+            runtime_guard = self._claim_runtime_guard(claim) if self._execute_job_accepts_runtime_guard else None
+            if runtime_guard is None:
+                self.execute_job(claim, access_token)
+            else:
+                self.execute_job(claim, access_token, runtime_guard)
         except LocalArtifactRecoveryUnavailable as exc:
             self.repository.schedule_retry(
                 claim,
@@ -677,48 +1063,11 @@ class ImageWorkerManager:
             )
             return
         except Exception as exc:
-            self._recent_error = str(exc)[:300]
             current_job = self.repository.get_job(claim.job.id)
-            if (
-                self.repository.is_cancel_requested(claim.job.task_id)
-                and not bool(getattr(current_job, "quota_consumed", False))
-            ):
-                self.repository.release_claim(claim)
-                return
-            stage = current_job.stage if current_job is not None else claim.job.stage
-            attempts = self._stage_attempts(current_job or claim.job, stage)
-            decision = self.retry_policy.decision(stage, attempts, exc, datetime.now(timezone.utc))
-            failure = classify_image_exception(exc)
-            self._note_upstream_outcome(success=False, failure=failure, stage=stage)
-            self._record_claim_account_result(
-                claim,
-                current_job,
-                success=False,
-                failure=failure,
-                error=exc,
-            )
-            if decision.retry and decision.next_retry_at is not None:
-                self.repository.schedule_retry(
-                    claim,
-                    error_code=decision.error_code,
-                    error_message=decision.error_message,
-                    next_retry_at=decision.next_retry_at,
-                )
-            else:
-                self.repository.fail_job(
-                    claim,
-                    error_code=decision.error_code,
-                    error_message=decision.error_message,
-                )
+            self._handle_claim_exception(claim, current_job, exc, initial_stage)
             return
         else:
-            current_job = self.repository.get_job(claim.job.id)
-            self._note_upstream_outcome(success=True, stage=getattr(current_job, "stage", initial_stage))
-            self._record_claim_account_result(
-                claim,
-                current_job,
-                success=True,
-            )
+            self._handle_claim_success(claim, initial_stage)
         finally:
             if self.state_change_callback is not None:
                 try:

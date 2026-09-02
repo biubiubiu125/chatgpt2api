@@ -582,6 +582,18 @@ class ConfigStore:
                 '   "auth-key": "your_real_auth_key"'
             )
 
+    def reset_after_fork(self) -> None:
+        """Rebuild the settings lock and re-isolate the storage backend.
+
+        The storage backend can own a SQLAlchemy engine whose pooled sockets
+        belong to the parent, so the child has to stop sharing them before it
+        writes anything.
+        """
+        self._lock = threading.RLock()
+        reset = getattr(self._storage_backend, "reset_after_fork", None)
+        if callable(reset):
+            reset()
+
     def _load(self) -> dict[str, object]:
         return read_json_object(self.path, name="config.json")
 

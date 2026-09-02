@@ -281,27 +281,102 @@ class ResourceController:
             return failures / float(len(self._upstream_outcomes))
 
     def sample(self) -> ResourceSnapshot:
+        """Read machine pressure, never raising.
+
+        sample() sits on the request path (``_ensure_submission_capacity``) and in
+        the worker dispatch loop, so a transient psutil/statvfs error must not turn
+        into an HTTP 500 or stall the queue with exponential backoff. Each probe
+        degrades independently: a probe that fails contributes a neutral value and
+        the rest of the snapshot stays truthful. Disk is the exception -- it is the
+        one signal whose absence must not read as "plenty of space", so a failed
+        disk probe reports the pressure threshold rather than zero.
+        """
         with self._lock:
-            self.settings.artifact_root.mkdir(parents=True, exist_ok=True)
-            memory = psutil.virtual_memory()
-            swap = psutil.swap_memory()
-            process = psutil.Process()
-            disk = shutil.disk_usage(self.settings.artifact_root.resolve())
-            available_memory, memory_limit = self._memory_sample(memory)
-            swap_in_rate, swap_out_rate = self._swap_rates(swap)
+            try:
+                self.settings.artifact_root.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.warning({
+                    "event": "image_queue_resource_artifact_root_unavailable",
+                    "error": str(exc),
+                })
+            available_memory, memory_limit = self._safe_memory_sample()
+            swap_in_rate, swap_out_rate = self._safe_swap_rates()
+            disk_free_bytes, disk_free_percent = self._safe_disk_sample()
             return ResourceSnapshot(
-                cpu_percent=self._container_cpu_percent(float(psutil.cpu_percent(interval=None))),
+                cpu_percent=self._safe_cpu_percent(),
                 available_memory_bytes=available_memory,
                 memory_limit_bytes=memory_limit,
                 swap_in_bytes_per_second=swap_in_rate,
                 swap_out_bytes_per_second=swap_out_rate,
-                thread_count=int(process.num_threads()),
-                file_handle_count=self._file_handle_count(process),
-                database_pool_percent=self._database_pool_percent(),
-                disk_free_bytes=int(disk.free),
-                disk_free_percent=(float(disk.free) / float(disk.total) * 100.0) if disk.total else 0.0,
+                thread_count=self._safe_thread_count(),
+                file_handle_count=self._safe_file_handle_count(),
+                database_pool_percent=self._safe_database_pool_percent(),
+                disk_free_bytes=disk_free_bytes,
+                disk_free_percent=disk_free_percent,
                 sampled_at=datetime.now(timezone.utc),
             )
+
+    def _safe_cpu_percent(self) -> float:
+        try:
+            return self._container_cpu_percent(float(psutil.cpu_percent(interval=None)))
+        except Exception as exc:
+            self._log_probe_failure("cpu", exc)
+            return 0.0
+
+    def _safe_memory_sample(self) -> tuple[int, int]:
+        try:
+            return self._memory_sample(psutil.virtual_memory())
+        except Exception as exc:
+            self._log_probe_failure("memory", exc)
+            # memory_limit_bytes == 0 makes every memory predicate return False,
+            # so an unreadable probe cannot fabricate memory pressure.
+            return 0, 0
+
+    def _safe_swap_rates(self) -> tuple[int, int]:
+        try:
+            return self._swap_rates(psutil.swap_memory())
+        except Exception as exc:
+            self._log_probe_failure("swap", exc)
+            return 0, 0
+
+    def _safe_thread_count(self) -> int:
+        try:
+            return int(psutil.Process().num_threads())
+        except Exception as exc:
+            self._log_probe_failure("thread_count", exc)
+            return 0
+
+    def _safe_file_handle_count(self) -> int:
+        try:
+            return self._file_handle_count(psutil.Process())
+        except Exception as exc:
+            self._log_probe_failure("file_handles", exc)
+            return 0
+
+    def _safe_database_pool_percent(self) -> float:
+        try:
+            return self._database_pool_percent()
+        except Exception as exc:
+            self._log_probe_failure("database_pool", exc)
+            return 0.0
+
+    def _safe_disk_sample(self) -> tuple[int, float]:
+        try:
+            disk = shutil.disk_usage(self.settings.artifact_root.resolve())
+        except Exception as exc:
+            self._log_probe_failure("disk", exc)
+            # Refuse to claim free space we could not measure: report exactly the
+            # pressure threshold so submissions pause instead of filling the disk.
+            return 0, 0.0
+        total = int(disk.total)
+        return int(disk.free), (float(disk.free) / float(total) * 100.0) if total else 0.0
+
+    def _log_probe_failure(self, probe: str, exc: BaseException) -> None:
+        logger.warning({
+            "event": "image_queue_resource_probe_failed",
+            "probe": probe,
+            "error": str(exc),
+        })
 
     def _disk_pressure(self, snapshot: ResourceSnapshot) -> bool:
         return snapshot.disk_free_bytes < 5 * 1024**3 or snapshot.disk_free_percent < 5.0

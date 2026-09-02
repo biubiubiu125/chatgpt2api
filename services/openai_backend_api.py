@@ -2417,8 +2417,6 @@ class OpenAIBackendAPI:
                 if stable_hits >= 2:
                     return last_result
             time.sleep(poll_interval_secs)
-        if last_result:
-            return last_result
         raise RuntimeError(f"timed out waiting for search result: {conversation_id}")
 
     def _get_search_conversation(self, conversation_id: str) -> Dict[str, Any]:

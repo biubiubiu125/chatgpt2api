@@ -185,6 +185,20 @@ class RealtimeMonitorService:
     def set_image_queue_provider(self, provider: Any) -> None:
         self._image_queue_provider = provider
 
+    def reset_after_fork(self) -> None:
+        """Rebuild the lock and drop inherited call state after a fork.
+
+        The monitor only serves the API process, so a forked job child has
+        nothing to publish here. It still has to replace the lock, which a fork
+        can inherit in a held state, and drop the parent's queue provider, whose
+        database handle no longer belongs to this process.
+        """
+        self._lock = Lock()
+        self._active = {}
+        self._events = deque(maxlen=self._events.maxlen)
+        self._completed = deque(maxlen=self._completed.maxlen)
+        self._image_queue_provider = None
+
     def set_threadpool(self, *, tokens: int, previous_tokens: int = 0) -> None:
         with self._lock:
             self._threadpool = {

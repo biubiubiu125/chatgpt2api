@@ -370,6 +370,15 @@ class ImageStorageService:
         self.index_file = index_file
         self._index_lock = IMAGE_INDEX_LOCK
 
+    def reset_after_fork(self) -> None:
+        """Rebuild the in-process index lock after a fork.
+
+        Cross-process index writes are already serialized by the on-disk file
+        lock; only this thread lock has to be replaced, because a forked child
+        can inherit it in a held state and deadlock on the first index write.
+        """
+        self._index_lock = Lock()
+
     def _index_file_lock_path(self) -> Path:
         return self.index_file.with_suffix(self.index_file.suffix + ".lock")
 

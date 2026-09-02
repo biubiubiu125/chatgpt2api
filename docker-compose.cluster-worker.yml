@@ -1,7 +1,6 @@
 services:
   data-permissions:
     image: ${CHATGPT2API_IMAGE:-ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a}
-    container_name: ${CHATGPT2API_WORKER_ID:-chatgpt2api-worker}-data-permissions
     user: "0:0"
     volumes:
       - ./data:/app/data
@@ -16,7 +15,6 @@ services:
 
   app:
     image: ${CHATGPT2API_IMAGE:-ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a}
-    container_name: ${CHATGPT2API_WORKER_ID:-chatgpt2api-worker}
     restart: unless-stopped
     depends_on:
       data-permissions:

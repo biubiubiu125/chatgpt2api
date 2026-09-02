@@ -195,6 +195,18 @@ class DashboardMetricsService:
         self._dirty = False
         self._flush_timer: threading.Timer | None = None
 
+    def reset_after_fork(self) -> None:
+        """Rebuild the lock and drop pending aggregates after a fork.
+
+        The inherited timer object does not exist as a thread in the child, and
+        the pending aggregates it would have flushed are the parent's to persist:
+        keeping them here would double-count every call recorded before the fork.
+        """
+        self._lock = threading.RLock()
+        self._pending = _empty_metrics_data()
+        self._dirty = False
+        self._flush_timer = None
+
     def _load_persisted(self) -> dict[str, Any]:
         data = read_json_object(self.path, name="dashboard_metrics.json")
         if not isinstance(data.get("days"), dict):

@@ -68,6 +68,18 @@ class LogService:
         self._line_count_cache: tuple[int, int, int] | None = None
         self._type_count_cache: dict[str, tuple[int, int, int]] = {}
 
+    def reset_after_fork(self) -> None:
+        """Rebuild the in-process append lock and drop cached line counts.
+
+        Appends across processes stay serialized by the on-disk file lock; only
+        this thread lock can be inherited in a held state and deadlock the child.
+        The counting caches are keyed by size and mtime, so they are dropped
+        rather than trusted after the parent keeps writing.
+        """
+        self._lock = threading.RLock()
+        self._line_count_cache = None
+        self._type_count_cache = {}
+
     def _file_lock_path(self) -> Path:
         return self.path.with_suffix(self.path.suffix + ".lock")
 

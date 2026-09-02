@@ -38,9 +38,11 @@ ChatGPT2API 是一个自托管网关，用于把 ChatGPT 官网能力封装成 O
 - `api/accounts.py`、`api/system.py`、`api/register.py`、`api/prompts.py`：管理台接口、账号池、存储、图片图库、监控、注册和提示词来源。
 - `services/protocol/`：ChatGPT Web 上游协议、SSE（Server-Sent Events，服务端推送）、Responses、Messages、搜索和图片协议适配。
 - `services/image_queue/`、`services/image_task_service.py`：PostgreSQL 任务与 Job、幂等、租约、资源控制、恢复、制品交付和 ACK（结果确认）。
+- `services/threadpool_governor.py`：把 AnyIO 后端线程池容量与图片队列资源控制器联动，避免线程池和生图互相挤占。
 - `services/storage/`、`services/image_storage_service.py`：JSON、SQLite、PostgreSQL、Git 账号存储，以及本地、WebDAV、双写和图片索引。
 - `services/register/`、`services/register_service.py`：临时邮箱、GPTMail、Outlook Token、Microsoft passwordless、plus alias 和自动补号。
 - `services/cluster_*.py`、`services/returned_url_verifier.py`：WireGuard 主从加入、数据库角色、Worker 心跳和公开图片 URL 校验。
+- `services/cluster_join_request.py`、`deploy/cluster-join-helper.sh`：管理台生成 Worker 配置时的请求文件协议；容器内 API 只投递请求，宿主机 helper 复用安装脚本的 `create-worker` 逻辑。
 - `web-vue/`：Vue 3 + Vite 管理控制台，包含 Dashboard、Accounts、Gallery、Studio、Register、Monitor、Logs、Proxy、Settings、Cluster 和 Debug 页面。
 - `scripts/`、`deploy/`、`docker-compose*.yml`、`Dockerfile`：前端构建、图片放大、配置迁移、备份恢复、一键安装、普通 Compose、WARP 和主从集群部署。
 - `tests/`：后端单元测试、接口测试、队列测试、注册链路测试和 PostgreSQL 专项测试；`web-vue/scripts/` 保存前端闭环检查脚本。
@@ -61,6 +63,9 @@ ChatGPT2API 是一个自托管网关，用于把 ChatGPT 官网能力封装成 O
 - **账号租约并发**：通过 `image_account_leases` 维护单账号图片并发，避免多 Worker 超额占用同一账号。
 - **图片存储**：支持本地、WebDAV、双写、索引、标签、缩略图、下载、压缩、清理和 R2 备份。
 - **代理与出口**：支持账号代理、账号组代理、多出口代理组、备用出口、WARP、Privoxy、FlareSolverr 和 Cloudflare clearance。
+- **内置 PostgreSQL 一键安装**：单机端和主控端由 Compose 自带 PostgreSQL，安装器自动生成密码、两个库名和连接串，不再要求先准备外部数据库。
+- **实例前缀隔离**：安装器按安装目录和节点角色派生实例前缀与 Compose 项目名，同一台机器上的多套部署不会撞容器名、默认网络和命名卷。
+- **可视化生成 Worker 配置**：管理台“集群治理”页可按编号生成并下载 `worker-N-config.zip`，与命令行 `create-worker N` 共用同一套签名、token 和登记逻辑。
 - **自动构建镜像**：推送到 `main` 或创建 `v*` tag 后，GitHub Actions 自动构建 `linux/amd64` 和 `linux/arm64` 镜像并发布到 GHCR。
 
 ---
@@ -94,6 +99,8 @@ flowchart TB
   AdminAPI --> Queue
   AdminAPI --> Artifacts
   AdminAPI --> Backup["R2 备份 / 恢复"]
+  AdminAPI --> JoinHelper["宿主机 join helper"]
+  JoinHelper --> Cluster
 ```
 
 > [!WARNING]
@@ -117,13 +124,17 @@ flowchart TB
 | :--- | :--- | :---: | :---: |
 | 一键脚本 + GHCR | 服务器快速上线，使用已发布镜像 | 否 | `3000` |
 | Docker Compose | 需要手动维护 `.env`、镜像和数据 | 否 | `3000` |
-| 本地 Compose | 本机完整试跑，附带 PostgreSQL 17 | 是 | `8000` |
+| 本地 Compose | 本机完整试跑，内置 PostgreSQL 17 | 是 | `8000` |
 | 主从集群脚本 | API 主节点与图片 Worker 分机部署 | 否 | 主节点 `3000` |
 | 源码运行 | 二次开发、调试和前端开发 | 是 | 按 `PORT` 设置 |
 
-所有标准 Docker 方式都要求提供可连接且允许应用用户建表的 PostgreSQL 图片队列；新安装的账号存储也统一使用 PostgreSQL。已有 `json`、SQLite 或 Git 部署可继续保留原配置，但 `IMAGE_QUEUE_DATABASE_URL` 仍不能省略。
+逐步操作和排查细节见 `docs/deployment.md`，下面只保留每种方式的关键约束。
 
-使用外部 PostgreSQL 时，应用用户需要对 `chatgpt2api_app` 和 `chatgpt2api_image_queue` 具备连接权限，并能在各自数据库的 `public` schema 创建表、序列和索引。管理员可以按实际用户名执行：
+一键安装的单机端和主控端会自动启动本安装目录内的 PostgreSQL，并隔离账号库 `chatgpt2api_app` 与图片队列库 `chatgpt2api_image_queue`。手动 Compose 也包含 PostgreSQL，但需要在 `.env` 中填写密码、`APP_DATABASE_URL`、`DATABASE_URL`（两者指向同一个账号库）和 `IMAGE_QUEUE_DATABASE_URL`。已有 `json`、SQLite 或 Git 部署可继续保留原配置，但 `IMAGE_QUEUE_DATABASE_URL` 仍不能省略。
+
+同一台机器上部署多套时，安装器会按安装目录和节点角色派生 `CHATGPT2API_INSTANCE_PREFIX` 与 `COMPOSE_PROJECT_NAME`，Compose 据此隔离容器名、默认网络和命名卷；带尾斜杠的安装目录会归一化，不会被当作第二套部署。手动 Compose 需要自行为每个目录设置不同的前缀。
+
+改用外部 PostgreSQL 时，应用用户需要对 `chatgpt2api_app` 和 `chatgpt2api_image_queue` 具备连接权限，并能在各自数据库的 `public` schema 创建表、序列和索引。管理员可以按实际用户名执行：
 
 ```sql
 GRANT CONNECT ON DATABASE chatgpt2api_app TO chatgpt2api_runtime;
@@ -138,11 +149,11 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE, CREATE ON SCHEMA public TO chatgpt2api_runtime;
 ```
 
-标准/WARP Compose 的 `database-init` 会在应用启动前创建并校验数据库角色标记；权限不足会阻止应用启动。集群主节点使用 `deploy/postgres-init/001-create-cluster-databases.sh` 自动完成同等的数据库和角色授权。
+标准/WARP Compose 的 `database-init` 会在应用启动前创建并校验数据库角色标记；权限不足会阻止应用启动。所有内置 PostgreSQL 栈都使用 `deploy/postgres-init/001-create-cluster-databases.sh` 建库、建 `chatgpt2api_admin` 管理角色、授权运行角色并写入库用途标记，安装器在每次启动后会再执行一次以对齐已有实例。该脚本不会强行降低已有角色的属性：PostgreSQL 不允许清除 bootstrap superuser 的 `SUPERUSER`，16 起也只有创建者能修改一个角色的属性，遇到这两种情况脚本会打印提示并继续。库用途标记与预期不符时脚本会直接失败，避免账号库和队列库被互相写串。
 
 ### 一键安装脚本
 
-一键脚本位于 `deploy/install.sh`，支持交互式安装和真正的非交互式安装。首次启动会先选择部署端：单机端、主控/监控端或生图端 Worker；新安装统一使用 PostgreSQL。管理员密钥必须手动填写，安装完成时会显示管理员密钥、PostgreSQL `DATABASE_URL` 和图片队列数据库地址。
+一键脚本位于 `deploy/install.sh`，支持交互式安装和真正的非交互式安装。首次启动会先选择部署端：单机端、主控/监控端或生图端 Worker；新安装统一使用 PostgreSQL。新建单机端固定使用 Docker，因为内置 PostgreSQL 由 Compose 服务提供；`MODE=python` 仅保留给已有源码部署兼容。管理员密钥必须手动填写，安装完成时会显示管理员密钥、PostgreSQL `DATABASE_URL` 和图片队列数据库地址。
 
 #### 交互式安装（推荐第一次使用）
 
@@ -159,11 +170,17 @@ sudo bash /tmp/chatgpt2api-install.sh
 - `2` 主控/监控端：运行 API、管理台、账号库和队列调度，不运行生图 Worker。
 - `3` 生图端 Worker：通过主控端生成的 join 文件加入集群，只运行生图任务。
 
-各端的交互顺序如下：
+各端的交互顺序如下；提示中的默认值会直接显示在方括号中，按回车会回显实际采用的默认值：
 
-- 单机端：Docker/Python → 管理员密钥 → API/图片公网地址 → 端口 → 线程池容量 → PostgreSQL `DATABASE_URL` → 图片队列 `IMAGE_QUEUE_DATABASE_URL` → 安装目录 → Release → WARP → 安装摘要 → 确认安装。
-- 主控/监控端：管理员密钥 → API 域名 → API 端口 → PostgreSQL 密码 → PostgreSQL 管理员密码 → WireGuard 公网 IP/域名 → WireGuard 端口 → 安装目录 → Release → 首次交互式安装时选择是否生成第一个 Worker → 安装摘要 → 确认安装。
-- 生图端：自动查找或填写 join 文件 → 显示 Worker/集群/数据库信息 → 图片公网 URL → `direct` 或 `proxy` → 图片端口 → 安装目录 → 显示两个 PostgreSQL 地址 → 安装摘要 → 确认安装。
+- 单机端：语言 → 单机端 → 管理员密钥（二次确认） → 图片查看 URL → 安装摘要 → 确认安装。Docker、端口 `3000`、线程池 `80`、实例前缀、PostgreSQL 密码和两个数据库 URL 均自动生成；新建单机端不再询问 WARP 或外部数据库。图片查看 URL 的默认值跟随实际生效端口，所以用 `PORT` 覆盖过端口时按回车也不会写错地址。在已有单机安装上重跑时，脚本会保留 `.env` 里原有的 `MODE` 和 `WITH_WARP`，不会把源码部署改成 Docker，也不会把已启用的 WARP 编排拆掉。
+- 主控/监控端：语言 → 主控/监控端 → 管理员密钥（二次确认） → 主控后台/API 公开访问根 URL（默认 `http://127.0.0.1:3000`） → API 端口 → PostgreSQL 运行密码 → PostgreSQL 管理员密码 → WireGuard 公网 IP/域名 → WireGuard 端口（默认 `51820`） → PostgreSQL 对外端口（默认 `5432`） → 安装目录（默认 `/opt/chatgpt2api`） → Release → 是否生成第一个 Worker → 安装摘要 → 确认安装。
+- 生图端：语言 → 生图端 Worker → 自动查找或填写 join 文件（默认从 `/opt/chatgpt2api/join/` 查找） → 显示 Worker/集群/数据库信息 → 图片查看 URL → `direct` 或 `proxy` → 图片端口 → 安装目录 → 安装摘要 → 确认安装。
+
+主控端安装后，进入后台“集群治理”页面点击“生成 Worker 配置”，填写第 `N` 个编号即可直接下载 `worker-N-config.zip`。压缩包内包含 `worker-N.join` 和 `join-signing.pub`；主节点后台 helper 会复用命令行 `create-worker N` 的签名、一次性 token、WireGuard peer 和数据库登记逻辑。解压后把这两个文件一起放入 Worker 的 `/opt/chatgpt2api/join/`，再运行 Worker 安装命令；命令行 `create-worker N` 方式仍可用。
+
+生成过程的实现方式是：容器内 API 只把请求写入 `data/cluster-join-requests/`，宿主机上的 `deploy/cluster-join-helper.sh` 逐个执行 `create-worker N` 并回写结果，因此容器不需要 WireGuard 权限或宿主机 Docker 套接字。主控端安装时会自动注册该 helper（有 systemd 时用 `chatgpt2api-<实例前缀>-join-helper.service`，否则用带 PID 文件的后台进程）。编号已被占用时接口返回 `409`；请求超时或前端取消时，helper 会终止正在执行的子进程并清理请求文件。
+
+Worker 首次加入时信任的是与 join 文件放在一起的 `join-signing.pub`，因此这个压缩包要通过可信通道传输。若希望提前把公钥钉死，可在 Worker 上先设置 `CHATGPT2API_JOIN_SIGNING_PUBLIC_KEY_B64`，或先单独拷贝 `join-signing.pub` 到 `/opt/chatgpt2api/join/`——两者都会让签名不匹配的 join 文件直接被拒绝。
 
 主控端默认不会在非交互安装或已有安装重跑时生成第一个 Worker；需要显式追加 `--create-first-worker`，也可以用 `--no-first-worker` 明确禁止生成。
 
@@ -179,16 +196,14 @@ PostgreSQL DATABASE_URL: postgresql+psycopg2://.../chatgpt2api_app
 
 #### 非交互式一键安装
 
-需要准备管理员密钥、账号库 PostgreSQL 地址和图片队列 PostgreSQL 地址：
+单机端非交互安装只需要准备管理员密钥和图片查看 URL；PostgreSQL 密码、数据库 URL、实例前缀和 Compose 项目名会自动生成：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh -o /tmp/chatgpt2api-install.sh
   sudo env NONINTERACTIVE=1 MODE=docker INSTALL_DIR=/opt/chatgpt2api PORT=3000 \
   CHATGPT2API_INSTALL_TARGET=standalone \
   CHATGPT2API_AUTH_KEY='replace-with-a-manual-admin-key' \
-  DATABASE_URL='postgresql+psycopg2://user:password@postgres-host:5432/chatgpt2api_app' \
   CHATGPT2API_BASE_URL='https://api.example.com' \
-  IMAGE_QUEUE_DATABASE_URL='postgresql+psycopg2://user:password@postgres-host:5432/chatgpt2api_image_queue' \
   bash /tmp/chatgpt2api-install.sh --non-interactive
 ```
 
@@ -197,9 +212,9 @@ curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deplo
 - `CHATGPT2API_AUTH_KEY` 必须手动提供；交互式安装会隐藏输入并要求确认两次，非交互式安装缺少该值会直接失败。
 - `CHATGPT2API_IMAGE` 留空时使用 `ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a`。
 - `CHATGPT2API_WARP_IMAGE`、`CHATGPT2API_PRIVOXY_IMAGE` 和 `CHATGPT2API_FLARESOLVERR_IMAGE` 也默认使用固定 digest。
-- `CHATGPT2API_RELEASE_REF` 默认固定到当前 Release 提交；不要改成 `main` 等可变分支。Docker 模式的自定义引用必须是 40 位提交 SHA，Python 模式才允许使用版本标签。
-- 新安装固定使用 `STORAGE_BACKEND=postgres`，必须提供指向 `chatgpt2api_app` 的 `DATABASE_URL`；JSON、SQLite、Git 仅兼容已有部署。
-- `IMAGE_QUEUE_DATABASE_URL` 始终必填，脚本会在启动前校验。
+- `CHATGPT2API_RELEASE_REF` 默认固定到当前 Release 提交；不要改成 `main` 等可变分支。Docker 模式的自定义引用必须是 40 位提交 SHA，Python 模式才允许使用版本标签；新建 standalone 仍固定使用 Docker。
+- 新安装固定使用 `STORAGE_BACKEND=postgres`；standalone 会自动启动内置 PostgreSQL，并写入 `POSTGRES_PASSWORD`、`POSTGRES_ADMIN_PASSWORD`、`APP_DATABASE_URL`、`DATABASE_URL` 和 `IMAGE_QUEUE_DATABASE_URL`。
+- 手动 Compose 仍需在 `.env` 中提供内置 PostgreSQL 的密码以及三条完整 URL；脚本安装不要求用户手填这些 URL。
 - 主控端的 `--create-first-worker` 与 `--no-first-worker` 只控制当前安装动作，不会写入 `.env`，避免已有安装重跑时重复创建 Worker。
 - standalone 模式必须提供 `CHATGPT2API_BASE_URL` 或 `CHATGPT2API_IMAGE_BASE_URL`；脚本不会再把任意请求 `Host` 当作图片公网地址。
 - 可用 `INSTALL_DIR`、`PORT`、`CHATGPT2API_AUTH_KEY`、`CHATGPT2API_IMAGE`、`CHATGPT2API_BASE_URL` 和 `CHATGPT2API_IMAGE_BASE_URL` 覆盖默认值。
@@ -211,9 +226,7 @@ curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deplo
   sudo env NONINTERACTIVE=1 MODE=docker WITH_WARP=1 INSTALL_DIR=/opt/chatgpt2api \
   CHATGPT2API_INSTALL_TARGET=standalone \
   CHATGPT2API_AUTH_KEY='replace-with-a-manual-admin-key' \
-  DATABASE_URL='postgresql+psycopg2://user:password@postgres-host:5432/chatgpt2api_app' \
   CHATGPT2API_BASE_URL='https://api.example.com' \
-  IMAGE_QUEUE_DATABASE_URL='postgresql+psycopg2://user:password@postgres-host:5432/chatgpt2api_image_queue' \
   bash /tmp/chatgpt2api-install.sh --non-interactive --with-warp
 ```
 
@@ -236,12 +249,14 @@ sudo bash /tmp/chatgpt2api-install.sh status --install-dir /opt/chatgpt2api
 
 脚本的集群子命令是：
 
-- `main`：安装或修复 API 主节点和 PostgreSQL。
+- `main`：安装或修复 API 主节点和 PostgreSQL，并注册后台 join helper。
 - `create-worker 1`：在主节点生成 `join/worker-1.join`，并登记 Worker 的 WireGuard peer。
 - `worker /opt/chatgpt2api/join/worker-1.join`：在从节点校验并消费一次性 join 文件，启动 Worker。
 - `rotate-worker 1`：废弃旧的待加入记录并重新生成 Worker 配置。
 - `worker-check`：检查 Worker 的 WireGuard、数据库角色、心跳、文件写入和公开图片 URL。
 - `status`：查看安装目录、Compose 状态、WireGuard 和 Worker 加入状态。
+
+集群子命令都按 `.env` 里的实例前缀操作 Compose 项目，不再依赖固定容器名，因此同机多套主控端各自只会停止和查询自己的那一套。从实例前缀之前的版本升级时，旧栈的容器名是写死的（`chatgpt2api`、`chatgpt2api-postgres`、`chatgpt2api-main`，Worker 则是 `worker-N`），换项目名后 `docker compose down` 不会带走它们，所以脚本会额外按名字清理这些容器，并且只清理 Compose 标记为出自同一安装目录的那些，避免误删无关部署。
 
 > `main`、`worker` 集群命令会先生成并校验 WireGuard、join 文件和公开图片配置；Worker 激活阶段先验收内部链路，加入完成后由 `worker-check` 验收公开 URL。若反向代理尚未就绪，Worker 会保持运行，修好 Nginx 后重新执行 `worker-check`。单机 `MODE=docker` 才适合上面的完全非交互式命令。
 
@@ -249,7 +264,7 @@ sudo bash /tmp/chatgpt2api-install.sh status --install-dir /opt/chatgpt2api
 
 ### Docker 运行
 
-推荐直接使用 GHCR（GitHub Container Registry）镜像。标准 Compose 不会自动创建 PostgreSQL；新配置默认使用 PostgreSQL 账号库和图片队列库，必须分别填写 `DATABASE_URL` 与 `IMAGE_QUEUE_DATABASE_URL`。Compose 会先执行数据目录权限和数据库角色初始化任务，再启动应用：
+推荐直接使用 GHCR（GitHub Container Registry）镜像。标准 Compose 自带 PostgreSQL 服务，会在应用前执行数据目录权限、数据库和角色初始化任务；手动部署时需要在 `.env` 中设置密码、`APP_DATABASE_URL`、`DATABASE_URL`（两者一致）和 `IMAGE_QUEUE_DATABASE_URL`：
 
 ```bash
 git clone https://github.com/biubiubiu125/chatgpt2api.git
@@ -271,9 +286,15 @@ printf '{"auth-key":"%s"}\n' "$CHATGPT2API_AUTH_KEY" > data/config.json
 CHATGPT2API_AUTH_KEY=
 CHATGPT2API_IMAGE=ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a
 STORAGE_BACKEND=postgres
-DATABASE_URL=postgresql+psycopg2://user:password@postgres-host:5432/chatgpt2api_app
-IMAGE_QUEUE_DATABASE_URL=postgresql+psycopg2://user:password@postgres-host:5432/chatgpt2api_image_queue
+POSTGRES_PASSWORD=replace-with-a-random-runtime-password
+POSTGRES_ADMIN_USER=chatgpt2api_admin
+POSTGRES_ADMIN_PASSWORD=replace-with-a-random-admin-password
+DATABASE_URL=postgresql+psycopg2://chatgpt2api_runtime:replace-with-url-encoded-password@postgres:5432/chatgpt2api_app
+APP_DATABASE_URL=postgresql+psycopg2://chatgpt2api_runtime:replace-with-url-encoded-password@postgres:5432/chatgpt2api_app
+IMAGE_QUEUE_DATABASE_URL=postgresql+psycopg2://chatgpt2api_runtime:replace-with-url-encoded-password@postgres:5432/chatgpt2api_image_queue
 ```
+
+`DATABASE_URL` 和 `APP_DATABASE_URL` 在标准 Compose 中应保持一致；如果运行时密码包含特殊字符，必须先进行 URL 编码。不同安装目录请设置不同的 `CHATGPT2API_INSTANCE_PREFIX` 或 `COMPOSE_PROJECT_NAME`，Compose 会据此隔离容器、默认网络和命名卷。`POSTGRES_ADMIN_USER` 和 `POSTGRES_ADMIN_PASSWORD` 只属于运行数据库的节点；Worker 通过 WireGuard 用运行角色连接主节点数据库，一键安装不会把管理员凭据写进 Worker 的 `.env`。标准 Compose 的 PostgreSQL 不映射宿主机端口，只在 Compose 网络内可见。
 
 启动和检查：
 
@@ -310,7 +331,7 @@ printf '{"auth-key":"%s"}\n' "$CHATGPT2API_AUTH_KEY" > data/config.json
 docker compose -f docker-compose.local.yml up -d --build
 ```
 
-本地 Compose 默认访问 `http://localhost:8000`，账号存储使用 SQLite，图片队列使用同一 Compose 内的 PostgreSQL 17。该方式只适合本机试跑，不要把示例数据库密码直接用于公网环境。
+本地 Compose 默认访问 `http://localhost:8000`，账号库和图片队列库都使用同一 Compose 内的 PostgreSQL 17，数据库名和角色划分与正式安装一致，因此可以直接用它验证生图队列。数据保存在命名卷 `chatgpt2api-postgres-local-data` 中，与正式安装使用的 `data/postgres` 目录互不影响。该方式只适合本机试跑，不要把示例数据库密码直接用于公网环境。
 
 ### 主从集群部署
 
@@ -335,14 +356,14 @@ sudo bash /tmp/chatgpt2api-install.sh create-worker 1
 sudo bash /tmp/chatgpt2api-install.sh status
 ```
 
-主节点脚本会创建 `chatgpt2api_app`、`chatgpt2api_image_queue`，并生成：
+`POSTGRES_PASSWORD` 和 `POSTGRES_ADMIN_PASSWORD` 留空时会自动生成强随机值并写入主节点 `.env`，上面显式传入只是为了便于自行管理。主节点脚本会创建 `chatgpt2api_app`、`chatgpt2api_image_queue`，并生成：
 
 ```text
 /opt/chatgpt2api/join/worker-1.join
 /opt/chatgpt2api/join/join-signing.pub
 ```
 
-把这两个文件安全复制到 Worker 主机的 `/opt/chatgpt2api/join/`。Worker 主机准备：
+把这两个文件安全复制到 Worker 主机的 `/opt/chatgpt2api/join/`；也可以在管理台“集群治理”页直接下载打包好的 `worker-1-config.zip`。Worker 主机准备：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/biubiubiu125/chatgpt2api/main/deploy/install.sh -o /tmp/chatgpt2api-install.sh
@@ -356,7 +377,7 @@ sudo bash /tmp/chatgpt2api-install.sh worker-check
 
 `CHATGPT2API_IMAGE_BASE_URL` 必须是客户端可访问的 `http` 或 `https` 地址，不能指向 localhost、内网地址、链路本地地址、保留地址，也不能带 query 或 fragment；路径只能是空路径或 `/images`，这样脚本生成的 Worker Nginx 片段才会匹配。`CHATGPT2API_WORKER_PUBLIC_ENTRY_MODE=direct` 时会直接把 Worker 公开在宿主机端口上，`proxy` 时会保持 Worker 只监听 `127.0.0.1`。Worker 激活阶段先验收内部链路，加入完成后由 `worker-check` 验收公开 URL；如果公开反向代理尚未就绪，Worker 会保持运行，修好 Nginx 后重新执行 `worker-check`。Worker 的 Nginx 示例配置在 `deploy/nginx-worker-images.example.conf`，脚本会生成 `deploy/nginx-worker-images.conf`；该配置只放行图片、缩略图和健康检查，其余路径返回 `403`。
 
-集群安装前请确认：主节点的 UDP `51820` 已放行，主节点 WireGuard 私网地址为 `10.77.0.1`，Worker 编号 `1` 对应 `10.77.0.11`，并且两个节点的时间和系统权限正常。不要把 `worker-*.join`、数据库密码或 `.env` 提交到 Git 仓库。
+集群安装前请确认：主节点的 WireGuard UDP 端口已放行（默认 `51820`，可用 `WIREGUARD_PORT` 改成其他 UDP 端口），主节点 WireGuard 私网地址为 `10.77.0.1`，Worker 编号 `1` 对应 `10.77.0.11`，并且两个节点的时间和系统权限正常。主节点 PostgreSQL 只绑定在 WireGuard 地址上，端口默认 `5432`，可用 `CHATGPT2API_POSTGRES_PORT` 调整；该端口会写入 join 文件，Worker 无需再单独配置。安装脚本会同时按这两个端口放行 UFW 或 firewalld 规则。不要把 `worker-*.join`、数据库密码或 `.env` 提交到 Git 仓库。
 
 ### 反向代理与健康检查
 
@@ -401,8 +422,11 @@ docker compose logs --tail=200 app
 - 构建平台：`linux/amd64`、`linux/arm64`。
 - 前端阶段使用构建机架构，避免在 arm64 QEMU（模拟器）中重复执行前端依赖安装。
 - Job 有明确超时；如果超过 45 分钟会失败并保留可定位的步骤，而不是等待 GitHub 6 小时后显示 `cancelled`。
-- 工作流权限：`contents: read`、`packages: write`。
-- `deploy/release-manifest.env` 是生产发布的唯一版本元数据；发布前必须与 `deploy/install.sh` 里的默认 release pin 保持一致，避免安装脚本和发布清单分叉。
+- 工作流权限：`contents: write`、`packages: write`，用于发布不可变清单和稳定发布通道。
+- `deploy/release-manifest.env` 是仓库内的兼容回退清单；新鲜默认 Docker 安装会优先读取 GitHub Release 的 `chatgpt2api-latest` 清单，拿到当前主分支构建对应的源码 SHA 和镜像 digest，再按该 SHA 下载部署文件。
+- 发布工作流会同时更新 `chatgpt2api-<commit SHA>` 不可变清单和 `chatgpt2api-latest` 稳定清单。稳定清单只是优先项：它由发布工作流创建，首次发布之前和任何一次发布失败之后都可能不存在，因此拉取失败时安装器会退回脚本内固定的 release pin（同样按 `chatgpt2api-<SHA>` Release 资产或 raw 清单获取并做完整校验），只有所有来源都不可用时才拒绝继续。
+- 单机端和主控端使用同一套判定：只要是全新安装、未显式指定 `--branch` / `CHATGPT2API_RELEASE_REF`、也未固定镜像 digest，就走稳定发布通道；已有安装重跑则保留原有 release 元数据。
+- CI 会执行 `deploy/install.sh`、`deploy/cluster-join-helper.sh` 和 PostgreSQL 初始化脚本的语法检查与专项回归，并校验发布提交里确实包含这些部署文件。
 - manifest 中的 `UV_VERSION` 同时驱动 Docker 构建和 CI 后端依赖安装，Python 一键模式也读取同一版本。
 
 镜像地址：
@@ -449,7 +473,7 @@ mkdir -p data
 cp .env.example .env
 CHATGPT2API_AUTH_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 printf '{"auth-key":"%s"}\n' "$CHATGPT2API_AUTH_KEY" > data/config.json
-# 编辑 .env，至少填写 IMAGE_QUEUE_DATABASE_URL、CHATGPT2API_WARP_IMAGE、CHATGPT2API_PRIVOXY_IMAGE
+# 编辑 .env，至少填写 POSTGRES_PASSWORD、POSTGRES_ADMIN_PASSWORD、三条数据库 URL 和下面的固定镜像
 cat >> .env <<'EOF'
 CHATGPT2API_IMAGE=ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a
 CHATGPT2API_WARP_IMAGE=caomingjun/warp@sha256:da12ba946c7e44665ef25de1fc7d22ef432a9fa8b71fa32dc7790e1b5f27cd7f
@@ -463,6 +487,8 @@ docker compose -f docker-compose.warp.yml ps
 
 该 Compose 会启动：
 
+- `postgres`：内置账号库和图片队列库，只在 Compose 网络内可见。
+- `data-permissions`、`database-init`：修正数据目录属主，并在应用前校验数据库角色标记。
 - `warp-proxy`：提供 WARP SOCKS5 出口，默认宿主机端口 `40000`。
 - `privoxy`：把 WARP SOCKS5 转成 HTTP 代理，默认宿主机端口 `40080`。
 - `flaresolverr`：默认宿主机端口 `8191`，用于刷新 Cloudflare clearance。
@@ -475,8 +501,8 @@ docker compose -f docker-compose.warp.yml ps
 
 源码一键安装需要 Python `3.13`、`uv`、Node.js 和 npm：
 
-一键脚本的 `MODE=python` 会构建前端、安装 Sharp 图像放大运行时，再使用 `uv sync --frozen` 安装后端依赖；检测到 systemd 时注册并重启
-`chatgpt2api.service`，否则使用带 PID 文件的 `nohup` 后备进程，并等待 `/health?format=json&scope=runtime`。
+一键脚本对已有源码部署使用 `MODE=python` 时，会构建前端、安装 Sharp 图像放大运行时，再使用 `uv sync --frozen` 安装后端依赖；检测到 systemd 时注册并重启
+`chatgpt2api.service`，否则使用带 PID 文件的 `nohup` 后备进程，并等待 `/health?format=json&scope=runtime`。新建单机端不支持该模式，因为内置 PostgreSQL 由 Compose 提供；源码运行请按下面的步骤自行准备数据库。
 
 ```bash
 git clone https://github.com/biubiubiu125/chatgpt2api.git
@@ -486,10 +512,12 @@ cp .env.example .env
 mkdir -p data
 CHATGPT2API_AUTH_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 printf '{"auth-key":"%s"}\n' "$CHATGPT2API_AUTH_KEY" > config.json
-# 编辑 .env，至少填写 IMAGE_QUEUE_DATABASE_URL；再执行下面两条命令
+# 编辑 .env，至少填写 DATABASE_URL 和 IMAGE_QUEUE_DATABASE_URL；再执行下面两条命令
 CHATGPT2API_ENV_FILE="$PWD/.env" uv run --frozen python -m scripts.bootstrap_database_roles
 CHATGPT2API_ENV_FILE="$PWD/.env" PORT=8000 uv run --frozen python -m scripts.run_uvicorn
 ```
+
+源码运行不会自带 PostgreSQL。可以复用本地 Compose 的数据库（`docker compose -f docker-compose.local.yml up -d postgres`），也可以指向已有实例；两个 URL 必须分别指向 `chatgpt2api_app` 和 `chatgpt2api_image_queue`，`bootstrap_database_roles` 会校验并写入库用途标记。
 
 前端：
 
@@ -514,6 +542,18 @@ PostgreSQL 队列专项测试：
 export TEST_IMAGE_QUEUE_DATABASE_URL='postgresql+psycopg2://user:password@localhost:5432/chatgpt2api_test'
 uv run pytest -q tests/image_queue/test_repository_postgres.py
 ```
+
+部署脚本回归（与 CI 相同）：
+
+```bash
+bash tests/scripts/test-install-script.sh
+bash tests/scripts/test-postgres-init-script.sh
+bash tests/scripts/test-cluster-join-helper.sh
+bash tests/scripts/test-deployment-manifest-files.sh
+bash tests/scripts/test-frontend-script-manifest.sh
+```
+
+`test-postgres-init-script.sh` 在本机存在 PostgreSQL 服务端二进制时会拉起临时实例，覆盖内置栈和外部数据库两种角色拓扑；找不到二进制时退化为脚本结构检查。`test-cluster-join-helper.sh` 用桩安装脚本驱动真实 helper，验证取消请求时既给会回滚的安装脚本留出宽限期，也不会漏掉不响应 TERM 的安装脚本留下的后台子进程（约 1 分钟）。
 
 前端构建和维护脚本：
 
@@ -619,7 +659,7 @@ IMAGE_QUEUE_DATABASE_URL=postgresql+psycopg2://user:password@host:5432/chatgpt2a
 集群闭环：
 
 1. 主节点使用 `docker-compose.cluster-main.yml` 启动 PostgreSQL 和 API，`deploy/postgres-init/001-create-cluster-databases.sh` 创建 `chatgpt2api_app`、`chatgpt2api_image_queue` 并写入数据库角色标记。
-2. `create-worker` 生成签名 join 文件，写入 `chatgpt2api_worker_join_token`，并把 Worker 的 WireGuard peer 加到主节点。
+2. `create-worker`（或管理台“生成 Worker 配置”）生成签名 join 文件，写入 `chatgpt2api_worker_join_token`，并把 Worker 的 WireGuard peer 加到主节点。
 3. Worker 校验 join 文件签名、数据库角色标记和一次性 token，消费成功后写入 `/app/data/worker.joined`，再启动 `docker-compose.cluster-worker.yml`。
 4. Worker 写入心跳、有效并发、资源暂停原因和图片域名投递状态；主节点 `/api/cluster/state` 汇总节点、队列、账号、注册和投递健康。
 5. 集群模式下图片结果采用 URL-only 投递：Worker 保存最终图片并返回自己的公开 URL，主节点确认 URL 属于该 Worker 的 `CHATGPT2API_IMAGE_BASE_URL` 且可访问后再返回给下游。
@@ -665,6 +705,15 @@ register_offpeak:
 | :--- | :--- | :--- |
 | `CHATGPT2API_AUTH_KEY` | 无 | 管理员主密钥；也可在 `config.json` 使用 `auth-key`。 |
 | `CHATGPT2API_PORT` | `3000` | Docker Compose 宿主机端口，默认只绑定 `127.0.0.1`。 |
+| `CHATGPT2API_INSTANCE_PREFIX` | 脚本自动生成 | 实例隔离前缀；同时用于 Compose 项目名。 |
+| `CHATGPT2API_COMPOSE_PROJECT_NAME` | 跟随实例前缀 | Compose 项目名；不同实例必须不同。 |
+| `CHATGPT2API_POSTGRES_PORT` | `5432` | 主控端 PostgreSQL 在 WireGuard 地址上的监听端口，会写入 Worker join 文件；单机端只使用容器内 `5432`，不映射宿主机端口。 |
+| `POSTGRES_PASSWORD` | 脚本自动生成 | 内置 PostgreSQL 运行角色 `chatgpt2api_runtime` 的密码。 |
+| `POSTGRES_ADMIN_USER` | `chatgpt2api_admin` | 内置 PostgreSQL 管理角色；只写入运行数据库的节点，不下发给 Worker。 |
+| `POSTGRES_ADMIN_PASSWORD` | 脚本自动生成 | 管理角色密码，用于建库、授权和库用途标记。 |
+| `CHATGPT2API_CLUSTER_JOIN_REQUEST_DIR` | `/app/data/cluster-join-requests` | 管理台生成 Worker 配置时的请求目录，由宿主机 join helper 消费。 |
+| `CHATGPT2API_CLUSTER_JOIN_SIGNING_PUBLIC_KEY_FILE` | `/app/data/join-signing.pub` | 打包进 `worker-N-config.zip` 的 join 签名公钥路径。 |
+| `CHATGPT2API_JOIN_SIGNING_PUBLIC_KEY_B64` | 无 | Worker 侧预先钉死的 join 签名公钥；设置后签名不匹配的 join 文件会被拒绝。 |
 | `CHATGPT2API_RELEASE_REF` | `baa6567484c5a86c2e572b07d7d68cf854a0ab07` | 一键安装使用的固定 Release 提交；Docker 模式必须是 40 位 SHA，Python 模式可使用版本标签。 |
 | `CHATGPT2API_IMAGE` | `ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a` | Compose 使用的镜像。 |
 | `CHATGPT2API_IMAGE_DIGEST` | 无 | 仅传入 digest 时自动拼成 `ghcr.io/...@sha256:...`。 |
@@ -721,6 +770,7 @@ WARP / FlareSolverr 初始化还支持 `WARP_SOCKS_PORT`、`PRIVOXY_PORT`、`FLA
 - `POST /v1/images/edits`：OpenAI Images 图生图/编辑兼容入口，支持 multipart、远程 URL、base64、data URL 和多参考图。
 - `GET/POST /api/image-tasks/*`：原生异步图片任务接口，提交只入队，查询任务状态，成功后可 ACK。
 - `GET /api/cluster/state`：管理员查看节点角色、Worker 心跳、队列、账号、注册和图片 URL 投递健康。
+- `POST /api/cluster/join-file`：主控端管理员按编号生成 Worker 配置包，返回含 join 文件和签名公钥的 zip；编号被占用时返回 `409`。
 - `POST /v1/editable-file-tasks`、`GET /v1/editable-file-tasks`：统一 PPT / PSD 可编辑文件任务。
 - `POST /v1/ppt/generations`、`POST /v1/psd/generations`：PPT / PSD 快捷入口。
 - `GET /files/{file_path}`：文件任务产物下载，需要任务所属身份的 API Key。
@@ -762,7 +812,7 @@ WARP / FlareSolverr 初始化还支持 `WARP_SOCKS_PORT`、`PRIVOXY_PORT`、`FLA
 - 支持本地图片存储、WebDAV、双写、图片索引、标签、下载、压缩和清理。
 - R2 备份可覆盖配置、账号、日志、图片索引、概览统计、生图队列逻辑导出和图片文件。
 - 设置页支持 API 文档、第三方画布入口、备份、图片存储测试和清理预览。
-- 集群管理页展示节点角色、Worker 在线数、队列深度、账号配额、注册状态、图片 URL 和投递健康。
+- 集群管理页展示节点角色、Worker 在线数、队列深度、账号配额、注册状态、图片 URL 和投递健康，并支持按编号生成、下载和轮换 Worker 配置包。
 - 多实例部署需要共享 PostgreSQL 和共享图片存储，并按部署拓扑配置会话保持。
 
 ---
@@ -824,6 +874,7 @@ OpenAI 兼容入口的错误响应结构：
 | `/api/image-tasks/{task_id}/cancel` | `POST` | 取消排队或运行中的图片任务。 |
 | `/api/image-tasks/{task_id}/ack` | `POST` | 下游确认已取走结果。 |
 | `/api/cluster/state` | `GET` | 集群节点、Worker、队列、账号、注册和投递健康，仅管理员。 |
+| `/api/cluster/join-file` | `POST` | 按编号生成并下载 `worker-N-config.zip`，仅主控端管理员。 |
 | `/v1/editable-file-tasks` | `GET/POST` | PPT / PSD / 可编辑文件任务创建与查询。 |
 | `/files/{file_path}` | `GET` | 文件任务产物下载，需要任务所属身份的 API Key。 |
 | `/api/accounts`、`/api/account-groups` | `GET/POST/DELETE` | 账号池、分组和批量导入管理，仅管理员。 |
@@ -931,9 +982,16 @@ curl http://localhost:3000/v1/images/generations \
 | `size` | 可传尺寸字段，实际效果取决于上游。 |
 | `quality` | 图片质量，默认 `auto`。 |
 | `response_format` | 支持 `b64_json` 或 `url`。 |
-| `stream` | 设为 `true` 时返回图片流式事件。 |
+| `stream` | 设为 `true` 时返回图片流式事件（异步任务 + 服务端代等 + SSE 推送），首字节 <200ms；不传时同步阻塞直到生成完成（最长 300 秒），中间层容易超时。 |
 | `client_task_id` | 可作为请求体里的幂等键，也会进入持久任务记录。 |
 | `history_disabled` | 默认 `true`，用于生成链路的会话隔离。 |
+
+**流式事件说明：**
+
+- `stream: true` 会先入 PostgreSQL 持久队列，立刻返回 `task_id`，然后每 15 秒发心跳（包含 `queue_position`、`stage`、`progress`），最后推送 `image_generation.completed` 或 `image_generation.failed`。
+- `completed` 事件携带的是**最终生成结果**，不是渐进式图像帧；`n>1` 时会拆成多个 `completed` 事件。
+- 客户端断开不会取消任务，worker 跑到底、配额照扣；想取消需显式调 `POST /api/image-tasks/{task_id}/cancel`。
+- 流式超时（300 秒仍在生成）后客户端可用返回的 `task_id` 轮询 `GET /api/image-tasks/{task_id}`，或用同一幂等键重试。
 
 </details>
 
@@ -1001,12 +1059,33 @@ curl http://localhost:3000/api/image-tasks/<task_id> \
   -H "Authorization: Bearer <auth-key>"
 ```
 
+订阅任务 SSE 流（入队后再订阅，而非先流式后轮询）：
+
+```bash
+curl http://localhost:3000/api/image-tasks/<task_id>/stream \
+  -H "Authorization: Bearer <auth-key>"
+```
+
 批量查询任务：
 
 ```bash
 curl "http://localhost:3000/api/image-tasks?ids=<task_id>,<client_task_id>&limit=100&offset=0" \
   -H "Authorization: Bearer <auth-key>"
 ```
+
+**图片生成的三种交付方式：**
+
+| 方式 | 端点 | 特点 | 适用场景 |
+| :--- | :--- | :--- | :--- |
+| **流式（SSE）** | `POST /v1/images/generations` `stream: true` | 任务入队后立刻返回 `task_id` + 15 秒心跳推送进度，生成完成时推送结果；首字节 <200ms；客户端断开不影响任务继续执行 | NewAPI 转发、前端实时进度、长耗时场景（避免中间层超时） |
+| **同步阻塞** | `POST /v1/images/generations` 不传 `stream` | 阻塞直到生成完成（最长 300 秒），一次性返回 JSON；期间无字节输出，中间层易超时 | 短平快场景、兼容不支持 SSE 的客户端 |
+| **异步任务** | `POST /api/image-tasks/generations` 立刻返回 `task_id`，客户端轮询或订阅 | 入队即返回，不等结果；轮询 `GET /api/image-tasks/{task_id}` 或订阅 `GET /api/image-tasks/{task_id}/stream` | 业务系统解耦、批量生图、工作台 UI |
+
+**提示：**
+
+- **NewAPI 渠道转发**：只能用前两种（`/v1/images/*`），异步任务接口（`/api/image-tasks/*`）不是 OpenAI 标准格式，NewAPI 不转发。
+- **流式和异步任务的区别**：流式是「异步任务 + 服务端替你等 + SSE 推送」，底层都是同一个 PostgreSQL 队列；异步任务是「只入队、自己轮询」。
+- **断线续接**：流式超时或断开后，用返回的 `task_id` 调 `GET /api/image-tasks/{task_id}` 拿结果，或用同一幂等键重试（命中已有任务，不重复生图）。
 
 取消任务：
 

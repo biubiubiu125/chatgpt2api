@@ -568,6 +568,19 @@ class ProxySettingsStore:
             self._egress_inflight[key] = int(self._egress_inflight.get(key, 0)) + 1
         return int((time.perf_counter() - started) * 1000)
 
+    def reset_after_fork(self) -> None:
+        """Drop egress accounting inherited from the parent process.
+
+        A forked child inherits the parent's in-flight counters. Those slots
+        belong to work the parent is still doing, so leaving them in place makes
+        the child block forever waiting for a slot that only the parent can free.
+        The child owns exactly the one job it was handed, so it starts empty.
+        """
+        self._egress_inflight = {}
+        self._lock = threading.RLock()
+        self._egress_condition = threading.Condition(self._lock)
+        self._flight_locks = {}
+
     def release_image_egress(self, profile: ProxyRuntimeProfile) -> None:
         limit = max(0, int(getattr(profile, "image_concurrency_limit", 0) or 0))
         if limit <= 0:

@@ -51,14 +51,39 @@ def read_json_object(path: Path, *, name: str | None = None) -> dict[str, Any]:
 def _write_text_atomic(path: Path, content: str) -> None:
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
-        tmp_path.write_text(content, encoding="utf-8")
+        # rename() alone is atomic for readers but says nothing about durability:
+        # a crash can leave the directory entry pointing at unflushed data, which
+        # surfaces as an empty or truncated file. fsync the payload before the
+        # rename, then fsync the directory so the entry itself survives.
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp_path, path)
+        _fsync_directory(path.parent)
     finally:
         try:
             if tmp_path.exists():
                 tmp_path.unlink()
         except OSError:
             pass
+
+
+def _fsync_directory(directory: Path) -> None:
+    # Windows cannot open a directory handle for fsync; on POSIX a missing
+    # directory fsync is the difference between a durable rename and a lost one.
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def write_json_file(path: Path, data: Any, *, backup: bool = True) -> None:

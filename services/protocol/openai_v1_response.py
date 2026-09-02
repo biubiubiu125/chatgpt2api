@@ -124,7 +124,7 @@ def durable_image_request(body: dict[str, Any]) -> tuple[dict[str, Any], str, st
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "input text is required"})
     model = response_image_model(body)
-    image_info = extract_response_image(body.get("input"))
+    image_inputs = extract_response_images(body.get("input"))
     tool = response_image_tool(body)
     count_source = tool.get("n") if tool.get("n") not in (None, "") else body.get("n")
     payload: dict[str, Any] = {
@@ -134,13 +134,15 @@ def durable_image_request(body: dict[str, Any]) -> tuple[dict[str, Any], str, st
         "size": tool.get("size") or body.get("size"),
         "quality": str(tool.get("quality") or body.get("quality") or "auto"),
     }
-    if image_info:
-        image_data, mime_type = image_info
-        payload["images"] = [(image_data, "image.png", mime_type)]
+    if image_inputs:
+        payload["images"] = [
+            (image_data, f"image_{index}.png", mime_type)
+            for index, (image_data, mime_type) in enumerate(image_inputs, start=1)
+        ]
     replay_hash = response_image_source_request_hash(body)
     if replay_hash:
         payload["source_request_hash"] = replay_hash
-    mode = "edit" if image_info else "generation"
+    mode = "edit" if image_inputs else "generation"
     body[_DURABLE_IMAGE_REQUEST_KEY] = {
         "payload": payload,
         "mode": mode,
@@ -149,25 +151,28 @@ def durable_image_request(body: dict[str, Any]) -> tuple[dict[str, Any], str, st
     return payload, mode, "b64_json"
 
 
-def extract_response_image(input_value: object) -> tuple[bytes, str] | None:
+def extract_response_images(input_value: object) -> list[tuple[bytes, str]]:
+    images: list[tuple[bytes, str]] = []
     if isinstance(input_value, dict):
         if str(input_value.get("type") or "").strip() == "input_image":
-            images = extract_image_from_message_content([input_value])
-            return images[0] if images else None
-        images = extract_image_from_message_content(input_value.get("content"))
-        return images[0] if images else None
+            return extract_image_from_message_content([input_value])
+        return extract_image_from_message_content(input_value.get("content"))
     if not isinstance(input_value, list):
-        return None
-    for item in reversed(input_value):
+        return images
+    for item in input_value:
         if isinstance(item, dict):
             if str(item.get("type") or "").strip() == "input_image":
-                images = extract_image_from_message_content([item])
-                if images:
-                    return images[0]
-            images = extract_image_from_message_content(item.get("content"))
-            if images:
-                return images[0]
-    return None
+                extracted = extract_image_from_message_content([item])
+                if extracted:
+                    images.extend(extracted)
+                continue
+            images.extend(extract_image_from_message_content(item.get("content")))
+    return images
+
+
+def extract_response_image(input_value: object) -> tuple[bytes, str] | None:
+    images = extract_response_images(input_value)
+    return images[0] if images else None
 
 
 def _input_image_parts(input_value: object) -> list[dict[str, Any]]:
@@ -570,6 +575,7 @@ def stream_image_response(
                     "id": response_id,
                     "status": "in_progress",
                     "task_id": output.task_id,
+                    **output.progress_fields,
                 },
             }
             continue

@@ -174,7 +174,21 @@ def validate_cluster_database_environment(
 
 
 def is_cluster_public_path(path: str, *, allow_images: bool = True) -> bool:
-    normalized = "/" + _clean(path).lstrip("/")
+    """Decide whether a worker node may serve this path.
+
+    The raw request path is attacker-controlled, so it is canonicalized before
+    matching: ``lstrip("/")`` alone lets ``//images/x`` and ``/images/../api/...``
+    through, and a leading space made ``" /health"`` match. Any traversal or
+    empty segment is rejected outright rather than normalized away, so a path
+    that needs rewriting to look public is simply not public.
+    """
+    raw = str(path or "")
+    if raw != raw.strip():
+        return False
+    segments = raw.split("/")
+    if any(segment in {"", ".", ".."} for segment in segments[1:]):
+        return False
+    normalized = "/" + raw.lstrip("/")
     if normalized in {"/health", "/health/live"}:
         return True
     if not allow_images:

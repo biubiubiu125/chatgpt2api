@@ -649,10 +649,21 @@ class ImageQueueRepository:
                 .where(ImageTask.status.notin_([status.value for status in TERMINAL_TASK_STATUSES]))
                 .where(ImageTask.completed_at.is_(None))
                 .where(ImageJob.status.in_([JobStatus.QUEUED.value, JobStatus.RETRY_WAIT.value]))
+                # A requeued job keeps the stage it reached before its lease expired,
+                # so an expiry sweep must only touch jobs that never started real work.
+                # Anything past GENERATING (or anything that already consumed quota)
+                # owns a downloaded or saved artifact the caller already paid for, and
+                # recovery -- not expiry -- is what finishes it.
+                .where(ImageJob.quota_consumed.is_(False))
                 .where(or_(
                     and_(
                         ImageJob.status == JobStatus.QUEUED.value,
-                        or_(ImageJob.created_at <= cutoff, ImageTask.queued_at <= cutoff),
+                        ImageJob.stage.in_([
+                            JobStage.QUEUED.value,
+                            JobStage.LEASED.value,
+                            JobStage.GENERATING.value,
+                        ]),
+                        or_(ImageJob.available_at <= cutoff, ImageTask.queued_at <= cutoff),
                     ),
                     and_(
                         ImageJob.status == JobStatus.RETRY_WAIT.value,
@@ -1020,7 +1031,20 @@ class ImageQueueRepository:
         extra_timeout_secs: float = 30.0,
     ) -> TaskSnapshot | None:
         with self.database.session() as session:
-            task = self._find_task(session, owner_key, task_or_client_id, lock=True)
+            # Lock order must match claim_next_job and reclaim_expired_leases:
+            # ImageJob rows first, then ImageTask. Locating the task first is fine
+            # as long as that lookup takes no lock -- taking the task lock before
+            # the job locks here is what deadlocks against a concurrent claim.
+            located = self._find_task(session, owner_key, task_or_client_id)
+            if located is None:
+                return None
+            jobs = session.execute(
+                select(ImageJob)
+                .where(ImageJob.task_id == located.id, ImageJob.status == JobStatus.FAILED.value)
+                .order_by(ImageJob.id)
+                .with_for_update()
+            ).scalars().all()
+            task = self._task_for_update(session, located.id)
             if task is None:
                 return None
             if task.cancel_requested:
@@ -1032,11 +1056,6 @@ class ImageQueueRepository:
             request_payload = dict(task.request_payload or {})
             request_payload["resume_poll_timeout_seconds"] = resume_timeout
             task.request_payload = request_payload
-            jobs = session.execute(
-                select(ImageJob)
-                .where(ImageJob.task_id == task.id, ImageJob.status == JobStatus.FAILED.value)
-                .with_for_update()
-            ).scalars().all()
             resumed = 0
             for job in jobs:
                 if job.image_urls:

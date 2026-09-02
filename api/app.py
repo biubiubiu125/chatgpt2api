@@ -23,9 +23,10 @@ from services.cluster_settings import (
 )
 from services.account_service import account_service
 from services.backup_service import backup_service
-from services.config import config
+from services.config import DATA_DIR, config
 from services.editable_file_task_service import editable_file_task_service
 from services.dashboard_metrics_service import dashboard_metrics_service
+from services.file_lock import release_file_lock, try_acquire_file_lock
 from services.image_service import start_image_cleanup_scheduler
 from services.image_queue.database import ImageQueueUnavailableError
 from services.image_queue.resource_controller import ResourceController
@@ -151,6 +152,35 @@ def _configure_image_queue_integrations(cluster_settings=None, *, on_resource_co
         register_service.resume_if_enabled()
 
 
+WORKER_JOIN_STATUS_UNVERIFIED = "unverified"
+
+
+def _worker_join_status_or_pending(cluster_settings, seen_errors: set[str] | None = None) -> str:
+    """Return the worker join status, treating any check failure as pending.
+
+    A missing marker, an expired activation window, or a temporarily unreachable
+    app database all raise here. None of those should take the node down: the
+    worker still serves its public image routes, and the startup retry loop keeps
+    re-checking, so a WireGuard blip or a slow activation resolves on its own.
+    Callers polling in a loop pass ``seen_errors`` so a persistent cause is
+    reported once instead of every few seconds.
+    """
+    try:
+        return worker_join_marker_status(cluster_settings)
+    except Exception as exc:
+        error = str(exc)
+        if seen_errors is None or error not in seen_errors:
+            if seen_errors is not None:
+                seen_errors.add(error)
+            logger.warning({
+                "event": "worker_join_activation_pending",
+                "status": WORKER_JOIN_STATUS_UNVERIFIED,
+                "error": error,
+                "impact": "worker public routes remain available; image queue is not claiming jobs",
+            })
+        return WORKER_JOIN_STATUS_UNVERIFIED
+
+
 def _start_image_queue_retry(
     stop_event: Event,
     cluster_settings=None,
@@ -160,18 +190,17 @@ def _start_image_queue_retry(
 ) -> Thread:
     retry_seconds = _env_float("IMAGE_QUEUE_STARTUP_RETRY_SECONDS", 5.0, 0.05, 300.0)
     resolved_cluster_settings = cluster_settings or load_cluster_settings()
+    reported_join_errors: set[str] = set()
 
     def retry() -> None:
         while not stop_event.wait(retry_seconds):
             try:
                 if resolved_cluster_settings.is_worker and resolved_cluster_settings.run_worker:
-                    marker_status = worker_join_marker_status(resolved_cluster_settings)
+                    marker_status = _worker_join_status_or_pending(
+                        resolved_cluster_settings,
+                        reported_join_errors,
+                    )
                     if marker_status != WORKER_JOIN_STATUS_JOINED:
-                        logger.warning({
-                            "event": "worker_join_activation_pending",
-                            "status": marker_status,
-                            "impact": "worker public routes remain available; image queue is not claiming jobs",
-                        })
                         continue
                 image_task_service.start()
                 _configure_image_queue_integrations(
@@ -247,6 +276,7 @@ async def _run_lifespan_services(
         image_cleanup_thread: Thread | None = None
         log_cleanup_thread: Thread | None = None
         threadpool_governor: ThreadPoolGovernor | None = None
+        main_services_lock = None
         run_main_services = not cluster_settings.is_worker
         queue_started = False
 
@@ -286,9 +316,17 @@ async def _run_lifespan_services(
         # existing files are durable queue state and must be retained.
         config.set_image_retention_protection(config.all_image_paths)
         backup_service.set_register_config_provider(register_service._runtime_config)
+        if run_main_services:
+            main_services_lock = try_acquire_file_lock(DATA_DIR / "main-services.lock")
+            if main_services_lock is None:
+                logger.info({
+                    "event": "main_services_already_running",
+                    "note": "skipping duplicate main-node background services in this process",
+                })
+                run_main_services = False
         worker_queue_ready = True
         if cluster_settings.is_worker and cluster_settings.run_worker:
-            marker_status = worker_join_marker_status(cluster_settings)
+            marker_status = _worker_join_status_or_pending(cluster_settings)
             worker_queue_ready = marker_status == WORKER_JOIN_STATUS_JOINED
             if not worker_queue_ready:
                 logger.warning({
@@ -371,6 +409,8 @@ async def _run_lifespan_services(
                 except Exception as exc:
                     logger.error({"event": "dashboard_metrics_shutdown_flush_failed", "error": str(exc)})
                 backup_service.stop()
+            if main_services_lock is not None:
+                release_file_lock(main_services_lock)
 
 
 def _build_app(app_version: str, cluster_settings, lifespan) -> FastAPI:

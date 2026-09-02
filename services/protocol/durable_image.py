@@ -426,6 +426,46 @@ def ensure_submission(
     return _submission(body, payload, mode, response_format)
 
 
+_PROGRESS_SNAPSHOT_FIELDS = (
+    "status",
+    "stage",
+    "progress",
+    "queue_position",
+    "estimated_wait_seconds",
+    "wait_reason",
+    "succeeded_jobs",
+    "failed_jobs",
+    "required_jobs",
+)
+
+
+def _progress_fields(identity: Mapping[str, object], task_id: str) -> dict[str, Any]:
+    """把任务快照里的排队/阶段字段带进心跳事件。
+
+    心跳本身只是保活，附带这些字段后客户端才能显示排队位置和当前阶段。
+    读取失败时静默降级为空字典，心跳不应该因为这个附加信息而中断。
+    """
+    reader = getattr(image_task_service, "progress_snapshot", None)
+    if not callable(reader):
+        return {}
+    try:
+        snapshot = reader(identity, task_id)
+    except Exception:
+        return {}
+    if not isinstance(snapshot, Mapping):
+        return {}
+    fields: dict[str, Any] = {}
+    for key in _PROGRESS_SNAPSHOT_FIELDS:
+        value = snapshot.get(key)
+        if value in (None, ""):
+            continue
+        if key == "status":
+            fields["task_status"] = value
+            continue
+        fields[key] = value
+    return fields
+
+
 def stream_outputs(
     body: dict[str, Any],
     payload: Mapping[str, Any],
@@ -447,6 +487,7 @@ def stream_outputs(
         total=total,
         upstream_event_type="queued",
         task_id=task_id,
+        progress_fields=_progress_fields(identity, task_id),
     )
 
     prepared = body.get(_PREPARED_RESULT_KEY)
@@ -477,6 +518,7 @@ def stream_outputs(
                 total=total,
                 upstream_event_type="in_progress",
                 task_id=task_id,
+                progress_fields=_progress_fields(identity, task_id),
             )
             continue
         try:

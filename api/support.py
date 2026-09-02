@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 from ipaddress import ip_address
 from pathlib import Path
 from threading import Event, Thread
@@ -61,7 +62,9 @@ def extract_bearer_token(authorization: str | None) -> str:
 
 def _legacy_admin_identity(token: str) -> dict[str, object] | None:
     auth_key = str(config.auth_key or "").strip()
-    if auth_key and token == auth_key:
+    # compare_digest over bytes: a non-ASCII bearer token would make the str
+    # form raise TypeError instead of simply failing to match.
+    if auth_key and hmac.compare_digest(token.encode("utf-8"), auth_key.encode("utf-8")):
         return {"id": "admin", "name": "管理员", "role": "admin"}
     return None
 

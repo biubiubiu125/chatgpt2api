@@ -1,7 +1,6 @@
 services:
   data-permissions:
     image: ${CHATGPT2API_IMAGE:-ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a}
-    container_name: chatgpt2api-main-data-permissions
     user: "0:0"
     volumes:
       - ./data:/app/data
@@ -16,7 +15,6 @@ services:
 
   postgres:
     image: postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
-    container_name: chatgpt2api-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: chatgpt2api_runtime
@@ -26,7 +24,7 @@ services:
       CHATGPT2API_POSTGRES_ADMIN_USER: ${POSTGRES_ADMIN_USER:-chatgpt2api_admin}
       CHATGPT2API_POSTGRES_ADMIN_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?POSTGRES_ADMIN_PASSWORD is required}
     ports:
-      - "${WIREGUARD_SERVER_IP:?WIREGUARD_SERVER_IP must be set to an address configured on the main WireGuard interface}:5432:5432"
+      - "${WIREGUARD_SERVER_IP:?WIREGUARD_SERVER_IP must be set to an address configured on the main WireGuard interface}:${CHATGPT2API_POSTGRES_PORT:-5432}:5432"
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
       - ./deploy/postgres-init:/docker-entrypoint-initdb.d:ro
@@ -39,7 +37,6 @@ services:
 
   app:
     image: ${CHATGPT2API_IMAGE:-ghcr.io/biubiubiu125/chatgpt2api@sha256:c70f118780c9b6e194353b09e8530e20eeed2496cddf9f80ee36c41775178f0a}
-    container_name: chatgpt2api-main
     restart: unless-stopped
     depends_on:
       postgres:
@@ -52,10 +49,12 @@ services:
       - ./data:/app/data
     environment:
       CHATGPT2API_CONFIG_FILE: /app/data/config.json
+      CHATGPT2API_CLUSTER_JOIN_SIGNING_PUBLIC_KEY_FILE: /app/data/join-signing.pub
       CHATGPT2API_NODE_ROLE: api-main
       CHATGPT2API_RUN_API: "true"
       CHATGPT2API_RUN_WORKER: "false"
       CHATGPT2API_CLUSTER_ID: ${CHATGPT2API_CLUSTER_ID:?CHATGPT2API_CLUSTER_ID is required}
+      CHATGPT2API_CLUSTER_JOIN_REQUEST_DIR: /app/data/cluster-join-requests
       STORAGE_BACKEND: postgres
       APP_DATABASE_URL: "postgresql+psycopg2://chatgpt2api_runtime:${POSTGRES_PASSWORD_URLENCODED:?POSTGRES_PASSWORD_URLENCODED is required; URL-encode POSTGRES_PASSWORD for database URLs}@postgres:5432/chatgpt2api_app"
       DATABASE_URL: "postgresql+psycopg2://chatgpt2api_runtime:${POSTGRES_PASSWORD_URLENCODED:?POSTGRES_PASSWORD_URLENCODED is required; URL-encode POSTGRES_PASSWORD for database URLs}@postgres:5432/chatgpt2api_app"

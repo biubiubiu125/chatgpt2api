@@ -114,11 +114,13 @@ docker compose -f docker-compose.warp.yml ps
 查看 FlareSolverr 日志：
 
 ```bash
-docker logs -f chatgpt2api-flaresolverr
+docker compose -f docker-compose.warp.yml logs -f flaresolverr
 ```
 
 查看主服务注册日志：
 
 ```bash
-docker logs -f chatgpt2api-warp
+docker compose -f docker-compose.warp.yml logs -f app
 ```
+
+容器名由 Compose 项目名派生（每套安装各自独立），所以请统一用 `docker compose ... logs <服务名>`，不要按固定容器名执行 `docker logs`。

@@ -39,7 +39,6 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
                 model=model,
             ),
             event_prefix="image_generation",
-            partial_images=body.get("partial_images"),
             usage_builder=lambda data: image_usage(
                 input_text_tokens=count_text_tokens(prompt, model),
                 output_tokens=count_image_output_items_tokens(data, size, quality),

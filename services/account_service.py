@@ -199,6 +199,36 @@ class AccountService:
         self._cumulative_total = self._load_cumulative_total()
         self._refresh_progress_file = self._get_refresh_progress_file()
 
+    def reset_after_fork(self) -> None:
+        """Rebuild locks and in-memory concurrency state after a fork.
+
+        A forked child inherits the parent's locks in whatever state they were
+        in at fork time, plus in-flight counters and refresh futures that belong
+        to work only the parent can finish. Both are fatal in the child: an
+        inherited held lock deadlocks, and inherited image slots make the child
+        wait for a slot the parent owns. The child re-reads accounts from
+        storage so it starts from committed state rather than a stale snapshot.
+        """
+        self._lock = Lock()
+        self._token_refresh_lock = Lock()
+        self._oauth_refresh_flights_lock = Lock()
+        self._oauth_refresh_flights = {}
+        self._image_auth_condition = Condition(Lock())
+        self._image_auth_active = 0
+        self._image_slot_condition = Condition(self._lock)
+        self._image_inflight = {}
+        self._image_failure_refresh_lock = Lock()
+        self._image_failure_refresh_active = set()
+        self._image_failure_refresh_active_scopes = {}
+        self._image_failure_refresh_rerun = set()
+        self._image_failure_refresh_pending = deque()
+        self._image_failure_refresh_pending_set = set()
+        self._image_failure_refresh_pending_scopes = {}
+        self._image_failure_refresh_started_at = {}
+        self._token_aliases = {}
+        self._persisted_accounts = {}
+        self._accounts = self._load_accounts()
+
     def _get_cumulative_file(self) -> Path:
         storage_path = getattr(self.storage, "file_path", None)
         if isinstance(storage_path, Path):

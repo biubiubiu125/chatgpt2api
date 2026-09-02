@@ -1189,7 +1189,12 @@ class ImageTaskService:
             return True
         return False
 
-    def execute_claim(self, claim: ClaimedJob, access_token: str) -> None:
+    def execute_claim(
+        self,
+        claim: ClaimedJob,
+        access_token: str,
+        runtime_guard: Callable[[], None] | None = None,
+    ) -> None:
         repository = self._require_repository()
         if self.artifact_service is None:
             raise ImageQueueUnavailableError("image artifact service is not started")
@@ -1258,6 +1263,8 @@ class ImageTaskService:
                     return
                 if repository.is_cancel_requested(claim.job.task_id):
                     raise RuntimeError("image task was canceled")
+                if runtime_guard is not None:
+                    runtime_guard()
 
             def note_stage(stage: JobStage) -> None:
                 callback = getattr(self.worker, "note_claim_stage", None)
@@ -1885,6 +1892,21 @@ class ImageTaskService:
             response_format=response_format,
             source_request_hash=source_request_hash,
         )
+
+    def progress_snapshot(
+        self,
+        identity: Mapping[str, object] | str,
+        task_id: object,
+    ) -> dict[str, Any]:
+        """读取任务进度字段，不做交付校验，用于流式心跳。
+
+        与 get_task 不同，这里不触发 artifact 校验和 URL 复核，因为心跳只需要
+        排队位置和阶段文案，任务尚未进入终态。
+        """
+        task = self._require_repository().get_task(_owner_key(identity), task_id)
+        if task is None:
+            return {}
+        return self._public_snapshot(task)
 
     def get_task(self, identity: Mapping[str, object] | str, task_id: object) -> dict[str, Any]:
         repository = self._require_repository()

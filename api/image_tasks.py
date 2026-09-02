@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+import json
+import time
+from typing import AsyncIterator
+
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.image_inputs import image_edit_source_request_hash, parse_image_edit_request, read_image_source_groups
@@ -12,8 +19,13 @@ from services.image_task_service import image_task_service
 from services.image_queue.artifact_service import InvalidImageArtifact
 from services.image_queue.idempotency import select_idempotency_key
 from services.image_queue.repository import IdempotencyConflict, TaskStateConflict
+from services.image_queue.types import TERMINAL_TASK_STATUSES, TaskStatus
+from services.image_failure import image_failure, public_image_error_message
 from services.log_service import LoggedCall
 from services.quota_service import reserve_quota
+
+
+logger = logging.getLogger(__name__)
 
 
 class ImageGenerationTaskRequest(BaseModel):
@@ -147,7 +159,6 @@ def _commit_quota_or_raise(quota, result: object, idempotency_key: str) -> None:
                 ),
                 "task_id": _task_id_from_result(result),
                 "idempotency_key": str(idempotency_key or ""),
-                "reason": str(exc),
             },
         ) from exc
 
@@ -453,5 +464,148 @@ def create_router() -> APIRouter:
             ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+
+    @router.get("/api/image-tasks/{task_id}/stream")
+    async def stream_image_task(
+        task_id: str,
+        authorization: str | None = Header(default=None),
+        timeout: float = Query(default=300.0, ge=10.0, le=600.0),
+    ):
+        """订阅已有任务的 SSE 流，复用 wait_for_terminal_async 的通知机制。
+
+        适用场景：客户端已通过 POST /api/image-tasks/generations 拿到 task_id，
+        之后用此端点订阅而非轮询。事件词汇与 /v1/images/* 流式响应一致，
+        但 payload 是 ImageTaskResponse 形状而非 OpenAI image chunk。
+        """
+        identity = require_identity(authorization)
+
+        # 提前校验任务是否存在且归属正确，让 404 走 JSON 响应而非流内错误。
+        try:
+            snapshot = await run_in_threadpool(
+                image_task_service.progress_snapshot,
+                identity,
+                task_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+        if not snapshot:
+            raise HTTPException(status_code=404, detail={"error": "image task not found"})
+
+        mode = str(snapshot.get("mode") or "generate")
+        event_prefix = "image_edit" if mode == "edit" else "image_generation"
+        terminal_statuses = {status.value for status in TERMINAL_TASK_STATUSES}
+
+        async def event_generator() -> AsyncIterator[str]:
+            current_snapshot = snapshot
+            task_status = str(current_snapshot.get("status") or "queued").lower()
+            already_terminal = task_status in terminal_statuses
+
+            # 首事件：初始快照。
+            if already_terminal:
+                try:
+                    current_snapshot = await run_in_threadpool(
+                        image_task_service.get_task,
+                        identity,
+                        task_id,
+                    )
+                except Exception as exc:
+                    logger.warning({
+                        "event": "image_task_stream_terminal_refresh_failed",
+                        "task_id": task_id,
+                        "error_type": exc.__class__.__name__,
+                    })
+                    failure = image_failure("internal_error")
+                    error_payload = {
+                        "error": {
+                            "message": public_image_error_message(failure),
+                            "type": failure.error_type,
+                            "code": failure.code,
+                            "task_id": task_id,
+                        },
+                    }
+                    yield f"event: error\n"
+                    yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                task_status = str(current_snapshot.get("status") or task_status).lower()
+                already_terminal = task_status in terminal_statuses
+                if not already_terminal:
+                    yield f"event: {event_prefix}.in_progress\n"
+                    yield f"data: {json.dumps(current_snapshot, ensure_ascii=False)}\n\n"
+                else:
+                    status = "completed" if task_status == "success" else "failed"
+                    yield f"event: {event_prefix}.{status}\n"
+                    yield f"data: {json.dumps(current_snapshot, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+            else:
+                yield f"event: {event_prefix}.queued\n"
+                yield f"data: {json.dumps(current_snapshot, ensure_ascii=False)}\n\n"
+
+            # 心跳 + 终态轮询。
+            deadline = time.monotonic() + timeout
+            heartbeat_interval = 15.0
+            try:
+                while True:
+                    remaining = max(0.1, deadline - time.monotonic())
+                    poll_timeout = min(heartbeat_interval, remaining)
+                    try:
+                        terminal = await asyncio.wait_for(
+                            image_task_service.wait_for_terminal_async(identity, task_id, poll_timeout),
+                            timeout=poll_timeout + 1.0,
+                        )
+                        # 拿到终态快照。
+                        status = str(terminal.get("status") or "success").lower()
+                        event_type = "completed" if status == "success" else "failed"
+                        yield f"event: {event_prefix}.{event_type}\n"
+                        yield f"data: {json.dumps(terminal, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    except asyncio.TimeoutError:
+                        # 心跳：拉取当前进度。
+                        progress = await run_in_threadpool(
+                            image_task_service.progress_snapshot,
+                            identity,
+                            task_id,
+                        )
+                        if progress:
+                            yield f"event: {event_prefix}.in_progress\n"
+                            yield f"data: {json.dumps(progress, ensure_ascii=False)}\n\n"
+                        if time.monotonic() >= deadline:
+                            # 超时：发 pending 错误 + [DONE] 让客户端知道流结束。
+                            failure = image_failure("image_task_pending")
+                            error_payload = {
+                                "error": {
+                                    "message": f"Image task {task_id} is still running",
+                                    "type": failure.error_type,
+                                    "code": failure.code,
+                                    "task_id": task_id,
+                                },
+                            }
+                            yield f"event: {event_prefix}.failed\n"
+                            yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+            except Exception as exc:
+                # 流内异常：发 error 事件 + [DONE]。
+                logger.warning({
+                    "event": "image_task_stream_error",
+                    "task_id": task_id,
+                    "error_type": exc.__class__.__name__,
+                })
+                failure = image_failure("internal_error")
+                error_payload = {
+                    "error": {
+                        "message": public_image_error_message(failure),
+                        "type": failure.error_type,
+                        "code": failure.code,
+                        "task_id": task_id,
+                    },
+                }
+                yield f"event: error\n"
+                yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     return router

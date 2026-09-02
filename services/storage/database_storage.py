@@ -55,6 +55,16 @@ class DatabaseStorageBackend(StorageBackend):
         self.Session = sessionmaker(bind=self.engine)
         self._write_lock = threading.RLock()
 
+    def reset_after_fork(self) -> None:
+        """Stop sharing the parent's pooled connections and write lock.
+
+        ``close=False`` disposes the pool without closing the inherited sockets,
+        which the parent is still using; the child opens its own on next
+        checkout. The write lock is rebuilt because a fork can inherit it held.
+        """
+        self.engine.dispose(close=False)
+        self._write_lock = threading.RLock()
+
     def load_accounts(self) -> list[dict[str, Any]]:
         """从数据库加载账号数据"""
         return self._load_rows(AccountModel, identity_key="access_token", stored_key="access_token")

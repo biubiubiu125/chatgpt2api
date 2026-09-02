@@ -318,6 +318,11 @@ def image_sse_stream(
         error = _stream_error_payload(exc, error_builder)
         yield "event: error\n"
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+        return
+    # Relays such as NewAPI only mark a stream as cleanly finished when they see
+    # a terminal [DONE]; without it they fall back to EOF and never re-emit one
+    # for the client.
+    yield "data: [DONE]\n\n"
 
 
 def anthropic_sse_stream(

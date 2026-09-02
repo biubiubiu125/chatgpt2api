@@ -36,17 +36,30 @@ jobs:
       - name: Validate shell and deployment manifests
         run: |
           bash -n deploy/install.sh
+          bash -n deploy/cluster-join-helper.sh
           bash -n deploy/postgres-init/001-create-cluster-databases.sh
           bash tests/scripts/test-install-script.sh
+          bash tests/scripts/test-postgres-init-script.sh
+          bash tests/scripts/test-cluster-join-helper.sh
           bash tests/scripts/test-deployment-manifest-files.sh
           bash tests/scripts/test-frontend-script-manifest.sh
-          IMAGE_QUEUE_DATABASE_URL='postgresql://user:password@db:5432/chatgpt2api_image_queue' \
-            CHATGPT2API_WARP_IMAGE='caomingjun/warp@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
-            CHATGPT2API_PRIVOXY_IMAGE='vimagick/privoxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+          POSTGRES_PASSWORD='runtime-password' \
+          POSTGRES_ADMIN_PASSWORD='admin-password' \
+          POSTGRES_ADMIN_USER='chatgpt2api_admin' \
+          APP_DATABASE_URL='postgresql+psycopg2://chatgpt2api_runtime:runtime-password@postgres:5432/chatgpt2api_app' \
+          DATABASE_URL='postgresql+psycopg2://chatgpt2api_runtime:runtime-password@postgres:5432/chatgpt2api_app' \
+          IMAGE_QUEUE_DATABASE_URL='postgresql+psycopg2://chatgpt2api_runtime:runtime-password@postgres:5432/chatgpt2api_image_queue' \
+          CHATGPT2API_WARP_IMAGE='caomingjun/warp@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+          CHATGPT2API_PRIVOXY_IMAGE='vimagick/privoxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
             docker compose -f docker-compose.yml config --quiet
-          IMAGE_QUEUE_DATABASE_URL='postgresql://user:password@db:5432/chatgpt2api_image_queue' \
-            CHATGPT2API_WARP_IMAGE='caomingjun/warp@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
-            CHATGPT2API_PRIVOXY_IMAGE='vimagick/privoxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+          POSTGRES_PASSWORD='runtime-password' \
+          POSTGRES_ADMIN_PASSWORD='admin-password' \
+          POSTGRES_ADMIN_USER='chatgpt2api_admin' \
+          APP_DATABASE_URL='postgresql+psycopg2://chatgpt2api_runtime:runtime-password@postgres:5432/chatgpt2api_app' \
+          DATABASE_URL='postgresql+psycopg2://chatgpt2api_runtime:runtime-password@postgres:5432/chatgpt2api_app' \
+          IMAGE_QUEUE_DATABASE_URL='postgresql+psycopg2://chatgpt2api_runtime:runtime-password@postgres:5432/chatgpt2api_image_queue' \
+          CHATGPT2API_WARP_IMAGE='caomingjun/warp@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+          CHATGPT2API_PRIVOXY_IMAGE='vimagick/privoxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
             docker compose -f docker-compose.warp.yml config --quiet
           POSTGRES_PASSWORD='runtime-password' \
           POSTGRES_ADMIN_PASSWORD='admin-password' \
@@ -126,12 +139,22 @@ jobs:
           test -n "${default_release_ref}"
           test -n "${manifest_release_ref}"
           test "${default_release_ref}" = "${manifest_release_ref}"
+          for required_file in \
+            deploy/cluster-join-helper.sh \
+            deploy/postgres-init/001-create-cluster-databases.sh \
+            services/cluster_join_request.py \
+            tests/scripts/test-cluster-join-helper.sh \
+            tests/scripts/test-postgres-init-script.sh \
+            web-vue/scripts/test-settings-image-base-url.mjs; do
+            git cat-file -e "${GITHUB_SHA}:${required_file}"
+          done
 
       - name: Validate frontend regression scripts
         working-directory: web-vue
         run: |
           npm ci --no-audit --no-fund
           npm run test:debug-center-editable-tasks
+          npm run test:settings-image-base-url
           npm run test:register-provider
           npm run test:studio-image-tasks
           npm run test:third-party-links
@@ -216,4 +239,16 @@ jobs:
               --title "chatgpt2api ${GITHUB_SHA}" \
               --notes "Immutable deployment manifest for ${GITHUB_SHA}" \
               deploy/release-manifest.env
+          fi
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            default_channel_tag="chatgpt2api-latest"
+            if gh release view "${default_channel_tag}" >/dev/null 2>&1; then
+              gh release upload "${default_channel_tag}" deploy/release-manifest.env --clobber
+            else
+              gh release create "${default_channel_tag}" \
+                --target "${GITHUB_SHA}" \
+                --title "chatgpt2api latest" \
+                --notes "Stable deployment manifest for the latest main build." \
+                deploy/release-manifest.env
+            fi
           fi

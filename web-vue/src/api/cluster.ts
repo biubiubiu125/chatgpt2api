@@ -46,8 +46,22 @@ export interface ClusterState {
   register: Record<string, any>
 }
 
+// `create` refuses a Worker number that is already registered; `rotate` revokes the
+// previous credentials for that number and issues a fresh set.
+export type WorkerJoinOperation = 'create' | 'rotate'
+
 export const clusterApi = {
   state() {
     return apiClient.get<never, ClusterState>('/api/cluster/state')
+  },
+  createJoinFile(
+    workerNo: number,
+    options?: { operation?: WorkerJoinOperation; signal?: AbortSignal },
+  ) {
+    return apiClient.post<{ worker_no: number; operation: WorkerJoinOperation }, Blob>(
+      '/api/cluster/join-file',
+      { worker_no: workerNo, operation: options?.operation || 'create' },
+      { responseType: 'blob', timeout: 150000, signal: options?.signal },
+    )
   },
 }

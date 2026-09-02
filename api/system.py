@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import os
+import threading
 from copy import deepcopy
 from datetime import datetime, timedelta
 from functools import lru_cache
-from typing import Any
+from contextlib import suppress
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Literal
 from urllib.parse import quote
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
@@ -18,6 +24,7 @@ from api.support import require_admin, require_identity, resolve_image_base_url
 from services.cluster_settings import ROLE_API_MAIN, load_cluster_settings
 from services.cluster_state import build_cluster_runtime_health, build_cluster_snapshot, current_node_payload
 from services.cluster_join_store import ClusterJoinStore
+from services.cluster_join_request import ClusterJoinRequestError, request_worker_join_file
 from services.account_service import account_service
 from services.backup_service import BackupError, backup_service
 from services.config import SECRET_MASK, config
@@ -214,6 +221,13 @@ class RetentionCleanupRequest(BaseModel):
 class AccountCleanupRequest(BaseModel):
     auto_remove_invalid_accounts: bool | None = None
     auto_remove_rate_limited_accounts: bool | None = None
+
+
+class WorkerJoinFileRequest(BaseModel):
+    worker_no: int = Field(..., ge=1, le=244)
+    # `rotate` revokes the previous credentials for this number and issues fresh ones;
+    # `create` refuses a number that is already taken.
+    operation: Literal["create", "rotate"] = "create"
 
 
 def _clean_text(value: object) -> str:
@@ -1094,6 +1108,84 @@ def create_router(app_version: str) -> APIRouter:
         if join_error:
             snapshot["join_error"] = join_error
         return snapshot
+
+    @router.post("/api/cluster/join-file")
+    async def download_worker_join_file(
+        body: WorkerJoinFileRequest,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        if not load_cluster_settings().is_api_main:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "Worker join files can only be generated on the API main node"},
+            )
+        request_dir = os.getenv(
+            "CHATGPT2API_CLUSTER_JOIN_REQUEST_DIR",
+            "/app/data/cluster-join-requests",
+        )
+        cancel_requested = threading.Event()
+
+        async def watch_disconnect() -> None:
+            try:
+                while not cancel_requested.is_set():
+                    if await request.is_disconnected():
+                        cancel_requested.set()
+                        return
+                    await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                raise
+
+        disconnect_task = asyncio.create_task(watch_disconnect())
+        try:
+            public_key_path = Path(
+                os.getenv(
+                    "CHATGPT2API_CLUSTER_JOIN_SIGNING_PUBLIC_KEY_FILE",
+                    "/app/data/join-signing.pub",
+                )
+            )
+            public_key = await run_in_threadpool(public_key_path.read_bytes)
+            if not public_key.strip():
+                raise OSError(f"Worker join signing public key is empty: {public_key_path}")
+            payload, join_filename = await run_in_threadpool(
+                request_worker_join_file,
+                request_dir,
+                body.worker_no,
+                operation=body.operation,
+                cancel_requested=cancel_requested.is_set,
+            )
+            bundle = BytesIO()
+            with ZipFile(bundle, mode="w", compression=ZIP_DEFLATED) as archive:
+                join_info = ZipInfo(join_filename)
+                join_info.create_system = 3
+                join_info.external_attr = 0o600 << 16
+                archive.writestr(join_info, payload)
+                public_key_info = ZipInfo("join-signing.pub")
+                public_key_info.create_system = 3
+                public_key_info.external_attr = 0o644 << 16
+                archive.writestr(public_key_info, public_key)
+        except ClusterJoinRequestError as exc:
+            raise HTTPException(status_code=exc.status_code, detail={"error": str(exc)}) from exc
+        except OSError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"error": f"Worker join signing public key is unavailable: {exc}"},
+            ) from exc
+        finally:
+            cancel_requested.set()
+            disconnect_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await disconnect_task
+        return Response(
+            content=bundle.getvalue(),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="worker-{body.worker_no}-config.zip"'
+                )
+            },
+        )
 
     @router.post("/api/backup/test")
     async def test_backup_connection(authorization: str | None = Header(default=None)):
