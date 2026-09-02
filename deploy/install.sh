@@ -1604,6 +1604,41 @@ default_release_channel_applies() {
     && -z "${CHATGPT2API_IMAGE_DIGEST:-}" ]]
 }
 
+load_builtin_release_manifest_defaults() {
+  local manifest_file="${INSTALL_DIR}/deploy/release-manifest.env"
+  local manifest_dir="${INSTALL_DIR}/deploy"
+  local builtin_image=""
+
+  if ! builtin_image="$(default_image)"; then
+    return 1
+  fi
+
+  reset_release_manifest_values
+  : "${CHATGPT2API_RELEASE_REF:=${DEFAULT_RELEASE_REF}}"
+  : "${CHATGPT2API_IMAGE:=${builtin_image}}"
+  : "${CHATGPT2API_IMAGE_DIGEST:=${DEFAULT_CHATGPT2API_IMAGE_DIGEST}}"
+  : "${UV_VERSION:=0.8.17}"
+  : "${CHATGPT2API_WARP_IMAGE:=${DEFAULT_CHATGPT2API_WARP_IMAGE}}"
+  : "${CHATGPT2API_PRIVOXY_IMAGE:=${DEFAULT_CHATGPT2API_PRIVOXY_IMAGE}}"
+  : "${CHATGPT2API_FLARESOLVERR_IMAGE:=${DEFAULT_CHATGPT2API_FLARESOLVERR_IMAGE}}"
+  BRANCH="${CHATGPT2API_RELEASE_REF:-${BRANCH:-}}"
+
+  mkdir -p "${manifest_dir}"
+  cat >"${manifest_file}" <<EOF
+CHATGPT2API_RELEASE_REF=${CHATGPT2API_RELEASE_REF}
+CHATGPT2API_IMAGE=${CHATGPT2API_IMAGE}
+CHATGPT2API_IMAGE_DIGEST=${CHATGPT2API_IMAGE_DIGEST}
+UV_VERSION=${UV_VERSION}
+CHATGPT2API_WARP_IMAGE=${CHATGPT2API_WARP_IMAGE}
+CHATGPT2API_PRIVOXY_IMAGE=${CHATGPT2API_PRIVOXY_IMAGE}
+CHATGPT2API_FLARESOLVERR_IMAGE=${CHATGPT2API_FLARESOLVERR_IMAGE}
+EOF
+  if [[ -d "${manifest_dir}" ]] && [[ -z "$(find "${manifest_dir}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+    rmdir -- "${manifest_dir}" 2>/dev/null || true
+  fi
+  return 0
+}
+
 should_load_release_manifest() {
   [[ "${RELEASE_REF_SELECTED}" == "1" ]] && return 0
   default_release_channel_applies
@@ -1737,6 +1772,12 @@ load_release_manifest() {
   trash_path "${tmp_manifest}"
   if [[ -d "${manifest_dir}" ]] && [[ -z "$(find "${manifest_dir}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     rmdir -- "${manifest_dir}" 2>/dev/null || true
+  fi
+  if [[ "${BRANCH}" == "${DEFAULT_RELEASE_REF}" && ( -z "${requested_release_ref}" || "${requested_release_ref}" == "${DEFAULT_RELEASE_REF}" ) ]]; then
+    if load_builtin_release_manifest_defaults; then
+      printf '%s\n' "release manifest unavailable for ${REPO_OWNER}/${REPO_NAME}@${BRANCH}; using the bundled default release metadata." >&2
+      return 0
+    fi
   fi
   printf '%s\n' "release manifest unavailable for ${REPO_OWNER}/${REPO_NAME}@${BRANCH}; refusing to continue without release-matched image metadata." >&2
   return 1

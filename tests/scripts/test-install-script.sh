@@ -564,6 +564,11 @@ BRANCH="${DEFAULT_RELEASE_REF}"
 REPO_OWNER="biubiubiu125"
 REPO_NAME="chatgpt2api"
 CHATGPT2API_RELEASE_REF=""
+CLI_BRANCH_SET="0"
+CLI_BRANCH_VALUE=""
+ENV_RELEASE_REF_SET="0"
+ENV_RELEASE_REF_VALUE=""
+RELEASE_REF_SELECTED="0"
 unset -f curl 2>/dev/null || true
 curl() { return 22; }
 load_release_manifest
